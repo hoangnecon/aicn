@@ -7,6 +7,7 @@ the whole unit.
 
 - `SKILL.md`: what the agent reads (entry point, stages, edit loop, rules).
 - `scripts/aicn.py`: the engine (discover, init-series, adopt, plan, tts-sync, render, verify-overlay, log, progress).
+- `scripts/aicn_audio.py`: Stage 3 audio (Demucs stems, sentence-level dub, frequency-aware mix, -14 LUFS master, audio gate).
 - `vendor/`: the five stage skills it drives, with their gate scripts. See `vendor/README.md`.
 - `references/`: folder contract, stage commands, caching design, production time.
 - `templates/`: hub and unit CHANGELOG / PROGRESS / CHECKLIST.
@@ -29,7 +30,9 @@ bash ~/Work/AICN/skills/aicn/install.sh
 | macOS on Apple Silicon | `h264_videotoolbox` encoder, Avenir Next font |
 | `ffmpeg`, `ffprobe` | decode, encode, concat, mux |
 | Python 3.10+ with numpy, Pillow, scipy | `aicn.py` renderer |
-| VieNeu-TTS venv (`/Users/Shared/Tools/VieNeu-TTS/.venv`, or `$AICN_PY`) | faster-whisper, TTS, stage scripts |
+| VieNeu-TTS venv (`/Users/Shared/Tools/VieNeu-TTS/.venv`, or `$AICN_PY`) | faster-whisper, TTS, stage scripts, `aicn_audio.py` |
+| `rubberband` (`brew install rubberband`) | time-stretch of the dub, formants preserved |
+| `uvx` (uv) | runs `demucs-mlx` for stem separation |
 
 ## Quick start
 
@@ -45,7 +48,7 @@ How long a finished unit takes: `references/production_time.md`.
 ## Test
 
 ```bash
-python3 -m unittest discover -s tests -v
+/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python -m unittest discover -s tests -v   # audio tests need numpy/scipy/soundfile
 ```
 
 ## Rights

@@ -50,17 +50,20 @@ register, pronouns and glossary.
 $PY $V/zh-vi-script-adapter/scripts/validate_bilingual_script.py --workspace $U
 ```
 
-## Stage 3: audio (voice_dub only)
+## Stage 3: audio
 
 ```bash
-$A tts-sync --unit $U --voice "Trúc Ly"           # map cached lines into seg_NNNN.wav
-$PY $V/vieneu-voice-pacing-mixer/scripts/synthesize_and_audit_pacing.py --workspace $U --voice "Trúc Ly" --only-missing
-$A tts-sync --unit $U --voice "Trúc Ly" --store   # cache the new lines
-$PY $V/vieneu-voice-pacing-mixer/scripts/assemble_master_audio.py --workspace $U
-$PY $V/vieneu-voice-pacing-mixer/scripts/verify_stage_3.py --workspace $U
+$PY $SK/scripts/aicn_audio.py all --unit $U
+# or step by step: separate | dub | mix | master | verify
 ```
 
-A line over 1.24× tempo is rewritten shorter in Stage 2 (`tts_text` only), not sped up.
+`dub` prints `OVERFLOW` for any sentence that does not fit at 1.25×. Shorten its `tts_text`
+in Stage 2, re-validate, and run `dub` again: only that sentence is re-synthesized.
+`verify` writes `data/03_mix_report.json` and signs Stage 3 only when every audio check passes.
+Then listen to one dubbed passage and one passage without dub.
+Details and tuning: `references/audio_mix.md`.
+
+Requirements: `rubberband` (`brew install rubberband`) and `uvx` (for `demucs-mlx`).
 
 ## Stage 4: style-B overlay
 

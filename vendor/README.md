@@ -15,3 +15,9 @@ files still show paths like `.agents/skills/<name>/scripts/...`. With `aicn`, us
 
 Stage 4 (style-B overlay) is `aicn.py verify-overlay`.
 To update a vendored skill: `rsync -aL --exclude __pycache__ ~/.gemini/config/skills/<name> vendor/`, then run the tests.
+
+**Retired in aicn:** `vieneu-voice-pacing-mixer/scripts/assemble_master_audio.py` and the
+`synthesize_and_audit_pacing.py` → `atempo` path. With no Demucs stem, the assembler replaced
+the film audio with silence. It also used `atempo`, which degrades the voice. Use
+`scripts/aicn_audio.py` instead. `verify_stage_3.py` is still used, and `aicn_audio.py verify`
+calls it.

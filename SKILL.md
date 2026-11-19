@@ -64,17 +64,19 @@ Exact commands per stage: `references/stages.md`.
 | 0 Init | workspace, profile, episode manifest | stage_0 | n/a |
 | 1 ASR + 5 fps hardsub scan + audit | Whisper timeline, Chinese line intervals, audit frames | `verify_stage_1.py` | source sha256. **Frozen** unless `plan` says the source changed |
 | 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) | `validate_bilingual_script.py` | none needed (seconds) |
-| 3 Audio | `tts-sync` → synth `--only-missing` → `tts-sync --store` → assemble | `verify_stage_3.py` | per line: sha256(tts_text, voice, engine) |
+| 3 Audio | `aicn_audio.py all`: separate → dub → mix → master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: per sentence sha256(text, voice, engine, sampling) |
 | 4 Overlay (style B) | `plan`, `render` | `aicn.py verify-overlay` | per chunk: sha256(source, window, cues, hardsub intervals, style, font, encoder, renderer version) |
 | 5 QA + release | import staging MP4, QA frames, **view every frame**, log rows | `verify_stage_5.py` | n/a (stream copy) |
 
-`sub_only` mode: Stage 3 has no TTS; skip `tts-sync`.
+`sub_only` mode: Stage 3 masters the original stereo (`aicn_audio.py all` skips separate/dub/mix).
+The old `assemble_master_audio.py` path is retired: it replaced a missing Demucs stem with
+silence and dropped the original voice entirely. Do not use it.
 
 ## 4. Edit loop (the fast path, ≈ 40 s per line)
 
 1. Edit the smallest thing: one item in `02_bilingual_script.json` (and the same id in `03_aligned_subtitles.json` for sub_only), or `config/overlay_style.json`.
 2. Re-run the validator of the stage you edited.
-3. `voice_dub`, and only if `tts_text` changed: `tts-sync` → synth `--only-missing` → `tts-sync --store` → `assemble_master_audio.py` → `verify_stage_3.py`.
+3. `voice_dub`, if `tts_text` changed: `aicn_audio.py dub`, `mix`, `master`, `verify` (only the edited sentence is re-synthesized). For a mix-only change (`config/audio_mix.json`): `mix`, `master`, `verify`.
 4. `aicn.py plan --unit U`. Expect only chunks containing the edited cue to be `changed:<parts>`. If more are dirty, find out why before rendering.
 5. `aicn.py render --unit U`: dirty chunks only, then `-c copy` concat + one audio mux.
 6. `aicn.py verify-overlay`, Stage 5 import with `--qa-timestamps` at cue midpoints (always including edited cues), view the QA frames of changed chunks, `verify_stage_5.py`.
@@ -91,7 +93,18 @@ The Chinese hardsub is hidden by a feathered blur (σ 22, ×0.82) **per Chinese 
 from `01_zh_bbox_scan.json`, not per Vietnamese cue**. The renderer re-measures each line
 on its first real frame and grows the mask by 1.5 × feather, so no stroke or ghost leaks.
 
-## 6. Correctness rules (never traded for speed)
+## 6. Audio: dub over the film, never instead of it
+
+Full design, parameters and tuning: `references/audio_mix.md`.
+
+- The original voice, music and effects stay in the master. Demucs stems are mandatory: `mix` stops if they are missing.
+- TTS reads whole sentences (comma-chained clauses of one speaker are merged), because short fragments come out with wrong tones.
+- Speed: rubberband R3 with formants preserved, `base_tempo` 1.10, up to 1.25 to fit. Never `atempo`: it doubled the word error rate.
+- Mix: 12 bands, about 10 ms frames. The original is turned down only in bands where the dub is active, only enough for the dub to be 10 dB above the voice and 6 dB above the music, never below its floor (voice -18 dB, music -9 dB).
+- Master: -14 LUFS, -1 dBTP, 48 kHz, 24-bit. Delivered as AAC 192k.
+- Listen to at least one dubbed passage and one passage without dub before release. Numbers do not catch a voice that sounds wrong.
+
+## 7. Correctness rules (never traded for speed)
 
 - Timeline truth is Whisper + the 5 fps scan. Never retime by eye; use `analyze_voice_waveform.py --snap-and-split`, then re-validate.
 - Display follows the Chinese line; audio does not move. `show_a/show_b` hold a cue to its line end (overlap ≥ 0.25 s) and snap a late first cue (≤ 1.0 s) to the line start. `slot_start/slot_end` never change.
@@ -101,7 +114,7 @@ on its first real frame and grows the mask by 1.5 × feather, so no stroke or gh
 - Changed renderer code → bump `RENDERER_VERSION` in `aicn.py`.
 - The automated Stage 5 CV check has passed frames with visible Chinese strokes. Viewing each QA frame is mandatory.
 
-## 7. How long a video takes
+## 8. How long a video takes
 
 Measured numbers and the formula: `references/production_time.md`.
 Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in its first table.
@@ -112,7 +125,10 @@ Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in
 |---|---|---|
 | Every chunk is dirty after a one-line edit | style/font changed, renderer bumped, or source re-concatenated | `plan` names `changed:<part>`; revert the unintended change |
 | `plan` says the source changed | `master_source.mp4` was rebuilt | re-run Stage 1 for this unit, then downstream |
-| TTS re-synthesises everything after inserting a line | synth ran without `tts-sync` first | `tts-sync` before, `tts-sync --store` after |
+| Final has only the dub voice, no film sound | old `assemble_master_audio.py` with no Demucs stem | use `aicn_audio.py all`; its gate checks `original_present` |
+| Dub sounds slurred or robotic on some lines | `atempo` speed-up, or a 2–4 syllable clause read alone | `aicn_audio.py dub` (sentences + rubberband) |
+| `OVERFLOW` in `dub` | sentence too long even at 1.25× | shorten `tts_text` of those ids in Stage 2 |
+| Hiss between dubbed words | TTS noise floor raised by the level match | keep the expander (`expander_*` in `audio_mix.json`) |
 | Stage 5 CV check fails on style B | QA timestamp in a gap between cues | timestamps inside cues (`04_overlay_geometry_log.json`) |
 | Chinese strokes or ghosts visible though CV passed | old renderer (< styleB-1.4) | re-render; re-view the frame |
 | `frames/qa/` has frames in another font | leftovers from an older render | only `data/04_qa_frames_manifest.json` counts |
@@ -126,6 +142,8 @@ Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in
 - "Tick the CHECKLIST box now, run the gate later" → tick after PASS.
 - "CV check passed, skip viewing frames" → view them.
 - "Rights later" → `init-series` will not run without `--rights`.
+- "No stems, just mix the dub alone" → that is the bug that removed the film sound. Run `separate`.
+- "Speed it up with atempo" → rubberband only.
 
-References: `references/stages.md`, `references/folder_contract.md`,
+References: `references/stages.md`, `references/audio_mix.md`, `references/folder_contract.md`,
 `references/incremental_build.md`, `references/production_time.md`.

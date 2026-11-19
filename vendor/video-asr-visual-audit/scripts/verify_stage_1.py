@@ -36,8 +36,10 @@ def main():
     checks = []
     metrics = {"localization_mode": loc_mode}
 
-    # 1. Check audio stem readiness (Demucs no_vocals.wav required in voice_dub mode; optional in sub_only mode)
-    no_vocals = os.path.join(ws, "media", "demucs", "no_vocals.wav")
+    # 1. Check audio stem readiness (aicn_audio.py media/stems/accomp.wav or legacy media/demucs/no_vocals.wav)
+    stems_acc = os.path.join(ws, "media", "stems", "accomp.wav")
+    legacy_acc = os.path.join(ws, "media", "demucs", "no_vocals.wav")
+    no_vocals = stems_acc if os.path.exists(stems_acc) else legacy_acc
     if loc_mode == "sub_only":
         src_vid = profile.get("source_video", "")
         has_bgm = os.path.exists(src_vid) or (os.path.exists(no_vocals) and os.path.getsize(no_vocals) > 100_000)

@@ -245,7 +245,9 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
     if not os.path.exists(video_path):
         video_path = os.path.join(ws, "master_source.mp4")
 
-    vocals_path = os.path.join(ws, "media", "demucs", "vocals.wav")
+    stems_voc = os.path.join(ws, "media", "stems", "vocals.wav")
+    legacy_voc = os.path.join(ws, "media", "demucs", "vocals.wav")
+    vocals_path = stems_voc if os.path.exists(stems_voc) else legacy_voc
     source_audio_path = os.path.join(ws, "media", "source_audio.wav")
     audio_src = source_audio_path if os.path.exists(source_audio_path) else video_path
 

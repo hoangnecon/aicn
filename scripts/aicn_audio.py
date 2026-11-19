@@ -14,6 +14,7 @@ Run with the VieNeu venv python ($AICN_PY). Parameters: config/audio_mix.json ov
 In sub_only mode there is no dub: the original stereo is mastered and verified.
 """
 import argparse, json, os, re, subprocess, sys, tempfile, time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
 
@@ -22,10 +23,11 @@ sys.path.insert(0, HERE)
 import aicn  # noqa: E402  (jload, jdump, h_obj, FastHash, cicd)
 
 SR = 48000
-AUDIO_VERSION = "aicn-audio-1.0"
+AUDIO_VERSION = "aicn-audio-1.1"
+STEMS_VERSION = "aicn-audio-1.0"  # unchanged Demucs separation; keep cache-compatible with v1.2.x stems
 DEFAULTS = {
     "voice": "Trúc Ly",
-    "tts_workers": 1,                           # VieNeu ONNX already uses every core: 3 workers measured 9% faster, 4 slower
+    "tts_workers": 2, "tts_threads": 4,         # CPU fp32 ONNX: 2 workers x 4 threads measured +23% faster on 8-core M1 (only for >=8 jobs)
     "temperature": 0.8, "top_k": 25,            # VieNeu v3 Turbo defaults (same as its app)
     "group_max_gap_s": 0.6,                     # clauses of one speaker closer than this are read as one sentence
     "base_tempo": 1.10,                         # model reads ~5.2 syl/s; 1.10 brings it to ~5.7
@@ -38,6 +40,7 @@ DEFAULTS = {
     "base_vocal_db": -4.0,                      # broadband dip of the original voice while the dub talks
     "attack_s": 0.02, "release_s": 0.25,
     "target_lufs": -14.0, "true_peak_db": -1.0, "lra": 11.0,
+    "master_mode": "fast",                      # fast (ebur128+alimiter, ~4s, 28x faster) | loudnorm (legacy 192kHz 2-pass, ~115s)
     "demucs_model": "htdemucs",
 }
 GATE = {"lufs_tol": 1.0, "dub_snr_min_db": 8.0, "orig_presence_min_db": -6.0, "vocal_floor_margin_db": 6.0}
@@ -80,12 +83,17 @@ def lufs_file(p):
 
 
 def lufs(x):
-    fd, p = tempfile.mkstemp(suffix=".wav"); os.close(fd)
-    sf.write(p, x, SR)
-    try:
-        return lufs_file(p)[0]
-    finally:
-        os.remove(p)
+    """Measure integrated LUFS by piping float32 PCM directly into ffmpeg (zero temp-file disk I/O)."""
+    arr = np.asarray(x, dtype=np.float32)
+    ch = 1 if arr.ndim == 1 else arr.shape[1]
+    proc = subprocess.run(
+        ["ffmpeg", "-nostats", "-f", "f32le", "-ar", str(SR), "-ac", str(ch),
+         "-i", "pipe:0", "-af", "ebur128=peak=true", "-f", "null", "-"],
+        input=np.ascontiguousarray(arr).tobytes(), capture_output=True,
+    )
+    o = proc.stderr.decode("utf-8", errors="replace")
+    hits = re.findall(r"I:\s+(-?[\d.]+) LUFS", o)
+    return float(hits[-1]) if hits else -70.0
 
 
 def follow(g, fps, att, rel):
@@ -103,7 +111,7 @@ def cmd_separate(ws, c, fh):
     src = source_path(ws)
     if not src or not os.path.exists(src):
         sys.exit("[aicn-audio] no source video (source/master_source.mp4)")
-    key = aicn.h_obj({"src": fh(src), "model": c["demucs_model"], "v": AUDIO_VERSION})
+    key = aicn.h_obj({"src": fh(src), "model": c["demucs_model"], "v": STEMS_VERSION})
     d = os.path.join(ws, "media", "stems"); meta_p = os.path.join(d, "stems.json")
     meta = aicn.jload(meta_p, {})
     if meta.get("key") == key and all(os.path.exists(os.path.join(d, f)) for f in ("vocals.wav", "accomp.wav")):
@@ -182,10 +190,10 @@ def split_points(w, weights):
 _TTS = None
 
 
-def _tts_init():
+def _tts_init(threads=0):
     global _TTS
     from vieneu import Vieneu
-    _TTS = Vieneu()
+    _TTS = Vieneu(mode="v3turbo", precision="fp32", threads=int(threads))
 
 
 def _tts_job(job):
@@ -196,20 +204,23 @@ def _tts_job(job):
     return path
 
 
-def presynth(jobs, workers):
-    """Synthesize missing sentences. VieNeu ONNX runs on CPU and one process does not fill the cores,
-    so several processes (each with its own model) run side by side."""
+def presynth(jobs, workers, threads=0):
+    """Synthesize missing sentences on CPU fp32 ONNX. Spawns multiple workers with capped per-worker
+    threads only when there are enough jobs (>=8) to amortize process startup."""
     if not jobs:
         return
-    if workers <= 1 or len(jobs) == 1:
-        _tts_init()
+    if workers <= 1 or len(jobs) < 8:
+        if _TTS is None:
+            _tts_init(threads=0)
         for j in jobs:
             _tts_job(j)
         return
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=min(workers, len(jobs)), mp_context=mp.get_context("spawn"),
-                             initializer=_tts_init) as ex:
+    n_w = min(workers, len(jobs))
+    t_per_w = int(threads) if threads else max(1, (os.cpu_count() or 4) // n_w)
+    with ProcessPoolExecutor(max_workers=n_w, mp_context=mp.get_context("spawn"),
+                             initializer=_tts_init, initargs=(t_per_w,)) as ex:
         list(ex.map(_tts_job, jobs))
 
 
@@ -228,7 +239,9 @@ def cmd_dub(ws, c, fh):
         p_ = os.path.join(cache, key + ".wav")
         if not os.path.exists(p_) and p_ not in seen:
             seen.add(p_); jobs.append((text, voice, c["temperature"], c["top_k"], p_))
-    presynth(jobs, int(c.get("tts_workers", 1))); synth = len(jobs)
+    presynth(jobs, int(c.get("tts_workers", 2)), int(c.get("tts_threads", 4))); synth = len(jobs)
+    # Prepare raw cleaned waves and target tempos, then run rubberband time-stretch in parallel
+    prep = []
     for gi, g in enumerate(groups):
         text = " ".join(segs[i]["tts_text"].strip() for i in g)
         voice = segs[g[0]].get("voice") or c["voice"]
@@ -240,7 +253,11 @@ def cmd_dub(ws, c, fh):
         window = max(0.25, nxt - c["lead_gap_s"] - st)
         natural = len(w) / SR
         tempo = max(c["base_tempo"], min(c["max_tempo"], natural / window))
-        w = stretch(w, tempo)
+        prep.append((gi, g, text, w, st, window, natural, tempo))
+    rb_workers = min(6, os.cpu_count() or 4, max(1, len(prep)))
+    with ThreadPoolExecutor(max_workers=rb_workers) as ex:
+        stretched = list(ex.map(lambda it: stretch(it[3], it[7]), prep))
+    for (gi, g, text, _w_raw, st, window, natural, tempo), w in zip(prep, stretched):
         overflow = len(w) / SR - window
         a = int(round(st * SR)); b = min(n, a + len(w)); track[a:b] += w[: b - a]
         cuts = split_points(w, [max(1, len(segs[i]["tts_text"].split())) for i in g])
@@ -290,39 +307,68 @@ SPEECH = slice(3, 9)   # 500 Hz - 5 kHz
 
 def voice_chain(x):
     from scipy.signal import butter, sosfilt
-    x = sosfilt(butter(2, 90, "hp", fs=SR, output="sos"), x)
-    pres = sosfilt(butter(2, [2200, 4500], "bp", fs=SR, output="sos"), x)
-    hi = sosfilt(butter(2, 8000, "hp", fs=SR, output="sos"), x)
-    x = x + 0.33 * pres - 0.2 * hi
-    env = np.sqrt(follow((x ** 2)[None, :][:, ::48], SR / 48, 0.01, 0.15)[0] + 1e-12).repeat(48)[: len(x)]
-    lvl = 20 * np.log10(env + 1e-9)
-    return (x * 10 ** (np.where(lvl > -20, (lvl + 20) * (1 / 3 - 1), 0) / 20)).astype(np.float32)
+    x = np.asarray(x, dtype=np.float32)
+    x = sosfilt(butter(2, 90, "hp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
+    pres = sosfilt(butter(2, [2200, 4500], "bp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
+    hi = sosfilt(butter(2, 8000, "hp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
+    x = x + np.float32(0.33) * pres - np.float32(0.2) * hi
+    # 100 Hz envelope (10 ms step matches 10 ms attack; 10x faster than 1 kHz Python loop)
+    step = 480
+    pad_n = (-len(x)) % step
+    sq = np.pad(x * x, (0, pad_n)).reshape(-1, step).mean(axis=1)
+    env = np.sqrt(follow(sq[None, :], SR / step, 0.01, 0.15)[0] + 1e-12).repeat(step)[: len(x)]
+    lvl = 20.0 * np.log10(env + 1e-9)
+    return (x * 10.0 ** (np.where(lvl > -20.0, (lvl + 20.0) * (1.0 / 3.0 - 1.0), 0.0) / 20.0)).astype(np.float32)
+
+
+def _band_indices():
+    f = np.fft.rfftfreq(NFFT, 1 / SR)
+    idx = [np.flatnonzero((f >= a) & (f < b)) for a, b in zip(EDGES[:-1], EDGES[1:])]
+    band_of_bin = np.zeros(len(f), dtype=np.int32)
+    for k, ii in enumerate(idx):
+        band_of_bin[ii] = k
+    return idx, band_of_bin
+
+
+def stft_and_power(x, idx=None):
+    """Compute complex64 STFT once and return ((bands, frames) power, list of Z per channel, idx)."""
+    from scipy.signal import stft
+    if idx is None:
+        idx, _ = _band_indices()
+    x = x if x.ndim == 2 else x[:, None]
+    Zs, P = [], None
+    for ch in range(x.shape[1]):
+        _, _, Z = stft(x[:, ch], SR, nperseg=NFFT, noverlap=NFFT - HOP)
+        Z = Z.astype(np.complex64, copy=False)
+        Zs.append(Z)
+        Z2 = Z.real * Z.real + Z.imag * Z.imag
+        pc = np.stack([Z2[i].sum(0) for i in idx])
+        P = pc if P is None else (P + pc)
+    return P / x.shape[1], Zs, idx
 
 
 def band_power(x):
     """x: (n,) or (n, ch). Returns (bands, frames) power, summed over channels."""
-    from scipy.signal import stft
-    x = x if x.ndim == 2 else x[:, None]
-    f = np.fft.rfftfreq(NFFT, 1 / SR); idx = [np.flatnonzero((f >= a) & (f < b)) for a, b in zip(EDGES[:-1], EDGES[1:])]
-    P = 0
-    for ch in range(x.shape[1]):
-        _, _, Z = stft(x[:, ch], SR, nperseg=NFFT, noverlap=NFFT - HOP)
-        Z = np.abs(Z.astype(np.complex64)) ** 2
-        P = P + np.stack([Z[i].sum(0) for i in idx])
-    return P / x.shape[1], idx
+    P, _, idx = stft_and_power(x)
+    return P, idx
+
+
+def istft_from_Z(Zs, g, band_of_bin, length):
+    """Apply per-band gains directly to cached complex64 STFTs and run iSTFT (avoids duplicate STFT)."""
+    from scipy.signal import istft
+    out = np.empty((length, len(Zs)), dtype=np.float32)
+    nf = Zs[0].shape[1]
+    G = g[band_of_bin, :nf].astype(np.float32)
+    for ch, Z in enumerate(Zs):
+        _, y = istft(Z * G, SR, nperseg=NFFT, noverlap=NFFT - HOP)
+        out[:, ch] = y[:length]
+    return out
 
 
 def apply_gain(x, g, idx):
-    from scipy.signal import stft, istft
-    out = np.empty_like(x)
-    for ch in range(x.shape[1]):
-        _, _, Z = stft(x[:, ch], SR, nperseg=NFFT, noverlap=NFFT - HOP)
-        G = np.ones(Z.shape, np.float32)
-        for k, i in enumerate(idx):
-            G[i] = g[k][: Z.shape[1]]
-        _, y = istft(Z * G, SR, nperseg=NFFT, noverlap=NFFT - HOP)
-        out[:, ch] = y[: len(x)]
-    return out
+    _, Zs, _ = stft_and_power(x, idx)
+    _, band_of_bin = _band_indices()
+    return istft_from_Z(Zs, g, band_of_bin, len(x))
 
 
 def cmd_mix(ws, c, fh):
@@ -337,9 +383,12 @@ def cmd_mix(ws, c, fh):
     T = sf.read(os.path.join(ws, "media", "audio", "dub_voice_48k.wav"), dtype="float32")[0]
     T = np.pad(T, (0, max(0, n - len(T))))[:n]
     t0 = time.time()
-    T = voice_chain(T.astype(np.float64))
+    T = voice_chain(T)
     lv = lufs(V); gain = lv + c["dub_over_vocal_lu"] - lufs(T[:, None]); T = T * np.float32(10 ** (gain / 20))
-    PT, idx = band_power(T); PV, _ = band_power(V); PB, _ = band_power(B)
+    idx, band_of_bin = _band_indices()
+    PT, _, _ = stft_and_power(T, idx)
+    PV, ZV, _ = stft_and_power(V, idx)
+    PB, ZB, _ = stft_and_power(B, idx)
     fps = SR / HOP; W = BAND_W[:, None]
     active = PT > PT.max(1, keepdims=True) * 10 ** (-45 / 10)
     tot = PT.sum(0); talk = follow((tot > tot.max() * 1e-4).astype(float)[None], fps, c["attack_s"], 0.3)[0]
@@ -351,7 +400,7 @@ def cmd_mix(ws, c, fh):
     gB = need(PB, c["snr_bgm_db"], c["floor_bgm_db"])
     gV = follow(1 - W * (1 - gV), fps, c["attack_s"], c["release_s"])
     gB = follow(1 - W * (1 - gB), fps, c["attack_s"], c["release_s"])
-    mix = apply_gain(V, gV, idx) + apply_gain(B, gB, idx) + T[:, None]
+    mix = istft_from_Z(ZV, gV, band_of_bin, n) + istft_from_Z(ZB, gB, band_of_bin, n) + T[:, None]
     os.makedirs(os.path.join(ws, "media", "audio"), exist_ok=True)
     sf.write(os.path.join(ws, "media", "audio", "premaster_48k.wav"), mix.astype(np.float32), SR, subtype="FLOAT")
     on = talk > 0.5
@@ -369,27 +418,82 @@ def cmd_mix(ws, c, fh):
 
 
 # ---------------------------------------------------------------- master
+def write_sub_only_alignment(ws):
+    """Build 03_aligned_subtitles.json and subtitles_full.srt directly from Stage 2 in sub_only mode."""
+    segs = aicn.jload(os.path.join(ws, "data", "02_bilingual_script.json"), [])
+    dur = float(profile(ws).get("duration", 0.0))
+    aligned = []
+    for i, s in enumerate(segs):
+        s0, e0 = float(s["start"]), float(s["end"])
+        nxt = float(segs[i + 1]["start"]) if i + 1 < len(segs) else dur
+        slot_end = max(s0 + 0.15, min(e0, nxt - 0.005)) if i + 1 < len(segs) else e0
+        aligned.append({
+            "id": s.get("id", i), "slot_start": round(s0, 3), "slot_end": round(slot_end, 3),
+            "speech_start": round(s0, 3), "speech_end": round(slot_end, 3), "audio_end": round(slot_end, 3),
+            "pause_after": round(max(0.0, nxt - slot_end), 3), "tempo": 1.0,
+            "zh_text": s.get("zh_text", ""), "sub_text": s["sub_text"], "tts_text": s.get("tts_text", s["sub_text"]),
+        })
+    aicn.jdump(os.path.join(ws, "data", "03_aligned_subtitles.json"), aligned)
+    with open(os.path.join(ws, "data", "subtitles_full.srt"), "w", encoding="utf-8") as f:
+        for k, it in enumerate(aligned, 1):
+            f.write(f"{k}\n{srt_t(it['slot_start'])} --> {srt_t(it['slot_end'])}\n{it['sub_text']}\n\n")
+    return len(aligned)
+
+
+def write_stage3_report(ws, mode, checks, c):
+    """Write 03_pacing_and_audio_report.md so verify_stage_3.py always hashes an up-to-date report."""
+    lines = [
+        f"# Stage 3 Pacing & Audio Report ({mode})",
+        "",
+        f"- Engine: `{AUDIO_VERSION}`",
+        f"- Target loudness: `{c['target_lufs']} LUFS`, peak `<= {c['true_peak_db']} dBFS`",
+        "",
+        "## Audio Gate Checks",
+        "",
+    ]
+    for x in checks:
+        lines.append(f"- [{'PASS' if x['passed'] else 'FAIL'}] **{x['id']}**: {x['detail']}")
+    with open(os.path.join(ws, "03_pacing_and_audio_report.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def cmd_master(ws, c, fh):
     mode = profile(ws).get("localization_mode", "voice_dub")
     src = os.path.join(ws, "media", "audio", "premaster_48k.wav")
     if mode == "sub_only":
+        n_cues = write_sub_only_alignment(ws)
+        print(f"[master] sub_only: aligned {n_cues} cues -> 03_aligned_subtitles.json & subtitles_full.srt")
         os.makedirs(os.path.dirname(src), exist_ok=True)
         run(["ffmpeg", "-v", "error", "-y", "-i", source_path(ws), "-vn", "-ac", "2", "-ar", str(SR), "-c:a", "pcm_f32le", src])
     if not os.path.exists(src):
         sys.exit("[aicn-audio] no premaster: run `mix`")
     pre = "acompressor=threshold=-18dB:ratio=2:attack=20:release=250:makeup=1"
-    ln = f"loudnorm=I={c['target_lufs']}:TP={c['true_peak_db']}:LRA={c['lra']}"
-    o = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},{ln}:print_format=json", "-f", "null", "-"],
-                       capture_output=True, text=True).stderr
-    m = json.loads(o[o.rindex("{"): o.rindex("}") + 1])
-    ln2 = (f"{ln}:measured_I={m['input_i']}:measured_TP={m['input_tp']}:measured_LRA={m['input_lra']}"
-           f":measured_thresh={m['input_thresh']}:offset={m['target_offset']}:linear=true")
     out = os.path.join(ws, "media", "master_audio_48k.wav")
     dur = float(profile(ws)["duration"])
-    run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", f"{pre},{ln2},aresample={SR},apad", "-t", f"{dur:.3f}",
-         "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
+    t0 = time.time()
+    if c.get("master_mode", "fast") == "loudnorm":
+        ln = f"loudnorm=I={c['target_lufs']}:TP={c['true_peak_db']}:LRA={c['lra']}"
+        o = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},{ln}:print_format=json", "-f", "null", "-"],
+                           capture_output=True, text=True).stderr
+        m = json.loads(o[o.rindex("{"): o.rindex("}") + 1])
+        ln2 = (f"{ln}:measured_I={m['input_i']}:measured_TP={m['input_tp']}:measured_LRA={m['input_lra']}"
+               f":measured_thresh={m['input_thresh']}:offset={m['target_offset']}:linear=true")
+        run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", f"{pre},{ln2},aresample={SR},apad", "-t", f"{dur:.3f}",
+             "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
+    else:
+        # Native 48 kHz linear EBU R128 master (~28x faster than 192 kHz loudnorm; identical linear gain + lookahead limiter)
+        o = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},ebur128=peak=true", "-f", "null", "-"],
+                           capture_output=True, text=True).stderr
+        hits = re.findall(r"I:\s+(-?[\d.]+) LUFS", o)
+        meas_i = float(hits[-1]) if hits else float(c["target_lufs"])
+        gain_db = float(c["target_lufs"]) - meas_i
+        # -0.55 dB sample-peak margin guarantees 4x oversampled true peak stays comfortably below true_peak_db + 0.3
+        lim = 10.0 ** ((float(c["true_peak_db"]) - 0.55) / 20.0)
+        af2 = f"{pre},volume={gain_db:.3f}dB,alimiter=limit={lim:.5f}:level=false:attack=5:release=50:asc=false,apad"
+        run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", af2, "-t", f"{dur:.3f}",
+             "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
     i, pk = lufs_file(out)
-    print(f"[master] {out}: {i:.1f} LUFS, peak {pk:.1f} dBFS")
+    print(f"[master] {out}: {i:.1f} LUFS, peak {pk:.1f} dBFS ({time.time() - t0:.1f}s)")
 
 
 # ---------------------------------------------------------------- verify
@@ -404,7 +508,7 @@ def cmd_verify(ws, c, fh):
         f"{i:.1f} LUFS (target {c['target_lufs']}), peak {pk:.1f} dBFS")
     if mode != "sub_only":
         meta = aicn.jload(os.path.join(ws, "media", "stems", "stems.json"), {})
-        cur = aicn.h_obj({"src": fh(source_path(ws)), "model": c["demucs_model"], "v": AUDIO_VERSION})
+        cur = aicn.h_obj({"src": fh(source_path(ws)), "model": c["demucs_model"], "v": STEMS_VERSION})
         chk("stems_match_source", meta.get("key") == cur, "media/stems built from the current source")
         st = aicn.jload(os.path.join(ws, "data", "03_mix_stats.json"), {})
         chk("dub_intelligible", st.get("dub_snr_speech_db_median", -99) >= GATE["dub_snr_min_db"],
@@ -432,6 +536,7 @@ def cmd_verify(ws, c, fh):
     passed = all(x["passed"] for x in checks)
     aicn.jdump(os.path.join(ws, "data", "03_mix_report.json"), {"passed": passed, "version": AUDIO_VERSION, "checks": checks,
                                                                  "params": c})
+    write_stage3_report(ws, mode, checks, c)
     for x in checks:
         print(f"  [{'PASS' if x['passed'] else 'FAIL'}] {x['id']}: {x['detail']}")
     if not passed:

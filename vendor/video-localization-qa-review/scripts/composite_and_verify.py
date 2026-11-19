@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 
@@ -107,7 +108,12 @@ def main():
 
     if args.import_existing_mp4 and os.path.exists(args.import_existing_mp4):
         print(f"[STAGE] Importing existing MP4 '{args.import_existing_mp4}' -> locked staging '{staging_mp4}'", flush=True)
-        shutil.copy2(args.import_existing_mp4, staging_mp4)
+        if os.path.exists(staging_mp4) or os.path.islink(staging_mp4):
+            os.remove(staging_mp4)
+        try:
+            os.link(os.path.abspath(args.import_existing_mp4), staging_mp4)
+        except OSError:
+            shutil.copy2(args.import_existing_mp4, staging_mp4)
     else:
         proj_cfg_path = os.path.join(ws, "config", "project_config.json")
         wm_cfg = {}
@@ -195,8 +201,8 @@ def main():
             sys.exit(ret)
 
     ts_list = [float(x.strip()) for x in args.qa_timestamps.split(",") if x.strip()]
-    manifest_frames = []
-    for ts in ts_list:
+
+    def _scan_one(ts):
         ts_int = int(round(ts))
         fname = f"frame_{ts_int}s.jpg"
         out_jpg = os.path.join(qa_dir, fname)
@@ -206,14 +212,17 @@ def main():
         ], check=True)
         cue = find_active_cue(geom_cues, ts)
         cv_res = cv_inspect_frame(out_jpg, cue, strip_y0)
-        manifest_frames.append({
+        print(f"[CV QA SCAN] {fname} (t={ts}s): cv_status={cv_res['cv_status']}, dark_pill={cv_res['dark_pill_ratio']}, white_px={cv_res['white_glyph_pixels']}", flush=True)
+        return {
             "timestamp": ts,
             "filename": fname,
             "rel_path": os.path.join("frames", "qa", fname),
             "sha256": sha256_file(out_jpg),
             **cv_res,
-        })
-        print(f"[CV QA SCAN] {fname} (t={ts}s): cv_status={cv_res['cv_status']}, dark_pill={cv_res['dark_pill_ratio']}, white_px={cv_res['white_glyph_pixels']}", flush=True)
+        }
+
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(ts_list)))) as ex:
+        manifest_frames = list(ex.map(_scan_one, ts_list))
 
     manifest_path = os.path.join(ws, "data", "04_qa_frames_manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:

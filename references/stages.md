@@ -26,19 +26,26 @@ $A adopt --unit $U                       # CHECKLIST, CHANGELOG, overlay_style.j
 
 Check: `data/00_episodes_manifest.json` lists each episode with sha256 and timeline offsets.
 
-## Stage 1: ASR + hardsub scan + audit (once per source)
+## Stage 1: Stems + ASR + hardsub scan + audit (once per source)
 
 ```bash
+# Separate stems first so Stage 1 ASR gets clean vocals AND Stage 3 stems are already cached
+$PY $SK/scripts/aicn_audio.py separate --unit $U
 $PY $V/video-asr-visual-audit/scripts/run_asr_and_scan.py --video $U/source/master_source.mp4 --workspace $U --color-mode auto
 $PY $V/video-asr-visual-audit/scripts/analyze_voice_waveform.py --workspace $U --snap-and-split
 $PY $V/video-asr-visual-audit/scripts/extract_audit_frames.py --video $U/source/master_source.mp4 --workspace $U
-# view the audit frames and record findings in 01_*.md
+# view the audit frames and record findings in 01_visual_audit_notes.md
 $PY $V/video-asr-visual-audit/scripts/verify_stage_1.py --workspace $U
 ```
 
-Outputs: `01_asr_raw_segments.json` (Whisper small on MLX/Metal when `mlx_whisper` is installed, else faster-whisper int8; multi-pass; `AICN_ASR=faster` forces CPU) and
-`01_zh_bbox_scan.json` (5 fps, Chinese line intervals and bboxes). These are frozen;
-`$A plan` reports when the source hash no longer matches them.
+Or run the non-interactive prep across all batches of a series at once:
+```bash
+$A run-series --hub workspace/<series> --phase prep
+```
+
+Outputs: `media/stems/{vocals,accomp}.wav`, `01_asr_raw_segments.json` (MLX Whisper on Metal,
+`word_timestamps=False` for 3.3× speedup; `AICN_ASR=faster` forces CPU) and
+`01_zh_bbox_scan.json` (fast 5 fps scan). These are frozen; `$A plan` reports when the source hash changes.
 
 ## Stage 2: bilingual script
 
@@ -68,10 +75,15 @@ Requirements: `rubberband` (`brew install rubberband`) and `uvx` (for `demucs-ml
 ## Stage 4: style-B overlay
 
 ```bash
-$A plan --unit $U            # cached / changed:<parts> per chunk
-$A render --unit $U          # one ffmpeg pass (mask_mode blur|solid, --mask to override) -> media/.staging_render.mp4
+$A plan --unit $U [--codec h264|hevc|h264_high] [--quality N] [--mask blur|solid] [--brand-dir <dir>]
+$A render --unit $U [--codec h264|hevc|h264_high] [--quality N] [--mask blur|solid] [--brand-dir <dir>]
 $A verify-overlay --unit $U  # Stage 4 gate
 ```
+
+- `--codec h264` (default): `h264_videotoolbox -q:v 58` (≈ 1.86 GB / 100 min, broad compatibility).
+- `--codec hevc`: `hevc_videotoolbox -q:v 60 -tag:v hvc1` (≈ 1.35 GB / 100 min, fastest & smallest).
+- `--codec h264_high`: legacy `5000k` ABR (≈ 3.65 GB / 100 min).
+- `--brand-dir <dir>` (or `config/project_config.json["watermark"]`): composites dual-corner PNGs (`13_top_left_logo_large.png`, `15_top_right_vietsub_floating.png`) inside the same single FFmpeg pass.
 
 ## Stage 5: QA and release
 
@@ -87,8 +99,19 @@ $A log --unit $U --kind release --message "Stage 5 PASS -> media/final_<unit>_vi
 This takes every 12th cue midpoint (about 15 frames per unit). After an edit, append the
 midpoints of the edited cues to `TS`.
 
-## Optional deliverables
+## Stage 6: Full-Series Pipeline & Release (mandatory — 1 published video = 1 FULL series)
 
-`split_compiled_episodes.py --workspace $U` (per-episode files),
-`render_vertical_9x16.py --workspace $U` (9:16), `apply_channel_branding.py` (logo and
-credit; its `--brand-dir` default points at a local folder, so pass yours).
+```bash
+# Hardware-overlapped full-series production after Stage 2 passes on batches (Metal ∥ CPU ∥ Media Engine)
+$A run-series --hub workspace/<series> --phase produce [--codec h264|hevc] [--brand-dir <dir>]
+
+# After visually verifying Stage 5 QA on EVERY working batch (all batches Stage 5 = P):
+$A merge-series --hub workspace/<series>
+# -> deliverables/final_<series>_full_vi.mp4 + deliverables/subtitles/final_<series>_full_vi.srt
+
+# Optional per-batch housekeeping (~1.2 GB freed/batch, keeps PPPPPP gates intact; --deep frees ~1.8 GB/batch)
+$A clean --unit $U --dry-run
+$A clean --unit $U
+```
+
+Other optional scripts: `split_compiled_episodes.py --workspace $U`, `render_vertical_9x16.py --workspace $U`.

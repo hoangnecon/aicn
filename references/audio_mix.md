@@ -15,10 +15,10 @@ while the dub is speaking, and only as far as needed for the dub to be clearly h
 | Step | Does | Output | Cache |
 |---|---|---|---|
 | separate | Demucs htdemucs (MLX) splits the source into vocals and accompaniment (drums + bass + other) | `media/stems/{vocals,accomp}.wav`, `stems.json` | source sha256 + model |
-| dub | groups comma-chained clauses of one speaker into sentences, TTS per sentence, cleans the hiss floor, time-stretches with rubberband R3 (formant preserved), places each sentence at its first clause, cuts it back into clauses | `media/audio/dub_voice_48k.wav`, `media/tts_segments/seg_NNNN.wav`, `data/03_aligned_subtitles.json`, `data/03_dub_sentences.json`, SRT | `.cache/tts_sent/<sha(text, voice, engine, temperature, top_k)>.wav` |
-| mix | voice chain on the dub, level match, per-band per-frame ducking of the original stems | `media/audio/premaster_48k.wav`, `data/03_mix_stats.json` | none (≈ 1 min per unit) |
-| master | glue compressor 2:1, 2-pass loudnorm | `media/master_audio_48k.wav` (48 kHz, 24-bit) | none |
-| verify | audio gate, then `verify_stage_3.py` signs Stage 3 | `data/03_mix_report.json`, `.cicd/stage_3_gate.json` | n/a |
+| dub | groups comma-chained clauses of one speaker into sentences, CPU `fp32` VieNeu TTS (default `tts_workers=2`, `tts_threads=4` for `>=8` jobs), cleans the hiss floor, time-stretches in parallel with rubberband R3 (formant preserved), places each sentence at its first clause, cuts it back into clauses | `media/audio/dub_voice_48k.wav`, `media/tts_segments/seg_NNNN.wav`, `data/03_aligned_subtitles.json`, `data/03_dub_sentences.json`, SRT | `.cache/tts_sent/<sha(text, voice, engine, temperature, top_k)>.wav` |
+| mix | voice chain on the dub, piped zero-disk LUFS level match, cached-Z `complex64` STFT/iSTFT per-band per-frame ducking of the original stems | `media/audio/premaster_48k.wav`, `data/03_mix_stats.json` | none (≈ 20.5 s compute per 10 min batch) |
+| master | glue compressor 2:1 + native 48 kHz EBU R128 linear gain + lookahead limiter (`master_mode="fast"`, ≈ 4.1 s vs 115 s legacy 192 kHz `loudnorm`) | `media/master_audio_48k.wav` (48 kHz, 24-bit) | none |
+| verify | audio gate + writes `03_pacing_and_audio_report.md`, then `verify_stage_3.py` signs Stage 3 | `data/03_mix_report.json`, `03_pacing_and_audio_report.md`, `.cicd/stage_3_gate.json` | n/a |
 
 ## Why sentences, not clauses
 
@@ -78,8 +78,8 @@ master format, then signs Stage 3.
 | Dub clearer | `snr_vocal_db` 10 → 12, or `dub_over_vocal_lu` 1 → 2 |
 | Music louder under the dub | `floor_bgm_db` -9 → -6, `snr_bgm_db` 6 → 4 |
 | Faster dub | `base_tempo` 1.10 → 1.15 (keep ≤ 1.2 for natural speech) |
-| Faster synthesis | not by `tts_workers`: VieNeu ONNX already uses every core (3 workers 9% faster, 4 slower) |
+| Faster CPU synthesis | `tts_workers=2, tts_threads=4` (default, measured +23% faster on 8-core M1); `tts_workers=4, tts_threads=2` (+26%, 4× RAM) |
 
-Changing any mix or master parameter re-runs `mix` and `master` only (about 2 minutes),
-then Stage 4 muxes the new audio without re-rendering any chunk. Changing `voice`,
+Changing any mix or master parameter re-runs `mix` and `master` only (about 25–30 s total),
+then Stage 4 renders the new audio. Changing `voice`,
 `temperature` or `top_k` re-synthesizes every sentence.

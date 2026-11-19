@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
 sys.path.insert(0, ORCH_SCRIPTS)
@@ -75,8 +76,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ts_list = select_smart_timestamps(args.workspace, args.timestamps)
 
-    manifest_items = []
-    for ts in ts_list:
+    def _extract_one(ts):
         ts_int = int(round(ts))
         fname = f"frame_{ts_int:04d}s.jpg"
         out_jpg = os.path.join(out_dir, fname)
@@ -91,13 +91,16 @@ def main():
         ]
         subprocess.run(cmd, check=True)
         rel_path = os.path.join("frames", "audit", fname)
-        manifest_items.append({
+        print(f"[AUDIT FRAME] Extracted {rel_path} (t={ts}s)", flush=True)
+        return {
             "timestamp": ts,
             "filename": fname,
             "rel_path": rel_path,
             "sha256": sha256_file(out_jpg),
-        })
-        print(f"[AUDIT FRAME] Extracted {rel_path} (t={ts}s)", flush=True)
+        }
+
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(ts_list)))) as ex:
+        manifest_items = list(ex.map(_extract_one, ts_list))
 
     manifest_path = os.path.join(args.workspace, "data", "01_extracted_audit_manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:

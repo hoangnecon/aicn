@@ -3,18 +3,25 @@ name: aicn
 description: Use when starting, resuming, or editing a Chinese short-drama / AI-drama Vietsub or Vietnamese dub re-up (any series, any unit of episodes), when entering a workspace with series hubs and units/, when a subtitle or dubbed line must change after render, when a re-render or a re-run of Whisper/TTS feels too slow or would start from scratch, or when estimating how long a finished video takes to produce.
 ---
 
-# AICN: drama re-up pipeline (series-general, incremental)
+# AICN: drama re-up pipeline (full-series release, incremental)
 
 ## Overview
 
 One entry point for every series. It drives five stage skills (vendored in `vendor/`:
 orchestrator, ASR + visual audit, zh→vi script adapter, VieNeu voice + pacing mixer,
 QA review) and adds root discovery, a fixed folder and log contract, content-hash
-caching, and the style-B subtitle overlay rendered per chunk.
+caching, hardware-overlapped full-series execution, and one-pass Style-B rendering.
+
+> **Release rule (mandatory): 1 published video = 1 FULL series.**
+> Every publishable release is ALWAYS the complete series with **full Vietnamese dubbing +
+> full Vietnamese subtitles + branding** at `deliverables/final_<series>_full_vi.mp4` (and
+> `deliverables/subtitles/final_<series>_full_vi.srt`). Working batches under `units/`
+> exist **strictly as internal work slices** (for caching, incremental edits, QA, and
+> GPU/CPU/Media-Engine pipelining) — **never** as separate uploads.
 
 **Core principle: every expensive output is keyed by the hash of exactly the inputs
-that produce it.** An edit dirties only the cues, TTS lines and chunks whose inputs
-changed. Everything else comes from cache. Nothing is recomputed because it is "safer".
+that produce it.** An edit dirties only the cues, TTS sentences and working batch whose
+inputs changed. Everything else comes from cache. Nothing is recomputed because it is "safer".
 
 | Variable | Value |
 |---|---|
@@ -30,8 +37,9 @@ python3 <skill>/scripts/aicn.py doctor --root <project-root>
 ```
 
 It writes `config/machine.json` and prints the stack to use. On Apple Silicon that is:
-Whisper on MLX (Metal), Demucs MLX, ffmpeg one-pass render with `h264_videotoolbox`,
-rubberband. Python never touches video frames on the default path.
+Whisper on MLX (Metal), Demucs MLX, ffmpeg one-pass render with `h264_videotoolbox` /
+`hevc_videotoolbox` (hardware decode + quality VBR), rubberband. Python never touches video
+frames on the default path.
 
 ## 1. On entry: read the root
 
@@ -54,10 +62,12 @@ Full tree: `references/folder_contract.md`. Short form:
 workspace/<series>/                      Series Hub
   CHANGELOG.md  PROGRESS.md  config/series_bible.json  config/rights.json
   source_inbox/<batch>/epNN.mp4          raw downloads, never edited
-  units/<unit>/                          10 episodes each
+  units/<batch>/                         internal working batches (~10 eps each; NOT standalone uploads)
      CHECKLIST.md CHANGELOG.md  config/ data/ source/ media/ frames/ .cicd/
-     .cache/{chunks,tts}/  media/.staging_render.mp4  media/final_<unit>_vi.mp4
-  deliverables/{16x9,9x16,subtitles,episodes}/
+     .cache/{timeline,tts_sent}/  media/.staging_render.mp4  media/final_<batch>_vi.mp4
+  deliverables/
+     final_<series>_full_vi.mp4          THE publishable full-series master (via `merge-series`)
+     subtitles/final_<series>_full_vi.srt
 ```
 
 New series: `aicn.py init-series --series-slug S --title T --total-episodes N --rights <basis>`
@@ -71,23 +81,26 @@ Exact commands per stage: `references/stages.md`.
 
 | Stage | Does | Gate | Cached by |
 |---|---|---|---|
-| 0 Init | workspace, profile, episode manifest | stage_0 | n/a |
-| 1 ASR + 5 fps hardsub scan + audit | Whisper timeline, Chinese line intervals, audit frames | `verify_stage_1.py` | source sha256. **Frozen** unless `plan` says the source changed |
+| 0 Init | series hub + internal working batches (`units/*`), profile, episode manifest | stage_0 | n/a |
+| 1 Prep (Stems + ASR + 5 fps scan + audit) | `aicn_audio.py separate` (Metal), MLX Whisper, 5 fps Chinese hardsub intervals, audit frames (`run-series --phase prep`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
 | 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) | `validate_bilingual_script.py` | none needed (seconds) |
-| 3 Audio | `aicn_audio.py all`: separate → dub → mix → master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: per sentence sha256(text, voice, engine, sampling) |
-| 4 Overlay (style B) | `render` (one ffmpeg pass) | `aicn.py verify-overlay` | whole unit: sha256(source, display cues, hardsub intervals, style, audio, encoder, renderer version); unchanged → skipped |
-| 5 QA + release | import staging MP4, QA frames, **view every frame**, log rows | `verify_stage_5.py` | n/a (stream copy) |
+| 3 Audio (full dub) | `aicn_audio.py all`: stems (cached) → CPU VieNeu TTS (2×4 threads) + parallel rubberband → cached-Z mix → fast 48 kHz master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: per sentence sha256(text, voice, engine, sampling) |
+| 4 Overlay (style B) | `render` (one ffmpeg pass: hwdec + VBR `--codec h264\|hevc\|h264_high`, optional `--brand-dir` dual-corner watermark) | `aicn.py verify-overlay` | whole batch: sha256(source, display cues, hardsub intervals, style, font, watermark, audio, encoder, renderer version); unchanged → skipped |
+| 5 Batch QA | hardlink staging MP4, 4-worker QA frame extraction, **view every frame**, verify batch (`run-series --phase produce` automates S3→S5-extract with 3-engine overlap) | `verify_stage_5.py` | hardlink (0 extra bytes) |
+| 6 Full-Series Release | **`aicn.py merge-series --hub <hub>`** once **ALL** working batches PASS Stage 5 → single full-series MP4 + SRT; optional `aicn.py clean` per batch | all batches `P` at Stage 5 | stream copy (seconds) |
 
-`sub_only` mode: Stage 3 masters the original stereo (`aicn_audio.py all` skips separate/dub/mix).
+The project requires **full Vietnamese dubbing (`voice_dub`) + full Vietnamese subtitles** on
+every published series. Never downgrade to `sub_only` as a shortcut.
 The old `assemble_master_audio.py` path is retired: it replaced a missing Demucs stem with
 silence and dropped the original voice entirely. Do not use it.
+(`aicn.py tts-sync` is legacy for the old per-chunk flow; Stage 3 uses `aicn_audio.py`.)
 
 ## 4. Edit loop (≈ 2–3 min per edit)
 
 1. Edit the smallest thing: one item in `02_bilingual_script.json` (and the same id in `03_aligned_subtitles.json` for sub_only), or `config/overlay_style.json`.
 2. Re-run the validator of the stage you edited.
 3. `voice_dub`, if `tts_text` changed: `aicn_audio.py dub`, `mix`, `master`, `verify` (only the edited sentence is re-synthesized). For a mix-only change (`config/audio_mix.json`): `mix`, `master`, `verify`.
-4. `aicn.py plan --unit U` says `render=current` or `stale: <parts>`; anything other than the part you edited means an unintended change. Then `aicn.py render --unit U`: one ffmpeg pass over the unit (≈ 2 min per 10 min of video). It is skipped when nothing it reads changed.
+4. `aicn.py plan --unit U` (pass the same `--codec`/`--quality`/`--mask`/`--brand-dir` flags as `render`) says `render=current` or `stale: <parts>`; anything other than the part you edited means an unintended change. Then `aicn.py render --unit U`: one ffmpeg pass over the unit (≈ 1.7–1.8 min per 10 min of video). It is skipped when nothing it reads changed.
 5. `aicn.py verify-overlay`, Stage 5 import with `--qa-timestamps` at cue midpoints (always including edited cues), view the QA frames of changed chunks, `verify_stage_5.py`.
 6. `aicn.py log --unit U --kind fix --message "<what> (<why>) -> rerun: <stages/chunks>"`.
 
@@ -155,6 +168,8 @@ Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in
 - "Speed it up with atempo" → rubberband only.
 - "Render frames in Python, it is more flexible" → ffmpeg one pass; Python draws PNGs only.
 - "faster-whisper is what the script used" → run `doctor`; on Apple Silicon use MLX.
+- "Upload one unit/batch as a standalone episode" → never. `units/` are internal working batches; every published video must be the full series assembled by `aicn.py merge-series`.
+- "Skip dubbing (`sub_only`) to hit a time target" → never. Every full-series release requires complete Vietnamese dubbing + subtitles.
 
 References: `references/stages.md`, `references/audio_mix.md`, `references/folder_contract.md`,
 `references/incremental_build.md`, `references/production_time.md`.

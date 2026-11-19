@@ -14,8 +14,9 @@
 | `config/series_bible.json` | init-series | characters, pronoun matrix (xưng hô), glossary, voices, `overlay_style` |
 | `config/rights.json` | init-series | licence basis and proof; Stage 0 is not done while basis is `unknown` |
 | `source_inbox/<batch>/` | you | raw downloads, never modified |
-| `units/<unit>/` | init_workspace.py + adopt | one working unit (usually 10 episodes) |
-| `deliverables/` | release | consolidated outputs |
+| `units/<batch>/` | init_workspace.py + adopt | internal working batch (~10 episodes) for caching/QA/pipelining — **never** a standalone upload |
+| `deliverables/final_<series>_full_vi.mp4` | `merge-series` | **THE publishable full-series master** (all episodes, full dub + full sub + watermark) |
+| `deliverables/subtitles/final_<series>_full_vi.srt` | `merge-series` | consolidated full-series SRT with cumulative offsets |
 
 ## Unit (adds to the init_workspace.py v2.0 tree)
 | Path | Purpose |

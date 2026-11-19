@@ -1,13 +1,17 @@
 # aicn
 
-Agent skill for Vietsub and Vietnamese dub re-ups of Chinese short dramas / AI dramas.
-It works for any series, cut into units of 10 episodes, and makes edits incremental:
-changing one subtitle line re-renders one episode chunk in about 40 seconds instead of
-the whole unit.
+Agent skill for full-series Vietnamese dubbing + Vietsub production of Chinese short dramas / AI dramas.
+**Every published release is 1 full series** (`deliverables/final_<series>_full_vi.mp4` +
+`final_<series>_full_vi.srt`). Internally, a series is split into working batches (`units/*`)
+so Whisper/scan and Demucs stems stay cached per source, VieNeu CPU TTS is cached per sentence,
+Stage 4 renders each batch in one hardware-accelerated FFmpeg pass (≈ 1.7 min per 10 min of
+1080p video, with optional dual-corner watermark compositing), `run-series` overlaps Apple
+Silicon's Metal GPU, CPU, and VideoToolbox Media Engine across batches, and `merge-series`
+stream-copies all verified batches into the final full-series master.
 
-- `SKILL.md`: what the agent reads (entry point, stages, edit loop, rules).
-- `scripts/aicn.py`: the engine (doctor, discover, init-series, adopt, plan, tts-sync, render, verify-overlay, log, progress).
-- `scripts/aicn_audio.py`: Stage 3 audio (Demucs stems, sentence-level dub, frequency-aware mix, -14 LUFS master, audio gate).
+- `SKILL.md`: what the agent reads (full-series contract, stages, edit loop, rules).
+- `scripts/aicn.py`: the engine (`doctor`, `discover`, `init-series`, `adopt`, `plan`, `render`, `verify-overlay`, `run-series`, `merge-series`, `clean`, `log`, `progress`; legacy `tts-sync`).
+- `scripts/aicn_audio.py`: Stage 3 audio (Demucs MLX stems, sentence-level CPU VieNeu dub with 2×4 threads + parallel rubberband, cached-Z frequency-aware mix, fast 48 kHz -14 LUFS master, audio gate).
 - `vendor/`: the five stage skills it drives, with their gate scripts. See `vendor/README.md`.
 - `references/`: folder contract, stage commands, caching design, production time.
 - `templates/`: hub and unit CHANGELOG / PROGRESS / CHECKLIST.
@@ -27,7 +31,7 @@ bash ~/Work/AICN/skills/aicn/install.sh
 
 | Tool | Used for |
 |---|---|
-| macOS on Apple Silicon | `h264_videotoolbox` encoder, Avenir Next font |
+| macOS on Apple Silicon | `h264_videotoolbox` / `hevc_videotoolbox` encoders, Avenir Next font |
 | `ffmpeg`, `ffprobe` (needs `gblur`, `alphamerge`, `overlay`) | one-pass render: decode, mask, overlay, encode, mux |
 | `mlx-whisper` in `$AICN_PY` | Stage 1 ASR on Metal (falls back to faster-whisper) |
 | Python 3.10+ with numpy, Pillow, scipy | `aicn.py` renderer |

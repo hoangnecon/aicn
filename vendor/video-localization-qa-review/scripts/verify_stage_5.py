@@ -69,7 +69,7 @@ def main():
         s_st = [s for s in streams if s.get("codec_type") == "subtitle"]
         out_dur = float(fmt.get("duration", 0.0))
         mp4_ok = (
-            v_st.get("codec_name") == "h264"
+            v_st.get("codec_name") in ("h264", "hevc")
             and int(v_st.get("width", 0)) == width
             and int(v_st.get("height", 0)) == height
             and a_st.get("codec_name") == "aac"
@@ -135,7 +135,7 @@ def main():
     canon_srt = os.path.join(ws, "data", "subtitles_full.srt")
 
     if pre_release_ok:
-        shutil.copy2(staging_mp4, final_mp4)
+        _hardlink_or_copy(staging_mp4, final_mp4)
         _hardlink_or_copy(final_mp4, deliv_16x9)
         if os.path.exists(canon_srt):
             _hardlink_or_copy(canon_srt, deliv_srt)
@@ -175,7 +175,7 @@ def main():
         },
         {
             "id": "staging_mp4_stream_and_codec_compliance",
-            "description": "Video is H.264, audio is 48000Hz stereo AAC, 0 duplicate mov_text streams (-sn), duration matches source",
+            "description": "Video is H.264/HEVC, audio is 48000Hz stereo AAC, 0 duplicate mov_text streams (-sn), duration matches source",
             "weight": 25,
             "passed": mp4_ok,
             "detail": mp4_detail

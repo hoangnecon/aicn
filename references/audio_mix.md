@@ -78,6 +78,7 @@ master format, then signs Stage 3.
 | Dub clearer | `snr_vocal_db` 10 → 12, or `dub_over_vocal_lu` 1 → 2 |
 | Music louder under the dub | `floor_bgm_db` -9 → -6, `snr_bgm_db` 6 → 4 |
 | Faster dub | `base_tempo` 1.10 → 1.15 (keep ≤ 1.2 for natural speech) |
+| Faster synthesis | not by `tts_workers`: VieNeu ONNX already uses every core (3 workers 9% faster, 4 slower) |
 
 Changing any mix or master parameter re-runs `mix` and `master` only (about 2 minutes),
 then Stage 4 muxes the new audio without re-rendering any chunk. Changing `voice`,

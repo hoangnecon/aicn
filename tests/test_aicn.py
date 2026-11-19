@@ -97,12 +97,21 @@ class FfmpegTimeline(unittest.TestCase):
         cues = [{"id": 0, "show_a": 2.0, "show_b": 4.0}]
         plates = {0: (Image.new("RGBA", (320, 80), (0, 0, 0, 135)), 900)}
         with tempfile.TemporaryDirectory() as d:
-            aicn.build_timeline(d, prof, cues, scan, style, plates, d)
+            aicn.build_timeline(d, prof, cues, scan, style, plates, d, 760)
             for kind, want in (("m", [1.0, 2.0, 7.0]), ("p", [2.0, 2.0, 6.0])):
                 lines = open(os.path.join(d, kind + ".ffconcat")).read().split("\n")
                 durs = [float(x.split()[1]) for x in lines if x.startswith("duration")]
                 self.assertAlmostEqual(sum(durs), 10.0, places=4)
                 self.assertEqual([round(x, 3) for x in durs], want)
+
+
+    def test_band_starts_above_masks_and_plates(self):
+        from PIL import Image
+        style = dict(aicn.DEFAULT_STYLE)
+        scan = {"strip_y0": 600, "hardsub_intervals": [{"start": 0, "end": 1, "bbox": [0, 10, 20, 60]}]}
+        y = aicn.band_y0({"height": 1080}, scan, style, {0: (Image.new("RGBA", (8, 8)), 700)})
+        self.assertLessEqual(y, 600 + 20 - style["box_pad_y"] - 15 - 20)
+        self.assertEqual(y % 2, 0)
 
 
 class CLI(unittest.TestCase):

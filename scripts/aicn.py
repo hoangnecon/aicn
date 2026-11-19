@@ -318,6 +318,26 @@ def cmd_plan(a, quiet=False):
     state = jload(os.path.join(ws, ".cache", "build_state.json"), {"chunks": {}, "tts": {}})
     src = os.path.join(ws, "source", "master_source.mp4")
     src_sha = fh(src) if os.path.exists(src) else "NO_SOURCE"
+    if getattr(a, "engine", "ffmpeg") == "ffmpeg":
+        from PIL import ImageFont
+        font = ImageFont.truetype(style["font_path"], style["font_size"], index=style.get("font_index", 0))
+        W, cy = int(prof.get("width", 1920)), centre_y_of(scan, prof)
+        plates = {c["id"]: build_plate({"text": c["sub_text"]}, style, W, cy, font)[:2] for c in cues}
+        parts, key = ff_render_key(ws, fh, cues, scan, style, band_y0(prof, scan, style, plates))
+        prev = state.get("render", {})
+        staging = os.path.exists(os.path.join(ws, "media", ".staging_render.mp4"))
+        if prev.get("key") == key and staging:
+            why, dirty = "current", []
+        else:
+            changed = [k for k, v in parts.items() if prev.get("parts", {}).get(k) != h_obj(v)] if prev else ["new"]
+            why, dirty = "stale: " + ",".join(changed or ["staging missing"]), ["unit"]
+        s1 = stage1_key(ws, fh); fh.save()
+        if not quiet:
+            print(f"[plan] unit={os.path.basename(ws)} engine=ffmpeg render={why}")
+            print("  !! source changed since Stage 1 -> Stage 1 must be re-run for this unit"
+                  if state.get("stage1_key") and state["stage1_key"] != s1 else
+                  "  stage1: frozen (source unchanged) - do NOT re-run Whisper/scan")
+        return dirty
     rows, dirty = [], []
     for cid, s, t in chunk_windows(prof, eps, a.chunk_s):
         inp, key = chunk_inputs(cid, s, t, cues, scan, style, src_sha, prof)
@@ -557,15 +577,23 @@ def centre_y_of(scan, prof):
     return int(sy + statistics.median((iv["bbox"][2] + iv["bbox"][3]) / 2 for iv in ivs))
 
 
-FF_BAND_Y0 = 760
+def band_y0(prof, scan, style, plates):
+    """Top of the band ffmpeg touches: above the highest Chinese mask and the highest plate, even, >= 0."""
+    sy = scan.get("strip_y0", prof.get("strip_y0", 880))
+    grow = int(style["mask_feather"] * 1.5)
+    tops = [sy + iv["bbox"][2] - style["box_pad_y"] - grow - 2 * style["mask_feather"] for iv in scan.get("hardsub_intervals", [])]
+    tops += [oy for _, oy in plates.values()]
+    y = min(tops) if tops else int(prof.get("height", 1080)) * 2 // 3
+    return max(0, (int(y) - 8) // 2 * 2)
+
 
 # ----------------------------------------------------------------- one-pass ffmpeg renderer (default)
-def build_timeline(ws, prof, cues, scan, style, plates, work):
+def build_timeline(ws, prof, cues, scan, style, plates, work, y0):
     """Python draws only PNGs: one per distinct set of active Chinese masks, one per Vietnamese plate.
     Two ffconcat lists time them; ffmpeg does decode, mask, overlay, encode, mux in one process."""
     from PIL import Image, ImageDraw, ImageFilter
     W, H = int(prof.get("width", 1920)), int(prof.get("height", 1080))
-    y0 = FF_BAND_Y0; bh = H - y0
+    bh = H - y0
     sy, pad = scan.get("strip_y0", prof.get("strip_y0", 880)), style["temporal_pad_s"]
     grow = int(style["mask_feather"] * 1.5)
     items = [("m", tuple(iv["bbox"]), iv["start"] - pad, iv["end"] + pad) for iv in scan.get("hardsub_intervals", [])]
@@ -620,9 +648,9 @@ def ffprobe_duration(p):
                                 capture_output=True, text=True).stdout.strip() or 0)
 
 
-def render_ffmpeg(ws, prof, style, work, audio, out):
+def render_ffmpeg(ws, prof, style, work, audio, out, y0):
     W, H = int(prof.get("width", 1920)), int(prof.get("height", 1080))
-    y0 = FF_BAND_Y0; bh = H - y0
+    bh = H - y0
     fps = prof.get("fps", 30)
     if style.get("mask_mode", "blur") == "solid":
         r, g, b = style.get("solid_rgb", [0, 0, 0])
@@ -649,6 +677,16 @@ def render_ffmpeg(ws, prof, style, work, audio, out):
     os.replace(out + ".part.mp4", out)
 
 
+def ff_render_key(ws, fh, cues, scan, style, y0):
+    src = os.path.join(ws, "source", "master_source.mp4")
+    audio = os.path.join(ws, "media", "master_audio_48k.wav")
+    parts = {"cues": [(c["id"], c["sub_text"], round(c["show_a"], 3), round(c["show_b"], 3)) for c in cues],
+             "ivs": [(iv["start"], iv["end"], iv["bbox"]) for iv in scan.get("hardsub_intervals", [])],
+             "style": style, "src": fh(src) if os.path.exists(src) else "NO_SOURCE",
+             "audio": fh(audio) if os.path.exists(audio) else None, "enc": ENCODE, "v": FF_RENDERER_VERSION, "y0": y0}
+    return parts, h_obj(parts)
+
+
 def cmd_render(a):
     if a.engine == "python":
         return cmd_render_chunks(a)
@@ -672,13 +710,9 @@ def cmd_render(a):
                          "box": [g["box_abs"][0], g["box_abs"][1] - prof.get("strip_y0", 880), g["box_abs"][2],
                                  g["box_abs"][3] - prof.get("strip_y0", 880)], "line_px": g["max_line_px"]})
     jdump(os.path.join(ws, "data", "04_overlay_geometry_log.json"), {"renderer": FF_RENDERER_VERSION, "centre_y": cy, "cues": geom_log})
-    src = os.path.join(ws, "source", "master_source.mp4")
     audio = os.path.join(ws, "media", "master_audio_48k.wav")
-    parts = {"cues": [(c["id"], c["sub_text"], round(c["show_a"], 3), round(c["show_b"], 3)) for c in cues],
-             "ivs": [(iv["start"], iv["end"], iv["bbox"]) for iv in scan.get("hardsub_intervals", [])],
-             "style": style, "src": fh(src), "audio": fh(audio) if os.path.exists(audio) else None,
-             "enc": ENCODE, "v": FF_RENDERER_VERSION}
-    key = h_obj(parts)
+    y0 = band_y0(prof, scan, style, plates)
+    parts, key = ff_render_key(ws, fh, cues, scan, style, y0)
     out = os.path.join(ws, "media", ".staging_render.mp4")
     state = jload(os.path.join(ws, ".cache", "build_state.json"), {"chunks": {}, "tts": {}})
     prev = state.get("render", {})
@@ -686,10 +720,10 @@ def cmd_render(a):
         print("[render] unchanged -> staging is current"); fh.save(); return
     t0 = time.time()
     work = os.path.join(ws, ".cache", "timeline", key[:16])
-    n = build_timeline(ws, prof, cues, scan, style, plates, work)
+    n = build_timeline(ws, prof, cues, scan, style, plates, work, y0)
     t1 = time.time()
-    print(f"[render] timeline: {n} PNGs in {t1 - t0:.1f}s; ffmpeg one pass, mask={style['mask_mode']}", flush=True)
-    render_ffmpeg(ws, prof, style, work, audio, out)
+    print(f"[render] timeline: {n} PNGs in {t1 - t0:.1f}s; ffmpeg one pass, mask={style['mask_mode']} band y>={y0}", flush=True)
+    render_ffmpeg(ws, prof, style, work, audio, out, y0)
     print(f"[render] ffmpeg {time.time() - t1:.1f}s -> {out}")
     state["render"] = {"engine": "ffmpeg", "key": key, "parts": {k: h_obj(v) for k, v in parts.items()},
                        "mask": style["mask_mode"], "renderer": FF_RENDERER_VERSION}
@@ -907,6 +941,7 @@ def main():
     p.set_defaults(f=cmd_init_series)
     p = sp.add_parser("adopt"); p.add_argument("--unit", required=True); p.set_defaults(f=cmd_adopt)
     p = sp.add_parser("plan"); p.add_argument("--unit", required=True); p.add_argument("--chunk-s", type=float, default=90)
+    p.add_argument("--engine", choices=["ffmpeg", "python"], default="ffmpeg")
     p.set_defaults(f=cmd_plan)
     p = sp.add_parser("tts-sync"); p.add_argument("--unit", required=True); p.add_argument("--voice", default="Trúc Ly")
     p.add_argument("--store", action="store_true"); p.set_defaults(f=cmd_tts_sync)

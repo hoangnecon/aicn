@@ -25,6 +25,7 @@ SR = 48000
 AUDIO_VERSION = "aicn-audio-1.0"
 DEFAULTS = {
     "voice": "Trúc Ly",
+    "tts_workers": 1,                           # VieNeu ONNX already uses every core: 3 workers measured 9% faster, 4 slower
     "temperature": 0.8, "top_k": 25,            # VieNeu v3 Turbo defaults (same as its app)
     "group_max_gap_s": 0.6,                     # clauses of one speaker closer than this are read as one sentence
     "base_tempo": 1.10,                         # model reads ~5.2 syl/s; 1.10 brings it to ~5.7
@@ -178,6 +179,40 @@ def split_points(w, weights):
     return cuts + [len(w)]
 
 
+_TTS = None
+
+
+def _tts_init():
+    global _TTS
+    from vieneu import Vieneu
+    _TTS = Vieneu()
+
+
+def _tts_job(job):
+    text, voice, temp, top_k, path = job
+    w = _TTS.infer(text=text, voice=voice, temperature=temp, top_k=top_k)
+    sf.write(path + ".part.wav", w, SR, subtype="FLOAT")
+    os.replace(path + ".part.wav", path)
+    return path
+
+
+def presynth(jobs, workers):
+    """Synthesize missing sentences. VieNeu ONNX runs on CPU and one process does not fill the cores,
+    so several processes (each with its own model) run side by side."""
+    if not jobs:
+        return
+    if workers <= 1 or len(jobs) == 1:
+        _tts_init()
+        for j in jobs:
+            _tts_job(j)
+        return
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=min(workers, len(jobs)), mp_context=mp.get_context("spawn"),
+                             initializer=_tts_init) as ex:
+        list(ex.map(_tts_job, jobs))
+
+
 def cmd_dub(ws, c, fh):
     segs = aicn.jload(os.path.join(ws, "data", "02_bilingual_script.json"))
     dur = float(profile(ws)["duration"]); n = int(round(dur * SR))
@@ -185,17 +220,20 @@ def cmd_dub(ws, c, fh):
     cache = os.path.join(ws, ".cache", "tts_sent"); os.makedirs(cache, exist_ok=True)
     tts = None; track = np.zeros(n, np.float32); aligned = [None] * len(segs); log = []; synth = 0; t0 = time.time()
     wav_dir = os.path.join(ws, "media", "tts_segments"); os.makedirs(wav_dir, exist_ok=True)
+    jobs, seen = [], set()
+    for g in groups:
+        text = " ".join(segs[i]["tts_text"].strip() for i in g)
+        voice = segs[g[0]].get("voice") or c["voice"]
+        key = aicn.h_obj({"t": text, "v": voice, "e": aicn.TTS_ENGINE_TAG, "temp": c["temperature"], "k": c["top_k"]})
+        p_ = os.path.join(cache, key + ".wav")
+        if not os.path.exists(p_) and p_ not in seen:
+            seen.add(p_); jobs.append((text, voice, c["temperature"], c["top_k"], p_))
+    presynth(jobs, int(c.get("tts_workers", 1))); synth = len(jobs)
     for gi, g in enumerate(groups):
         text = " ".join(segs[i]["tts_text"].strip() for i in g)
         voice = segs[g[0]].get("voice") or c["voice"]
         key = aicn.h_obj({"t": text, "v": voice, "e": aicn.TTS_ENGINE_TAG, "temp": c["temperature"], "k": c["top_k"]})
         raw_p = os.path.join(cache, key + ".wav")
-        if not os.path.exists(raw_p):
-            if tts is None:
-                from vieneu import Vieneu
-                tts = Vieneu()
-            w = tts.infer(text=text, voice=voice, temperature=c["temperature"], top_k=c["top_k"])
-            sf.write(raw_p, w, SR, subtype="FLOAT"); synth += 1
         w = clean(sf.read(raw_p, dtype="float32")[0], c)
         st = float(segs[g[0]]["start"])
         nxt = float(segs[groups[gi + 1][0]]["start"]) if gi + 1 < len(groups) else dur - 0.05

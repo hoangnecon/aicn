@@ -302,8 +302,13 @@ class _MlxWhisper:
         import mlx_whisper
         r = mlx_whisper.transcribe(np.asarray(audio, np.float32), path_or_hf_repo=self.repo, language=language,
                                    word_timestamps=word_timestamps, condition_on_previous_text=condition_on_previous_text,
-                                   temperature=temperature, verbose=None)
-        return [_Seg(d) for d in r["segments"]], r
+                                   temperature=temperature, verbose=None,
+                                   initial_prompt="以下是普通话的句子，使用简体中文。" if language == "zh" else None)
+        # No VAD in mlx-whisper: drop what Whisper itself marks as silence or a repetition loop
+        keep = [d for d in r["segments"]
+                if not (d.get("no_speech_prob", 0) > 0.6 and d.get("avg_logprob", 0) < -1.0)
+                and d.get("compression_ratio", 0) <= 2.4]
+        return [_Seg(d) for d in keep], r
 
 
 def load_whisper(size):

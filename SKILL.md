@@ -87,7 +87,7 @@ silence and dropped the original voice entirely. Do not use it.
 1. Edit the smallest thing: one item in `02_bilingual_script.json` (and the same id in `03_aligned_subtitles.json` for sub_only), or `config/overlay_style.json`.
 2. Re-run the validator of the stage you edited.
 3. `voice_dub`, if `tts_text` changed: `aicn_audio.py dub`, `mix`, `master`, `verify` (only the edited sentence is re-synthesized). For a mix-only change (`config/audio_mix.json`): `mix`, `master`, `verify`.
-4. `aicn.py render --unit U`: one ffmpeg pass over the unit (≈ 2 min per 10 min of video). It is skipped when nothing it reads changed.
+4. `aicn.py plan --unit U` says `render=current` or `stale: <parts>`; anything other than the part you edited means an unintended change. Then `aicn.py render --unit U`: one ffmpeg pass over the unit (≈ 2 min per 10 min of video). It is skipped when nothing it reads changed.
 5. `aicn.py verify-overlay`, Stage 5 import with `--qa-timestamps` at cue midpoints (always including edited cues), view the QA frames of changed chunks, `verify_stage_5.py`.
 6. `aicn.py log --unit U --kind fix --message "<what> (<why>) -> rerun: <stages/chunks>"`.
 

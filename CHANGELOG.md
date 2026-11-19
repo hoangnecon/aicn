@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1 (2026-11-19)
+- MLX Whisper: forced Simplified Chinese (it returned 146 Traditional characters on unit 07) and drops segments Whisper marks as silence or repetition loops (no VAD in mlx-whisper). Full Stage 1 on unit 07: 105 s, sub-clause coverage 210/211 as before, punctuation now kept.
+- `plan` understands the ffmpeg engine: prints `render=current` or `stale: <parts>`.
+- The ffmpeg band is computed from the scan and the plates (`band_y0`) instead of a fixed y = 760, so 720p, vertical sources and high subtitles are masked in the right place.
+- `tts_workers` option for VieNeu. Default 1: VieNeu ONNX already uses every core (3 workers measured 9% faster, 4 slower).
+
 ## 1.2.0 (2026-11-19)
 - `aicn.py doctor`: probes chip, cores, RAM, ffmpeg filters/encoders, MLX, models and tools; writes `config/machine.json` and names the stack to use.
 - Stage 4 default engine is now one ffmpeg pass (`ff-1.0`): Python only draws mask and plate PNGs, ffmpeg decodes, masks, overlays, encodes and muxes. Unit 07: 116 s instead of 207–400 s. Every source frame keeps its own timestamp (VFR-safe): 18,277 frames out of 18,277.

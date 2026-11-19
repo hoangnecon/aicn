@@ -70,10 +70,11 @@ workspace/<series>/                      Series Hub
      subtitles/final_<series>_full_vi.srt
 ```
 
-New series: `aicn.py init-series --series-slug S --title T --total-episodes N --rights <basis>`
-(`--rights` is required: `own`, `licensed:<contract>`, `cps:<platform>`, `mcn:<name>`).
-New unit: `init_workspace.py --topology series_episodic ...`, then `aicn.py adopt --unit <unit>`.
-Units made before this skill are adopted the same way.
+New series: `aicn.py init-series --series-slug <slug> --title "<Tên Tiếng Việt>" --total-episodes N --rights <basis>`
+- **Naming rule (mandatory, enforced by CLI):** `--series-slug` MUST be the **Vietnamese translated title**, **no accents**, **lowercase**, **hyphen-separated** (`[a-z0-9]+(-[a-z0-9]+)*`), e.g. `《那年十八我造神器》` → `nam-18-tuoi-toi-che-tao-than-khi`. Never use pinyin, underscores, uppercase, or arbitrary names.
+- `--rights` is required: `own`, `licensed:<contract>`, `cps:<platform>`, `mcn:<name>`.
+- New internal working batch: `init_workspace.py --topology series_episodic ...`, then `aicn.py adopt --unit <batch>`.
+- Every folder, subfolder, Markdown checklist, and per-stage report template/format is specified in `references/folder_contract.md`.
 
 ## 3. Stages and gates
 

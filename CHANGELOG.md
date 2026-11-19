@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1 (2026-11-20)
+- **Series naming & folder/markdown contract**:
+  - `aicn.py init-series` now enforces Vietnamese translated, no-accent, lowercase, hyphen-separated `--series-slug` (`^[a-z0-9]+(-[a-z0-9]+)*$`, e.g. `nam-18-tuoi-toi-che-tao-than-khi`).
+  - Expanded `references/folder_contract.md` and `SKILL.md` with the complete parent/child directory tree, per-folder contents, and per-stage Markdown checklist/report templates & fill formats.
+
 ## 1.3.0 (2026-11-20)
 - **Full-series release contract ("1 published video = 1 FULL series")**:
   - Working batches under `units/*` are strictly internal work slices (caching, QA, pipelining) — never standalone uploads.

@@ -238,6 +238,13 @@ def write_if_absent(p, content):
 
 
 def cmd_init_series(a):
+    import re
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", a.series_slug):
+        sys.exit(
+            f"[init-series] invalid --series-slug '{a.series_slug}': "
+            "must be translated to Vietnamese, no accents, lowercase, hyphen-separated "
+            "(e.g. 'nam-18-tuoi-toi-che-tao-than-khi')"
+        )
     hub = os.path.abspath(os.path.join(a.workspace_root, a.series_slug))
     for d in ("config", "source_inbox", "units", "deliverables/16x9", "deliverables/9x16",
               "deliverables/subtitles", "deliverables/episodes", "posters", ".cache/chunks", ".cache/tts"):

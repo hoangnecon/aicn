@@ -190,6 +190,13 @@ class CLI(unittest.TestCase):
                              "--total-episodes", "10")
             self.assertNotEqual(r.returncode, 0)
 
+    def test_init_series_enforces_vietnamese_hyphen_slug(self):
+        with tempfile.TemporaryDirectory() as d:
+            for bad in ("na_nian_shi_ba", "Nam-18-Tuoi", "năm-18-tuổi", "-bad", "bad--slug"):
+                r = self.run_cli("init-series", "--workspace-root", os.path.join(d, "workspace"),
+                                 "--series-slug", bad, "--title", "T", "--total-episodes", "10", "--rights", "own")
+                self.assertNotEqual(r.returncode, 0, f"should reject {bad}")
+
     def test_init_series_then_discover(self):
         with tempfile.TemporaryDirectory() as d:
             r = self.run_cli("init-series", "--workspace-root", os.path.join(d, "workspace"), "--series-slug", "demo", "--title", "Demo",

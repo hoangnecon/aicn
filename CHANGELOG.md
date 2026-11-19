@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0 (2026-11-19)
+- `aicn.py doctor`: probes chip, cores, RAM, ffmpeg filters/encoders, MLX, models and tools; writes `config/machine.json` and names the stack to use.
+- Stage 4 default engine is now one ffmpeg pass (`ff-1.0`): Python only draws mask and plate PNGs, ffmpeg decodes, masks, overlays, encodes and muxes. Unit 07: 116 s instead of 207–400 s. Every source frame keeps its own timestamp (VFR-safe): 18,277 frames out of 18,277.
+- Mask style `mask_mode`: `blur` (default) or `solid` (black box, about 12% faster); `render --mask` overrides.
+- Unchanged inputs skip the render entirely. The old per-frame renderer stays as `render --engine python`.
+- Stage 1 Whisper runs on MLX (Metal) when `mlx_whisper` is installed: 48 s instead of 194 s for one pass on unit 07. `AICN_ASR=faster` forces the CPU path.
+
 ## 1.1.0 (2026-11-19)
 - New Stage 3 engine `scripts/aicn_audio.py` replaces `assemble_master_audio.py`, which replaced a missing Demucs stem with silence and shipped dub-only audio.
 - Demucs (MLX) stems are mandatory. The original voice, music and effects stay in the master.

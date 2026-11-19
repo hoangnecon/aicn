@@ -36,7 +36,7 @@ $PY $V/video-asr-visual-audit/scripts/extract_audit_frames.py --video $U/source/
 $PY $V/video-asr-visual-audit/scripts/verify_stage_1.py --workspace $U
 ```
 
-Outputs: `01_asr_raw_segments.json` (faster-whisper small, int8, multi-pass) and
+Outputs: `01_asr_raw_segments.json` (Whisper small on MLX/Metal when `mlx_whisper` is installed, else faster-whisper int8; multi-pass; `AICN_ASR=faster` forces CPU) and
 `01_zh_bbox_scan.json` (5 fps, Chinese line intervals and bboxes). These are frozen;
 `$A plan` reports when the source hash no longer matches them.
 
@@ -69,7 +69,7 @@ Requirements: `rubberband` (`brew install rubberband`) and `uvx` (for `demucs-ml
 
 ```bash
 $A plan --unit $U            # cached / changed:<parts> per chunk
-$A render --unit $U          # dirty chunks only, then concat + mux -> media/.staging_render.mp4
+$A render --unit $U          # one ffmpeg pass (mask_mode blur|solid, --mask to override) -> media/.staging_render.mp4
 $A verify-overlay --unit $U  # Stage 4 gate
 ```
 

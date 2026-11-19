@@ -6,7 +6,7 @@ changing one subtitle line re-renders one episode chunk in about 40 seconds inst
 the whole unit.
 
 - `SKILL.md`: what the agent reads (entry point, stages, edit loop, rules).
-- `scripts/aicn.py`: the engine (discover, init-series, adopt, plan, tts-sync, render, verify-overlay, log, progress).
+- `scripts/aicn.py`: the engine (doctor, discover, init-series, adopt, plan, tts-sync, render, verify-overlay, log, progress).
 - `scripts/aicn_audio.py`: Stage 3 audio (Demucs stems, sentence-level dub, frequency-aware mix, -14 LUFS master, audio gate).
 - `vendor/`: the five stage skills it drives, with their gate scripts. See `vendor/README.md`.
 - `references/`: folder contract, stage commands, caching design, production time.
@@ -28,7 +28,8 @@ bash ~/Work/AICN/skills/aicn/install.sh
 | Tool | Used for |
 |---|---|
 | macOS on Apple Silicon | `h264_videotoolbox` encoder, Avenir Next font |
-| `ffmpeg`, `ffprobe` | decode, encode, concat, mux |
+| `ffmpeg`, `ffprobe` (needs `gblur`, `alphamerge`, `overlay`) | one-pass render: decode, mask, overlay, encode, mux |
+| `mlx-whisper` in `$AICN_PY` | Stage 1 ASR on Metal (falls back to faster-whisper) |
 | Python 3.10+ with numpy, Pillow, scipy | `aicn.py` renderer |
 | VieNeu-TTS venv (`/Users/Shared/Tools/VieNeu-TTS/.venv`, or `$AICN_PY`) | faster-whisper, TTS, stage scripts, `aicn_audio.py` |
 | `rubberband` (`brew install rubberband`) | time-stretch of the dub, formants preserved |
@@ -37,6 +38,7 @@ bash ~/Work/AICN/skills/aicn/install.sh
 ## Quick start
 
 ```bash
+python3 scripts/aicn.py doctor --root ~/Work/AICN
 python3 scripts/aicn.py discover --root ~/Work/AICN
 python3 scripts/aicn.py plan --unit workspace/<series>/units/<unit>
 python3 scripts/aicn.py render --unit workspace/<series>/units/<unit>

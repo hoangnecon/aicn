@@ -83,13 +83,35 @@ class TTSKey(unittest.TestCase):
         self.assertNotEqual(aicn.tts_key(a, "Trúc Ly"), aicn.tts_key(a, "Hải Đăng"))
 
 
+
+class FfmpegTimeline(unittest.TestCase):
+    """build_timeline must cover the whole video exactly and show the right PNG at each time."""
+    def test_segments_cover_duration_and_switch_at_events(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow missing")
+        prof = {"width": 320, "height": 1080, "duration": 10.0}
+        style = dict(aicn.DEFAULT_STYLE, temporal_pad_s=0.0)
+        scan = {"strip_y0": 880, "hardsub_intervals": [{"start": 1.0, "end": 3.0, "bbox": [50, 250, 10, 60]}]}
+        cues = [{"id": 0, "show_a": 2.0, "show_b": 4.0}]
+        plates = {0: (Image.new("RGBA", (320, 80), (0, 0, 0, 135)), 900)}
+        with tempfile.TemporaryDirectory() as d:
+            aicn.build_timeline(d, prof, cues, scan, style, plates, d)
+            for kind, want in (("m", [1.0, 2.0, 7.0]), ("p", [2.0, 2.0, 6.0])):
+                lines = open(os.path.join(d, kind + ".ffconcat")).read().split("\n")
+                durs = [float(x.split()[1]) for x in lines if x.startswith("duration")]
+                self.assertAlmostEqual(sum(durs), 10.0, places=4)
+                self.assertEqual([round(x, 3) for x in durs], want)
+
+
 class CLI(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, SCRIPT, *args], capture_output=True, text=True)
 
     def test_help_lists_all_commands(self):
         out = self.run_cli("--help").stdout
-        for c in ("discover", "init-series", "adopt", "plan", "tts-sync", "render",
+        for c in ("doctor", "discover", "init-series", "adopt", "plan", "tts-sync", "render",
                   "verify-overlay", "log", "progress"):
             self.assertIn(c, out)
 

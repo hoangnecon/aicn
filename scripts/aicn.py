@@ -35,6 +35,7 @@ SKILL_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file
 VENDOR = os.path.join(SKILL_DIR, "vendor")
 
 RENDERER_VERSION = "styleB-1.4"
+FF_RENDERER_VERSION = "ff-1.0"
 TTS_ENGINE_TAG = "vieneu-v3-turbo-48k"
 DEFAULT_STYLE = {
     "name": "B_hug_box",
@@ -52,6 +53,8 @@ DEFAULT_STYLE = {
     "box_pad_x": 18, "box_pad_y": 14,
     "temporal_pad_s": 0.05,
     "drift_tolerance_s": 0.30,
+    "mask_mode": "blur",        # blur | solid (black box, about 12% faster)
+    "solid_rgb": [0, 0, 0],
 }
 ENCODE = {"vcodec": "h264_videotoolbox", "bitrate": "5000k", "pix_fmt": "yuv420p"}
 
@@ -554,7 +557,152 @@ def centre_y_of(scan, prof):
     return int(sy + statistics.median((iv["bbox"][2] + iv["bbox"][3]) / 2 for iv in ivs))
 
 
+FF_BAND_Y0 = 760
+
+# ----------------------------------------------------------------- one-pass ffmpeg renderer (default)
+def build_timeline(ws, prof, cues, scan, style, plates, work):
+    """Python draws only PNGs: one per distinct set of active Chinese masks, one per Vietnamese plate.
+    Two ffconcat lists time them; ffmpeg does decode, mask, overlay, encode, mux in one process."""
+    from PIL import Image, ImageDraw, ImageFilter
+    W, H = int(prof.get("width", 1920)), int(prof.get("height", 1080))
+    y0 = FF_BAND_Y0; bh = H - y0
+    sy, pad = scan.get("strip_y0", prof.get("strip_y0", 880)), style["temporal_pad_s"]
+    grow = int(style["mask_feather"] * 1.5)
+    items = [("m", tuple(iv["bbox"]), iv["start"] - pad, iv["end"] + pad) for iv in scan.get("hardsub_intervals", [])]
+    items += [("p", c["id"], c["show_a"] - pad, c["show_b"] + pad) for c in cues]
+
+    def mask_img(bbs):
+        m = Image.new("L", (W, bh), 0); d = ImageDraw.Draw(m)
+        for x0, x1, ry0, ry1 in bbs:
+            b = (max(0, x0 - style["box_pad_x"] - grow), sy + ry0 - style["box_pad_y"] - grow - y0,
+                 min(W, x1 + style["box_pad_x"] + grow), sy + ry1 + style["box_pad_y"] + grow - y0)
+            d.rounded_rectangle(b, radius=max(1, (b[3] - b[1]) // 2), fill=255)
+        return m.filter(ImageFilter.GaussianBlur(style["mask_feather"]))
+
+    def plate_img(pid):
+        band = Image.new("RGBA", (W, bh), (0, 0, 0, 0))
+        if pid is not None:
+            img, oy = plates[pid]
+            band.alpha_composite(img.crop((0, max(0, y0 - oy), W, img.height)), (0, max(0, oy - y0)))
+        return band
+
+    dur = float(prof.get("duration") or ffprobe_duration(os.path.join(ws, "source", "master_source.mp4")))
+    bounds = sorted({0.0, dur} | {max(0.0, min(dur, t)) for it in items for t in it[2:]})
+    seqs, made = {"m": [], "p": []}, set()
+    os.makedirs(work, exist_ok=True)
+    for a_, b_ in zip(bounds, bounds[1:]):
+        if b_ - a_ < 1e-4:
+            continue
+        mid = (a_ + b_) / 2
+        act = sorted((it for it in items if it[2] <= mid < it[3]), key=lambda x: x[2])
+        keys = {"m": tuple(sorted(it[1] for it in act if it[0] == "m")),
+                "p": next((it[1] for it in act if it[0] == "p"), None)}
+        for kind, key in keys.items():
+            name = f"{kind}_{hashlib.sha1(repr(key).encode()).hexdigest()[:12]}.png"
+            if name not in made:
+                (mask_img(key) if kind == "m" else plate_img(key)).save(os.path.join(work, name), compress_level=1)
+                made.add(name)
+            sq = seqs[kind]
+            if sq and sq[-1][0] == name:
+                sq[-1][1] += b_ - a_
+            else:
+                sq.append([name, b_ - a_])
+    for kind, sq in seqs.items():
+        with open(os.path.join(work, kind + ".ffconcat"), "w") as f:
+            f.write("ffconcat version 1.0\n")
+            f.writelines(f"file '{n}'\nduration {d:.6f}\n" for n, d in sq)
+            f.write(f"file '{sq[-1][0]}'\n")
+    return len(made)
+
+
+def ffprobe_duration(p):
+    return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p],
+                                capture_output=True, text=True).stdout.strip() or 0)
+
+
+def render_ffmpeg(ws, prof, style, work, audio, out):
+    W, H = int(prof.get("width", 1920)), int(prof.get("height", 1080))
+    y0 = FF_BAND_Y0; bh = H - y0
+    fps = prof.get("fps", 30)
+    if style.get("mask_mode", "blur") == "solid":
+        r, g, b = style.get("solid_rgb", [0, 0, 0])
+        head = f"[0:v]null[base];color=c=0x{r:02x}{g:02x}{b:02x}:s={W}x{bh}:r={fps},format=rgba[cov];"
+    else:
+        sig, dk = style["blur_sigma"], style["blur_darken"]
+        # blur the band at 1/4 size: same look as sigma at full size, ~16x cheaper
+        head = (f"[0:v]split[base][src];[src]crop={W}:{bh}:0:{y0},scale={W // 4}:{bh // 4},gblur=sigma={sig / 4:.2f},"
+                f"scale={W}:{bh},colorchannelmixer=rr={dk}:gg={dk}:bb={dk},format=rgba[cov];")
+    fg = (head + f"[1:v]format=gray,fps={fps}[mk];[cov][mk]alphamerge[covm];"
+          f"[base][covm]overlay=0:{y0}:eof_action=pass:format=auto[v1];"
+          f"[2:v]format=rgba,fps={fps}[pl];[v1][pl]overlay=0:{y0}:eof_action=pass:format=auto,format={ENCODE['pix_fmt']}[v]")
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", os.path.join(ws, "source", "master_source.mp4"),
+           "-f", "concat", "-safe", "0", "-i", os.path.join(work, "m.ffconcat"),
+           "-f", "concat", "-safe", "0", "-i", os.path.join(work, "p.ffconcat")]
+    if os.path.exists(audio):
+        cmd += ["-i", audio]
+    cmd += ["-filter_complex", fg, "-map", "[v]"]
+    cmd += ["-map", "3:a", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if os.path.exists(audio) else ["-an"]
+    # passthrough keeps every source frame with its own timestamp: VFR-safe, no drift against audio
+    cmd += ["-c:v", ENCODE["vcodec"], "-b:v", ENCODE["bitrate"], "-g", str(int(round(fps * 2))),
+            "-fps_mode", "passthrough", "-sn", "-movflags", "+faststart", out + ".part.mp4"]
+    subprocess.run(cmd, check=True)
+    os.replace(out + ".part.mp4", out)
+
+
 def cmd_render(a):
+    if a.engine == "python":
+        return cmd_render_chunks(a)
+    import numpy as np
+    from PIL import ImageFont
+    ws = os.path.abspath(a.unit)
+    if not a.no_gate:
+        cicd().require_gate(ws, 3)
+    fh = FastHash(ws)
+    prof, eps, cues, scan, style = load_unit(ws)
+    if a.mask:
+        style["mask_mode"] = a.mask
+    font = ImageFont.truetype(style["font_path"], style["font_size"], index=style.get("font_index", 0))
+    W = int(prof.get("width", 1920)); cy = centre_y_of(scan, prof)
+    plates, geom_log = {}, []
+    for c in cues:
+        img, oy, g = build_plate({"text": c["sub_text"]}, style, W, cy, font)
+        plates[c["id"]] = (img, oy)
+        geom_log.append({"id": c["id"], "slot_start": c["show_a"], "slot_end": c["show_b"], "style": "frosted_glass",
+                         "style_name": style["name"], "lines": g["lines"], "n_lines": g["n_lines"],
+                         "box": [g["box_abs"][0], g["box_abs"][1] - prof.get("strip_y0", 880), g["box_abs"][2],
+                                 g["box_abs"][3] - prof.get("strip_y0", 880)], "line_px": g["max_line_px"]})
+    jdump(os.path.join(ws, "data", "04_overlay_geometry_log.json"), {"renderer": FF_RENDERER_VERSION, "centre_y": cy, "cues": geom_log})
+    src = os.path.join(ws, "source", "master_source.mp4")
+    audio = os.path.join(ws, "media", "master_audio_48k.wav")
+    parts = {"cues": [(c["id"], c["sub_text"], round(c["show_a"], 3), round(c["show_b"], 3)) for c in cues],
+             "ivs": [(iv["start"], iv["end"], iv["bbox"]) for iv in scan.get("hardsub_intervals", [])],
+             "style": style, "src": fh(src), "audio": fh(audio) if os.path.exists(audio) else None,
+             "enc": ENCODE, "v": FF_RENDERER_VERSION}
+    key = h_obj(parts)
+    out = os.path.join(ws, "media", ".staging_render.mp4")
+    state = jload(os.path.join(ws, ".cache", "build_state.json"), {"chunks": {}, "tts": {}})
+    prev = state.get("render", {})
+    if prev.get("key") == key and os.path.exists(out):
+        print("[render] unchanged -> staging is current"); fh.save(); return
+    t0 = time.time()
+    work = os.path.join(ws, ".cache", "timeline", key[:16])
+    n = build_timeline(ws, prof, cues, scan, style, plates, work)
+    t1 = time.time()
+    print(f"[render] timeline: {n} PNGs in {t1 - t0:.1f}s; ffmpeg one pass, mask={style['mask_mode']}", flush=True)
+    render_ffmpeg(ws, prof, style, work, audio, out)
+    print(f"[render] ffmpeg {time.time() - t1:.1f}s -> {out}")
+    state["render"] = {"engine": "ffmpeg", "key": key, "parts": {k: h_obj(v) for k, v in parts.items()},
+                       "mask": style["mask_mode"], "renderer": FF_RENDERER_VERSION}
+    state["last_render"] = {"at": now(), "rendered": 1, "reused": 0, "output": out, "seconds": round(time.time() - t0, 1)}
+    jdump(os.path.join(ws, ".cache", "build_state.json"), state)
+    fh.save()
+    for old in glob.glob(os.path.join(ws, ".cache", "timeline", "*")):
+        if not old.endswith(key[:16]):
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def cmd_render_chunks(a):
+    """Legacy per-frame Python renderer (refine_x re-measure). --engine python."""
     import numpy as np
     from PIL import ImageFont
     ws = os.path.abspath(a.unit)
@@ -641,7 +789,10 @@ def cmd_verify_overlay(a):
     # 2. lines / width
     lines_bad = [x["id"] for x in geom if x["n_lines"] > style["max_lines"] or x["line_px"] > W - 120]
     # 3. renderer masks every hardsub interval by construction; check every chunk output exists
-    chunk_files = [os.path.join(ws, ".cache", "chunks", v["key"] + ".mp4") for v in state.get("chunks", {}).values()]
+    if state.get("render", {}).get("engine") == "ffmpeg":   # one-pass: the staging file is the only artifact
+        chunk_files = [os.path.join(ws, "media", ".staging_render.mp4")]
+    else:
+        chunk_files = [os.path.join(ws, ".cache", "chunks", v["key"] + ".mp4") for v in state.get("chunks", {}).values()]
     missing_chunks = [p for p in chunk_files if not os.path.exists(p)]
     staging = os.path.join(ws, "media", ".staging_render.mp4")
     dur_ok = False
@@ -710,10 +861,44 @@ def cmd_progress(a):
     print("[progress] refreshed")
 
 
+# ----------------------------------------------------------------- doctor (machine ingest)
+def cmd_doctor(a):
+    """Probe the machine once and write config/machine.json so every stage uses the native stack."""
+    import platform
+    sh = lambda *c: subprocess.run(c, capture_output=True, text=True).stdout
+    m = {"at": now(), "os": platform.platform(), "arch": platform.machine(),
+         "chip": sh("sysctl", "-n", "machdep.cpu.brand_string").strip(),
+         "cores": os.cpu_count(), "ram_gb": round(int(sh("sysctl", "-n", "hw.memsize") or 0) / 2**30, 1)}
+    filters, encoders = sh("ffmpeg", "-hide_banner", "-filters"), sh("ffmpeg", "-hide_banner", "-encoders")
+    m["ffmpeg"] = {"version": (sh("ffmpeg", "-version").split("\n") or [""])[0],
+                   "filters": {f: f" {f} " in filters for f in ("gblur", "boxblur", "overlay", "alphamerge", "drawbox",
+                                                                 "subtitles", "drawtext", "scale_vt")},
+                   "encoders": {e: e in encoders for e in ("h264_videotoolbox", "hevc_videotoolbox", "libx264")}}
+    py = os.environ.get("AICN_PY", "/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python")
+    probe = lambda mod: subprocess.run([py, "-c", f"import {mod}"], capture_output=True).returncode == 0
+    m["python"] = {"path": py, **{k: probe(k) for k in ("mlx.core", "mlx_whisper", "faster_whisper", "soundfile", "cv2")}}
+    m["tools"] = {t: bool(shutil.which(t)) for t in ("rubberband", "uvx", "ffprobe")}
+    hub = os.path.expanduser("~/.cache/huggingface/hub")
+    m["models"] = sorted(d for d in (os.listdir(hub) if os.path.isdir(hub) else []) if "whisper" in d.lower())
+    m["choose"] = {
+        "asr": "mlx-whisper (Metal)" if m["python"]["mlx_whisper"] else "faster-whisper (CPU int8)",
+        "render": "ffmpeg one-pass" if m["ffmpeg"]["filters"]["gblur"] and m["ffmpeg"]["filters"]["alphamerge"] else "python chunks",
+        "encoder": "h264_videotoolbox" if m["ffmpeg"]["encoders"]["h264_videotoolbox"] else "libx264",
+        "stems": "demucs-mlx via uvx" if m["tools"]["uvx"] else "MISSING",
+        "stretch": "rubberband R3" if m["tools"]["rubberband"] else "MISSING (brew install rubberband)",
+    }
+    out = os.path.join(os.path.abspath(a.root), "config", "machine.json")
+    jdump(out, m)
+    for k, v in m["choose"].items():
+        print(f"  {k:8s} {v}")
+    print(f"[doctor] {m['chip']} {m['cores']} cores {m['ram_gb']} GB -> {out}")
+
+
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
+    p = sp.add_parser("doctor"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_doctor)
     p = sp.add_parser("discover"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_discover)
     p = sp.add_parser("init-series"); p.add_argument("--series-slug", required=True); p.add_argument("--title", default="")
     p.add_argument("--workspace-root", default="workspace"); p.add_argument("--total-episodes", default="?")
@@ -727,6 +912,8 @@ def main():
     p.add_argument("--store", action="store_true"); p.set_defaults(f=cmd_tts_sync)
     p = sp.add_parser("render"); p.add_argument("--unit", required=True); p.add_argument("--chunk-s", type=float, default=90)
     p.add_argument("--only", default=""); p.add_argument("--no-gate", action="store_true", help="tests only")
+    p.add_argument("--engine", choices=["ffmpeg", "python"], default="ffmpeg")
+    p.add_argument("--mask", choices=["blur", "solid"], default=None, help="override style mask_mode")
     p.set_defaults(f=cmd_render)
     p = sp.add_parser("verify-overlay"); p.add_argument("--unit", required=True); p.add_argument("--no-gate", action="store_true")
     p.set_defaults(f=cmd_verify_overlay)

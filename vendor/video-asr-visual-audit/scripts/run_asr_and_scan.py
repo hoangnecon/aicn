@@ -281,6 +281,43 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+
+class _Seg:
+    def __init__(self, d):
+        self.text, self.start, self.end = d["text"], d["start"], d["end"]
+        self.avg_logprob = d.get("avg_logprob", -0.2)
+
+
+class _MlxWhisper:
+    """faster-whisper compatible facade over mlx-whisper (Metal GPU, ~4x faster on Apple Silicon).
+    VAD options are ignored: mlx-whisper drops silence through no_speech_threshold."""
+    REPO = {"small": "mlx-community/whisper-small-mlx", "base": "mlx-community/whisper-base-mlx",
+            "medium": "mlx-community/whisper-medium-mlx", "large-v3": "mlx-community/whisper-large-v3-mlx"}
+
+    def __init__(self, size):
+        self.repo = self.REPO.get(size, size)
+
+    def transcribe(self, audio, language="zh", word_timestamps=False, beam_size=None, vad_filter=None,
+                   vad_parameters=None, condition_on_previous_text=True, temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)):
+        import mlx_whisper
+        r = mlx_whisper.transcribe(np.asarray(audio, np.float32), path_or_hf_repo=self.repo, language=language,
+                                   word_timestamps=word_timestamps, condition_on_previous_text=condition_on_previous_text,
+                                   temperature=temperature, verbose=None)
+        return [_Seg(d) for d in r["segments"]], r
+
+
+def load_whisper(size):
+    """AICN_ASR=mlx (default when mlx_whisper imports) or AICN_ASR=faster."""
+    if os.environ.get("AICN_ASR", "mlx") == "mlx":
+        try:
+            import mlx_whisper  # noqa: F401
+            print(f"[ASR] engine=mlx-whisper ({size}) on Metal", flush=True)
+            return _MlxWhisper(size)
+        except ImportError:
+            print("[ASR] mlx_whisper missing -> faster-whisper CPU", flush=True)
+    from faster_whisper import WhisperModel
+    return WhisperModel(size, device="cpu", compute_type="int8")
+
 def run_multipass_whisper_asr(
     video_path: str,
     vocals_path: str,
@@ -297,9 +334,8 @@ def run_multipass_whisper_asr(
         or swallowed inside a multi-clause segment is individually sliced and transcribed
         with bandpass-boosted audio (vad_filter=False).
     """
-    from faster_whisper import WhisperModel
     t0 = time.time()
-    print(f"[PLAN] Running Multi-Pass faster-whisper ({model_size}) -> {out_json}", flush=True)
+    print(f"[PLAN] Running Multi-Pass whisper ({model_size}) -> {out_json}", flush=True)
 
     raw_audio = decode_audio_16k(video_path)
     if os.path.exists(vocals_path):
@@ -311,7 +347,7 @@ def run_multipass_whisper_asr(
         voc_audio = raw_audio
         pass1_audio = raw_audio
 
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    model = load_whisper(model_size)
     vad_params = dict(threshold=0.28, min_speech_duration_ms=120, min_silence_duration_ms=250, speech_pad_ms=220)
     segments_gen, _ = model.transcribe(
         pass1_audio,

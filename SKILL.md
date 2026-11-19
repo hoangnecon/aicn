@@ -23,6 +23,16 @@ changed. Everything else comes from cache. Nothing is recomputed because it is "
 | Stage scripts | `<skill>/vendor/<stage-skill>/scripts/*.py`, run with `$AICN_PY` (default `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`) |
 | Gate tokens | `<unit>/.cicd/stage_N_gate.json`, signed, 100/100 required |
 
+## 0. Once per machine: doctor
+
+```bash
+python3 <skill>/scripts/aicn.py doctor --root <project-root>
+```
+
+It writes `config/machine.json` and prints the stack to use. On Apple Silicon that is:
+Whisper on MLX (Metal), Demucs MLX, ffmpeg one-pass render with `h264_videotoolbox`,
+rubberband. Python never touches video frames on the default path.
+
 ## 1. On entry: read the root
 
 ```bash
@@ -65,22 +75,21 @@ Exact commands per stage: `references/stages.md`.
 | 1 ASR + 5 fps hardsub scan + audit | Whisper timeline, Chinese line intervals, audit frames | `verify_stage_1.py` | source sha256. **Frozen** unless `plan` says the source changed |
 | 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) | `validate_bilingual_script.py` | none needed (seconds) |
 | 3 Audio | `aicn_audio.py all`: separate → dub → mix → master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: per sentence sha256(text, voice, engine, sampling) |
-| 4 Overlay (style B) | `plan`, `render` | `aicn.py verify-overlay` | per chunk: sha256(source, window, cues, hardsub intervals, style, font, encoder, renderer version) |
+| 4 Overlay (style B) | `render` (one ffmpeg pass) | `aicn.py verify-overlay` | whole unit: sha256(source, display cues, hardsub intervals, style, audio, encoder, renderer version); unchanged → skipped |
 | 5 QA + release | import staging MP4, QA frames, **view every frame**, log rows | `verify_stage_5.py` | n/a (stream copy) |
 
 `sub_only` mode: Stage 3 masters the original stereo (`aicn_audio.py all` skips separate/dub/mix).
 The old `assemble_master_audio.py` path is retired: it replaced a missing Demucs stem with
 silence and dropped the original voice entirely. Do not use it.
 
-## 4. Edit loop (the fast path, ≈ 40 s per line)
+## 4. Edit loop (≈ 2–3 min per edit)
 
 1. Edit the smallest thing: one item in `02_bilingual_script.json` (and the same id in `03_aligned_subtitles.json` for sub_only), or `config/overlay_style.json`.
 2. Re-run the validator of the stage you edited.
 3. `voice_dub`, if `tts_text` changed: `aicn_audio.py dub`, `mix`, `master`, `verify` (only the edited sentence is re-synthesized). For a mix-only change (`config/audio_mix.json`): `mix`, `master`, `verify`.
-4. `aicn.py plan --unit U`. Expect only chunks containing the edited cue to be `changed:<parts>`. If more are dirty, find out why before rendering.
-5. `aicn.py render --unit U`: dirty chunks only, then `-c copy` concat + one audio mux.
-6. `aicn.py verify-overlay`, Stage 5 import with `--qa-timestamps` at cue midpoints (always including edited cues), view the QA frames of changed chunks, `verify_stage_5.py`.
-7. `aicn.py log --unit U --kind fix --message "<what> (<why>) -> rerun: <stages/chunks>"`.
+4. `aicn.py render --unit U`: one ffmpeg pass over the unit (≈ 2 min per 10 min of video). It is skipped when nothing it reads changed.
+5. `aicn.py verify-overlay`, Stage 5 import with `--qa-timestamps` at cue midpoints (always including edited cues), view the QA frames of changed chunks, `verify_stage_5.py`.
+6. `aicn.py log --unit U --kind fix --message "<what> (<why>) -> rerun: <stages/chunks>"`.
 
 Undo is free: the old text restores the old key, and the chunk comes back from cache.
 
@@ -89,9 +98,11 @@ Undo is free: the old text restores the old key, and the chunk comes back from c
 Translucent black plate hugging each line: Avenir Next Demi Bold 48 px, white text,
 plate `rgba(0,0,0,135)`, radius 10, padding 20/10/12, line gap 12, ≤ 2 balanced lines,
 ≤ 1500 px per line, block centred on the unit's median hardsub centre (no jumping).
-The Chinese hardsub is hidden by a feathered blur (σ 22, ×0.82) **per Chinese interval
-from `01_zh_bbox_scan.json`, not per Vietnamese cue**. The renderer re-measures each line
-on its first real frame and grows the mask by 1.5 × feather, so no stroke or ghost leaks.
+The Chinese hardsub is hidden **per Chinese interval from `01_zh_bbox_scan.json`, not per
+Vietnamese cue**, with a feathered mask grown by 1.5 × feather. `mask_mode` in
+`config/overlay_style.json`: `blur` (default, σ 22, ×0.82) or `solid` (black box).
+The ffmpeg engine does not re-measure lines on the real frame; if a QA frame shows a
+clipped stroke, raise `box_pad_x` or use `render --engine python` (re-measures, ≈ 3× slower).
 
 ## 6. Audio: dub over the film, never instead of it
 
@@ -109,9 +120,8 @@ Full design, parameters and tuning: `references/audio_mix.md`.
 - Timeline truth is Whisper + the 5 fps scan. Never retime by eye; use `analyze_voice_waveform.py --snap-and-split`, then re-validate.
 - Display follows the Chinese line; audio does not move. `show_a/show_b` hold a cue to its line end (overlap ≥ 0.25 s) and snap a late first cue (≤ 1.0 s) to the line start. `slot_start/slot_end` never change.
 - `verify-overlay` fails on **blank**: a Chinese line blurred with no Vietnamese for > 0.30 s. Fix the script or Stage 1 data; do not raise the tolerance.
-- Chunks are frame-exact, so the concat has the source frame count and audio cannot drift.
-- `render --only` refuses to build a release while other chunks are stale.
-- Changed renderer code → bump `RENDERER_VERSION` in `aicn.py`.
+- The render keeps every source frame with its own timestamp (`-fps_mode passthrough`), so the output has the source frame count and audio cannot drift. Check the frame count after a render.
+- Changed renderer code → bump `FF_RENDERER_VERSION` (or `RENDERER_VERSION` for `--engine python`) in `aicn.py`.
 - The automated Stage 5 CV check has passed frames with visible Chinese strokes. Viewing each QA frame is mandatory.
 
 ## 8. How long a video takes
@@ -123,7 +133,6 @@ Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Every chunk is dirty after a one-line edit | style/font changed, renderer bumped, or source re-concatenated | `plan` names `changed:<part>`; revert the unintended change |
 | `plan` says the source changed | `master_source.mp4` was rebuilt | re-run Stage 1 for this unit, then downstream |
 | Final has only the dub voice, no film sound | old `assemble_master_audio.py` with no Demucs stem | use `aicn_audio.py all`; its gate checks `original_present` |
 | Dub sounds slurred or robotic on some lines | `atempo` speed-up, or a 2–4 syllable clause read alone | `aicn_audio.py dub` (sentences + rubberband) |
@@ -144,6 +153,8 @@ Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in
 - "Rights later" → `init-series` will not run without `--rights`.
 - "No stems, just mix the dub alone" → that is the bug that removed the film sound. Run `separate`.
 - "Speed it up with atempo" → rubberband only.
+- "Render frames in Python, it is more flexible" → ffmpeg one pass; Python draws PNGs only.
+- "faster-whisper is what the script used" → run `doctor`; on Apple Silicon use MLX.
 
 References: `references/stages.md`, `references/audio_mix.md`, `references/folder_contract.md`,
 `references/incremental_build.md`, `references/production_time.md`.

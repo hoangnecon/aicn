@@ -28,6 +28,8 @@ inputs changed. Everything else comes from cache. Nothing is recomputed because 
 | `<skill>` | the folder holding this file |
 | Engine | `python3 <skill>/scripts/aicn.py <cmd>` (`--help` lists commands) |
 | Hongguo Sourcing CLI | `node <skill>/scripts/hg_tool.cjs <cmd>` (backed by `tools/hongguo-drama`; replaces retired `ohg`) |
+| Douyin Sourcing CLI | `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py <cmd>` (backed by `Evil0ctal/Douyin_TikTok_Download_API`) |
+| Unified Radar & Index | `python3 <skill>/scripts/aicn_radar.py sync-all\|search\|top` (`data/drama_index.db`, Hongguo + Douyin + Bilibili) |
 | Stage scripts | `<skill>/vendor/<stage-skill>/scripts/*.py`, run with `$AICN_PY` (default `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`) |
 | Gate tokens | `<unit>/.cicd/stage_N_gate.json`, signed, 100/100 required |
 | RSI Ledger | `<skill>/LESSONS.md` + `references/recursive_self_improvement.md` |
@@ -56,19 +58,23 @@ It lists each Series Hub (`workspace/<series>/` with `units/` and
 Then read, in order: hub `PROGRESS.md`, the last 20 lines of the unit `CHANGELOG.md`,
 the unit `CHECKLIST.md`. Do not open media to find out where things stand.
 
-## 1b. Sourcing, Discovery Analytics & Candidate Lists (`tools/hongguo-drama`)
+## 1b. Sourcing, Discovery Analytics & Candidate Lists (Chinese-First, Zero YouTube)
 
 Full sourcing & analytics guide: `references/sourcing_and_analytics.md`.
-Primary engine: **`jackotom/hongguo-drama`** at `<project-root>/tools/hongguo-drama` via `node <skill>/scripts/hg_tool.cjs` (`openhongguo`/`ohg` is retired and deleted).
+Original-platform engines: **`jackotom/hongguo-drama`** (`scripts/hg_tool.cjs`), **`Evil0ctal/Douyin_TikTok_Download_API`** (`scripts/dy_tool.py`), **`yt-dlp`** (Bilibili `--user-agent`), indexed together by **`scripts/aicn_radar.py`** -> `data/drama_index.db`.
 
-- **Freshness-first discovery:** Always combine `hg_tool.cjs new --genre ai|real|all` (sorted by launch date descending, `红果首发`) with `hg_tool.cjs rank --category hot-ai-drama|hot-real-drama|hot-comic-drama` and `hg_tool.cjs search "<kw>"`. Do not pitch stale/old dramas as "trending".
-- **Analytics filter:** Prefer `AI仿真人剧` (`hot-ai-drama`), `真人喜剧` (`hot-real-drama`), or `3D漫剧` (`hot-comic-drama`) in the **50–120 ep (~60–150 min)** sweet spot; verify playable episodes via `hg_tool.cjs episodes <series_id>` before pitching.
+- **Chinese-original sources only (NO YouTube):** Never search or download Chinese dramas from YouTube (YouTube hosts recaps/re-ups). Always start discovery in **Chinese keywords (`中文`)** and pull exclusively from original Chinese platforms (**Hongguo `红果`**, **Douyin `抖音`**, **Bilibili `B站`**, **Hema `河马`**, **Kuaishou `快手`**).
+- **Search local analytics index first:** Run `aicn_radar.py sync-all` periodically, then query `aicn_radar.py search "<中文关键词>"` or `aicn_radar.py top --format ai --limit 15` (scored by recency-weighted engagement velocity from `first_visible_time`/`create_time` + `likes` + `favorites`).
+- **Freshness-first live queries:** Combine `hg_tool.cjs new --genre ai|real|all`, `hg_tool.cjs rank --category hot-ai-drama|hot-real-drama|hot-comic-drama`, `dy_tool.py detail` + `related_posts`, and `yt-dlp bilisearch`. Do not pitch stale/old dramas as "trending".
 - **Mandatory Candidate List Contract:** Every shortlist presented to the user MUST be written to an artifact and include for **every** candidate:
   1. **Vietnamese translated title** + original Chinese title (`ZH`) + valid Vietnamese `--series-slug`.
-  2. `series_id`, format/genre, episode count, estimated total duration, and recency/trend signal.
+  2. Platform (`hongguo`/`douyin`/`bilibili`), `series_id` / `aweme_id`, format/genre, episode count, publish date (`age`), likes/favorites/heat score.
   3. **Vietnamese synopsis** (2–4 sentences covering hook, comedy/drama beat, and main cast).
-  4. **Local `.jpg` cover thumbnail** fetched & converted via `hg_tool.cjs fetch-covers` and embedded directly in the artifact.
-- **1080p Download + CENC Decrypt:** `node <skill>/scripts/hg_tool.cjs download <series_id> --episodes 1-10 --out <inbox_batch_dir> --quality 1080p` (uses V5 `video_tab` GET signing + local `spade_a` key derivation + `ffmpeg -decryption_key`).
+  4. **Local `.jpg` cover thumbnail** fetched via `hg_tool.cjs fetch-covers` or `dy_tool.py detail --cover-out` and embedded directly in the artifact.
+- **No-Watermark / 1080p Downloads:**
+  - Hongguo: `node <skill>/scripts/hg_tool.cjs download <series_id> --episodes 1-10 --out <inbox_batch_dir> --quality 1080p`
+  - Douyin: `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py download <aweme_id_or_mix_id> --out <inbox_batch_dir>` (clean watermark-free MP4)
+- **Facebook Caption Standard (when user asks for upload metadata):** 2-line minimal format — Line 1: `[TRỌN BỘ THUYẾT MINH] <Hook Title> | Full N Tập`; Line 2: all-lowercase broad hashtags (`#aishortfilmdrama #aishortdrama #aifilm #phimai #phimngan #phimthuyetminh #phimtrungquoc ...`, never awkward genre calque tags).
 
 ## 2. Folder contract
 
@@ -195,7 +201,8 @@ Whenever an upstream API breaks, a QA gate fails, the user corrects an output/wo
 - "faster-whisper is what the script used" → run `doctor`; on Apple Silicon use MLX.
 - "Upload one unit/batch as a standalone episode" → never. `units/` are internal working batches; every published video must be the full series assembled by `aicn.py merge-series`.
 - "Skip dubbing (`sub_only`) to hit a time target" → never. Every full-series release requires complete Vietnamese dubbing + subtitles.
-- "Use `ohg` / `openhongguo` to download" → retired and deleted; always use `node <skill>/scripts/hg_tool.cjs` (`tools/hongguo-drama`).
+- "Use `ohg` / `openhongguo` to download" → retired and deleted; always use `hg_tool.cjs` (Hongguo) or `dy_tool.py` (Douyin).
+- "Grab Chinese dramas from YouTube or search in Vietnamese/English first" → forbidden. YouTube is recap/re-up. Search in Chinese and acquire only from Hongguo, Douyin, Bilibili, Hema, or Kuaishou.
 - "Present a candidate list with only Chinese titles or without thumbnails" → never. Always include Vietnamese title, Vietnamese synopsis, `--series-slug`, recency/trend signal, and embedded local `.jpg` covers.
 - "I'll remember not to make that mistake next time" → never prose-only; log `L-NNN` in `LESSONS.md` and codify into code, tests, or a hard gate.
 

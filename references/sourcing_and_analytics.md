@@ -54,10 +54,29 @@ Never pick candidates from a single static list or old viral hits. Combine **fre
    - **High-retention hooks:** Strong opening 20% hook (transmigration, time-travel family comedy, hidden identity reversal, prodigy kid, system gag) where 50% of YouTube replay peaks cluster.
    - **Verify playable episodes:** Run `hg_tool.cjs episodes <series_id>` to confirm episode count and valid `video_id`s before pitching.
 
-### Secondary Chinese & International Open-Source Sources (Backup Stack)
-- **Bundled inside `tools/hongguo-drama/src/native/`:** `hema.js` (`河马剧场`), `xifan.js` (`喜番`), `dramabox.js` (DramaBox), `reelshort.js` (ReelShort).
-- **Bilibili (`B站`):** `yutto` (`yutto-dev/yutto`) or `yt-dlp --user-agent`.
-- **Douyin (`抖音`):** `Evil0ctal/Douyin_TikTok_Download_API` or `JoeanAmier/TikTokDownloader` (requires fresh browser cookies).
+### Secondary & Multi-Platform Original Sources (`tools/Douyin_TikTok_Download_API` + `aicn_radar.py`)
+
+> **Mandatory Origin Rule (NO YouTube):** Never search, pitch, or download Chinese dramas from YouTube (`YouTube` is downstream recap/re-up). Always start with **Chinese keywords (`中文`)** and extract directly from original Chinese platforms.
+
+#### Douyin (`抖音`) — `scripts/dy_tool.py`
+Powered by [`Evil0ctal/Douyin_TikTok_Download_API`](../../tools/Douyin_TikTok_Download_API) pure-Python `ABogus` + `websign` (`x-secsdk-web-signature`) + `curl_cffi` (`chrome131` TLS) + local headless Chrome guest cookie minting (`tools/.venv-dy`, **no Douyin login needed** for detail/related/mix/hot):
+- **Inspect video + author + stats + `.jpg` cover:** `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py detail <aweme_id_or_url> --cover-out <path.jpg>`
+- **Download watermark-free MP4 (auto-verified via `ffprobe`):** `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py download <aweme_id> --out <dir>`
+- **Inspect collection (`合集`):** `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py mix <mix_id>`
+- **Douyin Hot Boards:** `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py hot --board hot|entertainment|challenge`
+- *Douyin discovery pattern:* Douyin refuses `GENERAL_SEARCH` (`status_code 2483`) to guest cookies, **but** `related_posts` (`/aweme/v1/web/aweme/related/`) works without login and returns 10 adjacent viral AI short dramas per seed (with exact `create_time`, `digg_count`, `collect_count`, `author`).
+
+#### Unified Analytics & Search Index — `scripts/aicn_radar.py`
+Stores Hongguo (`new` + `rank` + `first_visible_time` + `likes/favorites`), Douyin (`detail` + 2-hop `related_posts` BFS + `hot`), and Bilibili (`yt-dlp bilisearch --user-agent`) into `data/drama_index.db` (SQLite + FTS5) scored by recency-weighted engagement velocity (`heat_score`):
+```bash
+python3 <skill>/scripts/aicn_radar.py sync-all
+python3 <skill>/scripts/aicn_radar.py top --format ai --limit 15
+python3 <skill>/scripts/aicn_radar.py search "<中文关键词>" --platform all|hongguo|douyin|bilibili --sort newest|score|likes
+```
+
+#### Other Original Chinese Platforms
+- **Bilibili (`B站`):** `yutto` or `yt-dlp --user-agent ...` (direct 1080p MP4).
+- **Bundled in `tools/hongguo-drama/src/native/`:** `hema.js` (`河马剧场`), `xifan.js` (`喜番`).
 - **Kuaishou (`快手`):** `JoeanAmier/KS-Downloader`.
 
 ---

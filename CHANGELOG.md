@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.1 (2026-11-20)
+- **Douyin Native Engine (`Evil0ctal/Douyin_TikTok_Download_API` via `scripts/dy_tool.py`)**:
+  - Installed `tools/Douyin_TikTok_Download_API` + lightweight `tools/.venv-dy` (`wreq`, `curl_cffi`, `playwright`).
+  - Added `scripts/dy_tool.py` (`detail`, `download`, `mix`, `hot`) using pure-Python `ABogus` + `websign` (`x-secsdk-web-signature`) + Chrome guest `UIFID_TEMP` cookie minting (zero login required) — live verified fetching watermark-free 1080p MP4 from Douyin (`7707844707132476726`, `17.71 MB`).
+- **Unified Multi-Platform Analytics & Search Index (`scripts/aicn_radar.py`)**:
+  - Indexes **Hongguo** (`rank`, `new`, `first_visible_time`, `likes`, `favorites`), **Douyin** (`detail` + 2-hop `related_posts` AI-drama BFS + `hot`), and **Bilibili** (`bilisearch`) into SQLite + FTS5 (`data/drama_index.db`) with recency-weighted velocity `heat_score`.
+- **Chinese-First Sourcing & Facebook Caption RSI (`L-006`, `L-007`)**:
+  - Enforced strict **no-YouTube sourcing** rule for Chinese dramas (`SKILL.md`, `references/sourcing_and_analytics.md`): search in Chinese keywords first and acquire only from original Chinese platforms (Hongguo, Douyin, Bilibili, Hema, Kuaishou).
+  - Documented 2-line Facebook upload metadata format (`[TRỌN BỘ THUYẾT MINH] ...` + lowercase broad hashtags `#aishortfilmdrama #aishortdrama #aifilm #phimai ...`).
+
 ## 1.4.0 (2026-11-20)
 - **Primary Hongguo Engine Switch (`jackotom/hongguo-drama` via `scripts/hg_tool.cjs`)**:
   - Retired and deleted `openhongguo` (`ohg v0.4.0`) after live HTTP debugging confirmed ByteDance returns HTTP 200 / 0 bytes on legacy POST playback routes.

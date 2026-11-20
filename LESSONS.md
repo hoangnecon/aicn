@@ -36,3 +36,17 @@ Structured log of verified production failures, user corrections, and API change
 - **Symptom:** `soundfile.LibsndfileError: System error` during `cmd_mix` / `cmd_dub` when `/System/Volumes/Data` dropped below 2 GiB free.
 - **Verified Root Cause:** Intermediate `premaster_48k.wav` and raw staging files accumulated across batches.
 - **Guardrail Implemented (`v1.3.x`):** Run `aicn.py clean` on verified (`PPPPPP`) batches and keep >= 5–10 GiB free space; offload finished full-series deliverables to Drive when requested.
+
+## L-006 (2026-11-20) — Sourcing Chinese Dramas Must Never Touch YouTube; Search & Index Original CN Sources Only
+- **Symptom:** Initial searches on `Săn bắn thập niên 70` and `2 Con Mèo Biến Thành Mỹ Nữ` surfaced YouTube review/re-up channels (`Mễ Cốc Review`, etc.), and even Bilibili had multiple MCN mirrors (`小律AIGC` vs `小映漫剧`) of a video first published on Douyin.
+- **Verified Root Cause:** YouTube uploads are downstream recaps/re-ups; Bilibili AIGC channels sometimes cross-post Douyin originals days later. Without Chinese-first discovery across Hongguo + Douyin + Bilibili + a unified analytics index, discovery wastes time and risks picking stale/re-uploaded sources.
+- **Guardrail Implemented (`v1.4.1`):**
+  1. Added hard rule banning YouTube as a Chinese drama source; all Chinese drama searches start with Chinese keywords across Hongguo, Douyin, Bilibili, Hema, and Kuaishou.
+  2. Installed `Evil0ctal/Douyin_TikTok_Download_API` at `tools/Douyin_TikTok_Download_API` + lightweight `tools/.venv-dy` (`wreq`, `curl_cffi`, `playwright`).
+  3. Built `scripts/dy_tool.py` using pure-Python `ABogus` + `websign` (`x-secsdk-web-signature`) + Chrome guest `UIFID_TEMP` minting — verified live fetching no-watermark 1080p MP4 from Douyin (`7707844707132476726`, 17.71 MB) and 2-hop `related_posts` AI-drama graph discovery.
+  4. Built unified SQLite FTS5 analytics & search index `scripts/aicn_radar.py` (`data/drama_index.db`) indexing Hongguo (`new` + `rank` + `first_visible_time` + `likes/favorites`), Douyin (`detail` + `related_posts` + `hot`), and Bilibili (`bilisearch`).
+
+## L-007 (2026-11-20) — Facebook Upload Metadata Requires Single 2-Line Format & Lowercase Broad Hashtags
+- **Symptom:** User rejected separate YouTube-style Title/Description/Tags blocks and niche calque hashtags (`#phimhaikhoahuyen`) when posting to Facebook.
+- **Verified Root Cause:** Facebook only has one Description box; user prefers a punchy `[TRỌN BỘ THUYẾT MINH] ... | Full N Tập` hook line followed immediately by all-lowercase broad tags (`#aishortfilmdrama #aishortdrama #aifilm #phimai ...`).
+- **Guardrail Implemented (`v1.4.1`):** Codified the 2-line Facebook caption format and lowercase hashtag policy in `SKILL.md` and `references/sourcing_and_analytics.md`.

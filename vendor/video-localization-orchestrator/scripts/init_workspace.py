@@ -112,29 +112,45 @@ def ingest_and_build_episodes_manifest(
         # Probe episodes and concatenate into source/master_source.mp4
         concat_txt = os.path.join(source_dir, "concat_list.txt")
         specs = []
+        ep_durations = []
         for ep_p in canonical_eps:
             pinfo = probe_video(ep_p)
             vs = next((s for s in pinfo.get("streams", []) if s.get("codec_type") == "video"), {})
             as_ = next((s for s in pinfo.get("streams", []) if s.get("codec_type") == "audio"), {})
+            ep_durations.append(float((pinfo.get("format") or {}).get("duration") or vs.get("duration") or 0.0))
             specs.append((
                 int(vs.get("width", 1920)),
                 int(vs.get("height", 1080)),
                 vs.get("codec_name", "h264"),
+                vs.get("profile", ""),
+                int(vs.get("index", 0)),
+                vs.get("time_base", ""),
+                as_.get("codec_name", "aac"),
+                as_.get("profile", ""),
                 int(as_.get("sample_rate", 48000)),
                 int(as_.get("channels", 2)),
             ))
+        expected_dur = sum(ep_durations)
         uniform = len(set(specs)) == 1
         with open(concat_txt, "w", encoding="utf-8") as f:
             for ep_p in canonical_eps:
                 rel_p = os.path.relpath(ep_p, source_dir)
                 f.write(f"file '{rel_p}'\n")
+        need_norm = not uniform
         if uniform:
             print(f"[INIT] Concatenating {len(canonical_eps)} uniform episodes -> {master_dst}", flush=True)
             subprocess.run(
                 ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", master_dst],
                 check=True,
             )
-        else:
+            m_dur = float((probe_video(master_dst).get("format") or {}).get("duration") or 0.0)
+            if expected_dur > 0 and abs(m_dur - expected_dur) > max(3.0, 0.02 * expected_dur):
+                print(
+                    f"[INIT] WARNING: stream-copy concat duration mismatch ({m_dur:.2f}s vs expected {expected_dur:.2f}s); falling back to normalized concat.",
+                    flush=True,
+                )
+                need_norm = True
+        if need_norm:
             w0, h0 = specs[0][0], specs[0][1]
             print(f"[INIT] Normalizing & concatenating {len(canonical_eps)} mixed-spec episodes -> {master_dst}", flush=True)
             norm_eps = []
@@ -142,7 +158,9 @@ def ingest_and_build_episodes_manifest(
                 norm_p = os.path.join(source_dir, f".norm_ep{idx:02d}.mp4")
                 subprocess.run([
                     "ffmpeg", "-y", "-i", ep_p,
+                    "-map", "0:v:0", "-map", "0:a:0",
                     "-vf", f"scale={w0}:{h0}:force_original_aspect_ratio=decrease,pad={w0}:{h0}:(ow-iw)/2:(oh-ih)/2,fps=30",
+                    "-video_track_timescale", "15360",
                     "-c:v", "h264_videotoolbox", "-b:v", "5500k",
                     "-c:a", "aac", "-ar", "48000", "-ac", "2",
                     norm_p

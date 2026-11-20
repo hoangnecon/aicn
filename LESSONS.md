@@ -50,3 +50,8 @@ Structured log of verified production failures, user corrections, and API change
 - **Symptom:** User rejected separate YouTube-style Title/Description/Tags blocks and niche calque hashtags (`#phimhaikhoahuyen`) when posting to Facebook.
 - **Verified Root Cause:** Facebook only has one Description box; user prefers a punchy `[TRỌN BỘ THUYẾT MINH] ... | Full N Tập` hook line followed immediately by all-lowercase broad tags (`#aishortfilmdrama #aishortdrama #aifilm #phimai ...`).
 - **Guardrail Implemented (`v1.4.1`):** Codified the 2-line Facebook caption format and lowercase hashtag policy in `SKILL.md` and `references/sourcing_and_analytics.md`.
+
+## L-008 (2026-11-20) — Mixed Bilibili + Douyin Episode Stream Concat (`Non-monotonic DTS` & Ghost Duration)
+- **Symptom:** Concatenating Bilibili `ep01..ep04` with Douyin `ep05` in `init_workspace.py` emitted `Non-monotonic DTS` and produced `master_source.mp4` reporting `duration=1843.97s` (when total episode runtime was `669.01s`).
+- **Verified Root Cause:** `init_workspace.py` checked only `(width, height, codec_name, sample_rate, channels)`, missing three fatal stream mismatches between platforms: Douyin puts `audio` at stream index `0` and `video` at `1` (reversed from Bilibili), uses `HE-AACv2` instead of `AAC-LC`, and uses `time_base=1/15360` instead of `1/16000`.
+- **Guardrail Implemented (`v1.4.2`):** Updated `init_workspace.py` `specs` tuple to include `(v_profile, v_index, v_time_base, a_codec, a_profile)` plus post-concat duration verification (`abs(master_dur - sum(ep_durs))`), normalizing mixed batches with `-map 0:v:0 -map 0:a:0 -video_track_timescale 15360`.

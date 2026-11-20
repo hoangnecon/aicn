@@ -108,6 +108,20 @@ class TestHgToolAndRsi(unittest.TestCase):
             self.assertEqual(q.returncode, 0, q.stderr)
             self.assertIn("7707844707132476726", q.stdout)
 
+    def test_init_workspace_normalizes_timebase_and_stream_order(self):
+        init_ws = (
+            SKILL_DIR
+            / "vendor"
+            / "video-localization-orchestrator"
+            / "scripts"
+            / "init_workspace.py"
+        )
+        src = init_ws.read_text(encoding="utf-8")
+        self.assertIn('vs.get("time_base"', src)
+        self.assertIn('vs.get("index"', src)
+        self.assertIn('"-map", "0:v:0", "-map", "0:a:0"', src)
+        self.assertIn('"-video_track_timescale"', src)
+
 
 if __name__ == "__main__":
     unittest.main()

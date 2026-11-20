@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.2 (2026-11-20)
+- **Mixed-Source Concatenation Fix (`init_workspace.py`, `L-008`)**:
+  - Expanded episode stream uniformity checks to verify `profile`, stream `index`, `time_base`, `audio.codec_name`, and `audio.profile` (catching Douyin vs Bilibili stream order reversal `0=audio/1=video`, `HE-AACv2` vs `AAC-LC`, and `1/15360` vs `1/16000` timescale mismatches).
+  - Normalized mixed episodes with explicit `-map 0:v:0 -map 0:a:0 -video_track_timescale 15360` and added post-concat duration verification against summed source episodes.
+
 ## 1.4.1 (2026-11-20)
 - **Douyin Native Engine (`Evil0ctal/Douyin_TikTok_Download_API` via `scripts/dy_tool.py`)**:
   - Installed `tools/Douyin_TikTok_Download_API` + lightweight `tools/.venv-dy` (`wreq`, `curl_cffi`, `playwright`).

@@ -155,25 +155,37 @@ class DramaDunyamClient:
         self._initialized = True
         return payload
 
-    def _get_json(self, path: str, params: dict[str, Any] | None = None, _retried: bool = False) -> Any:
+    def _get_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        _cookie_retried: bool = False,
+        _attempts: int = 4,
+    ) -> Any:
         self.init_session(force=False)
         url = f"{self.base_url}{path}"
         if params:
             clean = {k: v for k, v in params.items() if v is not None and v != ""}
             if clean:
                 url = f"{url}?{urllib.parse.urlencode(clean)}"
-        req = urllib.request.Request(url)
-        try:
-            with self.opener.open(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if exc.code == 412 and not _retried:
-                self.init_session(force=True)
-                return self._get_json(path, params=params, _retried=True)
-            if exc.code == 402:
-                raise PaywallLockedError(f"Episode locked behind HTTP 402 paywall: {path}") from exc
-            body = exc.read().decode("utf-8", errors="ignore")[:240]
-            raise RuntimeError(f"HTTP {exc.code} on {url}: {body}") from exc
+        for attempt in range(_attempts):
+            req = urllib.request.Request(url)
+            try:
+                with self.opener.open(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code == 412 and not _cookie_retried:
+                    self.init_session(force=True)
+                    return self._get_json(path, params=params, _cookie_retried=True, _attempts=_attempts)
+                if exc.code == 402:
+                    raise PaywallLockedError(f"Episode locked behind HTTP 402 paywall: {path}") from exc
+                body = exc.read().decode("utf-8", errors="ignore")[:240]
+                if exc.code in (429, 502, 503, 504) and attempt + 1 < _attempts:
+                    wait_s = 1.5 * (2 ** attempt)
+                    print(f"[dd] transient HTTP {exc.code} on {path}, retrying in {wait_s:.1f}s...", flush=True)
+                    time.sleep(wait_s)
+                    continue
+                raise RuntimeError(f"HTTP {exc.code} on {url}: {body}") from exc
 
     def home(self, lang: str = "en") -> dict[str, Any]:
         return self._get_json("/api/home", {"lang": lang})

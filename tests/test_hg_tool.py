@@ -171,6 +171,47 @@ class TestHgToolAndRsi(unittest.TestCase):
             self.assertIn("332020", q.stdout)
             conn.close()
 
+    def test_dd_tool_retries_transient_503_source_preparing(self):
+        import io
+        import json
+        import urllib.error
+        from unittest.mock import patch
+        import dd_tool
+
+        client = dd_tool.DramaDunyamClient()
+        client._initialized = True
+        calls = {"n": 0}
+
+        class _Resp:
+            def __init__(self, body: bytes):
+                self._body = body
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_open(req, timeout=20.0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url,
+                    503,
+                    "Service Unavailable",
+                    None,
+                    io.BytesIO(b'{"hata":"source_preparing","retryable":true}'),
+                )
+            return _Resp(json.dumps({"delivery": "direct", "url": "https://cdn.example/ep47.mp4"}).encode())
+
+        with patch.object(client.opener, "open", side_effect=fake_open), patch("time.sleep"):
+            res = client.play_info("332020", 47)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(res["url"], "https://cdn.example/ep47.mp4")
+
 
 if __name__ == "__main__":
     unittest.main()

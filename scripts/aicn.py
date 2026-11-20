@@ -76,24 +76,40 @@ def resolve_encode(style, codec=None, quality=None):
     return enc
 
 
-def resolve_watermark(ws, brand_dir=None):
-    """Return dual-corner watermark spec dict or None if disabled/missing."""
+def resolve_watermark(ws, brand_dir=None, width=1920):
+    """Return dual-corner watermark spec dict (scaled cleanly on narrow/portrait widths) or None."""
+    wm_scale = round(max(0.5, width / 1920.0), 3) if width < 1200 else 1.0
+
+    def _spec(tl, tr, tl_x=42, tl_y=22, tr_mx=42, tr_y=58):
+        return {
+            "tl": tl,
+            "tr": tr,
+            "scale": wm_scale,
+            "tl_x": int(round(tl_x * wm_scale)),
+            "tl_y": int(round(tl_y * wm_scale)),
+            "tr_mx": int(round(tr_mx * wm_scale)),
+            "tr_y": int(round(tr_y * wm_scale)),
+        }
+
     if brand_dir:
         bd = os.path.abspath(brand_dir)
         tl = os.path.join(bd, "13_top_left_logo_large.png")
         tr = os.path.join(bd, "15_top_right_vietsub_floating.png")
         if os.path.exists(tl) and os.path.exists(tr):
-            return {"tl": tl, "tr": tr, "tl_x": 42, "tl_y": 22, "tr_mx": 42, "tr_y": 58}
+            return _spec(tl, tr)
         sys.exit(f"[aicn] --brand-dir missing 13_top_left_logo_large.png or 15_top_right_vietsub_floating.png in {bd}")
     cfg = jload(os.path.join(ws, "config", "project_config.json"), {}) or {}
     wm = cfg.get("watermark") or {}
     tl, tr = wm.get("top_left_logo", ""), wm.get("top_right_badge", "")
     if wm.get("enabled") and tl and tr and os.path.exists(tl) and os.path.exists(tr):
-        return {
-            "tl": tl, "tr": tr,
-            "tl_x": int(wm.get("top_left_x", 42)), "tl_y": int(wm.get("top_left_y", 22)),
-            "tr_mx": int(wm.get("top_right_margin_x", 42)), "tr_y": int(wm.get("top_right_y", 58)),
-        }
+        return _spec(
+            tl,
+            tr,
+            int(wm.get("top_left_x", 42)),
+            int(wm.get("top_left_y", 22)),
+            int(wm.get("top_right_margin_x", 42)),
+            int(wm.get("top_right_y", 58)),
+        )
     return None
 
 
@@ -257,7 +273,7 @@ def cmd_init_series(a):
         {"series": a.series_slug, "basis": a.rights, "proof": "", "platforms_allowed": [], "content_id_risk": "unknown"},
         ensure_ascii=False, indent=2))
     write_if_absent(os.path.join(hub, "config", "series_bible.json"), json.dumps(
-        {"series_slug": a.series_slug, "title_zh": "", "title_vi": a.title or "", "characters": [],
+        {"series_slug": a.series_slug, "source_language": getattr(a, "source_lang", "zh"), "title_zh": "", "title_vi": a.title or "", "characters": [],
          "pronoun_matrix": [], "glossary": [], "voices": {}, "overlay_style": DEFAULT_STYLE},
         ensure_ascii=False, indent=2))
     print("[init-series] done. Next: drop episodes in source_inbox/<batch>/, then init_workspace.py --topology series_episodic, then `aicn.py adopt`.")
@@ -288,6 +304,31 @@ def cmd_adopt(a):
 
 
 # ----------------------------------------------------------------- model
+def resolve_style_for_profile(base_style, prof):
+    """Adapt Style-B typography and mask padding cleanly when width < 1000 (9:16 portrait)."""
+    style = dict(DEFAULT_STYLE, **(base_style if isinstance(base_style, dict) else {}))
+    W = int((prof or {}).get("width", 1920))
+    if W < 1000:
+        if style.get("font_size") == DEFAULT_STYLE["font_size"]:
+            style["font_size"] = max(24, min(32, int(round(W * 28 / 720))))
+        portrait_defaults = {
+            "pad_x": 14,
+            "pad_top": 7,
+            "pad_bottom": 8,
+            "line_gap": 7,
+            "plate_radius": 8,
+            "box_pad_x": 14,
+            "box_pad_y": 12,
+            "blur_sigma": 18,
+        }
+        for k, pv in portrait_defaults.items():
+            if style.get(k) == DEFAULT_STYLE[k]:
+                style[k] = pv
+        safe_max_px = max(320, W - 120 - 2 * int(style["pad_x"]) - 12)
+        style["max_line_px"] = min(int(style.get("max_line_px", safe_max_px)), safe_max_px)
+    return style
+
+
 def load_unit(ws):
     prof = jload(os.path.join(ws, "data", "00_video_profile.json"), {})
     eps = (jload(os.path.join(ws, "data", "00_episodes_manifest.json"), {}) or {}).get("episodes", [])
@@ -299,7 +340,7 @@ def load_unit(ws):
         cues = cues.get("segments", cues.get("cues", []))
     scan = jload(os.path.join(ws, "data", "01_zh_bbox_scan.json"), {}) or {}
     st_ = jload(os.path.join(ws, "config", "overlay_style.json"), {})
-    style = dict(DEFAULT_STYLE, **(st_ if isinstance(st_, dict) else {}))
+    style = resolve_style_for_profile(st_, prof)
     apply_display_windows(cues, scan.get("hardsub_intervals", []), style)
     return prof, eps, cues, scan, style
 
@@ -376,9 +417,10 @@ def cmd_plan(a, quiet=False):
         if getattr(a, "mask", None):
             style["mask_mode"] = a.mask
         enc = resolve_encode(style, getattr(a, "codec", None), getattr(a, "quality", None))
-        wm = resolve_watermark(ws, getattr(a, "brand_dir", None))
+        W = int(prof.get("width", 1920))
+        wm = resolve_watermark(ws, getattr(a, "brand_dir", None), width=W)
         font = ImageFont.truetype(style["font_path"], style["font_size"], index=style.get("font_index", 0))
-        W, cy = int(prof.get("width", 1920)), centre_y_of(scan, prof)
+        cy = centre_y_of(scan, prof)
         plates = {c["id"]: build_plate({"text": c["sub_text"]}, style, W, cy, font)[:2] for c in cues}
         parts, key = ff_render_key(ws, fh, cues, scan, style, band_y0(prof, scan, style, plates), enc, wm)
         prev = state.get("render", {})
@@ -734,9 +776,17 @@ def render_ffmpeg(ws, prof, style, work, audio, out, y0, enc=None, wm=None):
     if wm:
         cmd += ["-i", wm["tl"], "-i", wm["tr"]]
         tl_i, tr_i = next_idx, next_idx + 1
-        fg += (f"[2:v]format=rgba,fps={fps}[pl];[v1][pl]overlay=0:{y0}:eof_action=pass:format=auto[v2];"
-               f"[v2][{tl_i}:v]overlay={wm['tl_x']}:{wm['tl_y']}:format=auto[v3];"
-               f"[v3][{tr_i}:v]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:format=auto,format={enc['pix_fmt']}[v]")
+        sc = float(wm.get("scale", 1.0))
+        if sc < 0.999:
+            fg += (f"[2:v]format=rgba,fps={fps}[pl];[v1][pl]overlay=0:{y0}:eof_action=pass:format=auto[v2];"
+                   f"[{tl_i}:v]scale=trunc(iw*{sc:.3f}/2)*2:-1[tlw];"
+                   f"[{tr_i}:v]scale=trunc(iw*{sc:.3f}/2)*2:-1[trw];"
+                   f"[v2][tlw]overlay={wm['tl_x']}:{wm['tl_y']}:format=auto[v3];"
+                   f"[v3][trw]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:format=auto,format={enc['pix_fmt']}[v]")
+        else:
+            fg += (f"[2:v]format=rgba,fps={fps}[pl];[v1][pl]overlay=0:{y0}:eof_action=pass:format=auto[v2];"
+                   f"[v2][{tl_i}:v]overlay={wm['tl_x']}:{wm['tl_y']}:format=auto[v3];"
+                   f"[v3][{tr_i}:v]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:format=auto,format={enc['pix_fmt']}[v]")
     else:
         fg += f"[2:v]format=rgba,fps={fps}[pl];[v1][pl]overlay=0:{y0}:eof_action=pass:format=auto,format={enc['pix_fmt']}[v]"
     cmd += ["-filter_complex", fg, "-map", "[v]"]
@@ -763,6 +813,7 @@ def ff_render_key(ws, fh, cues, scan, style, y0, enc=None, wm=None):
     wm_key = None
     if wm:
         wm_key = {"tl": fh(wm["tl"])[:16], "tr": fh(wm["tr"])[:16],
+                  "scale": wm.get("scale", 1.0),
                   "pos": [wm["tl_x"], wm["tl_y"], wm["tr_mx"], wm["tr_y"]]}
     parts = {"cues": [(c["id"], c["sub_text"], round(c["show_a"], 3), round(c["show_b"], 3)) for c in cues],
              "ivs": [(iv["start"], iv["end"], iv["bbox"]) for iv in scan.get("hardsub_intervals", [])],
@@ -784,9 +835,9 @@ def cmd_render(a):
     if a.mask:
         style["mask_mode"] = a.mask
     enc = resolve_encode(style, getattr(a, "codec", None), getattr(a, "quality", None))
-    wm = resolve_watermark(ws, getattr(a, "brand_dir", None))
-    font = ImageFont.truetype(style["font_path"], style["font_size"], index=style.get("font_index", 0))
     W = int(prof.get("width", 1920)); cy = centre_y_of(scan, prof)
+    wm = resolve_watermark(ws, getattr(a, "brand_dir", None), width=W)
+    font = ImageFont.truetype(style["font_path"], style["font_size"], index=style.get("font_index", 0))
     plates, geom_log = {}, []
     for c in cues:
         img, oy, g = build_plate({"text": c["sub_text"]}, style, W, cy, font)
@@ -1016,6 +1067,7 @@ def cmd_merge_series(a):
         if not a.allow_incomplete and (len(gs) < 6 or gs[5] != "P"):
             sys.exit(f"[merge-series] {os.path.basename(u)} Stage 5 gate is not PASS ({gs}) — every batch must PASS before full-series release")
         cand_mp4 = (glob.glob(os.path.join(hub, "deliverables", "16x9", f"*{os.path.basename(u)}*.mp4"))
+                    + glob.glob(os.path.join(hub, "deliverables", "9x16", f"*{os.path.basename(u)}*.mp4"))
                     + glob.glob(os.path.join(u, "media", "final_*_vi.mp4")))
         if not cand_mp4:
             sys.exit(f"[merge-series] missing batch MP4 for {os.path.basename(u)}")
@@ -1248,7 +1300,8 @@ def main():
     p = sp.add_parser("discover"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_discover)
     p = sp.add_parser("init-series"); p.add_argument("--series-slug", required=True); p.add_argument("--title", default="")
     p.add_argument("--workspace-root", default="workspace"); p.add_argument("--total-episodes", default="?")
-    p.add_argument("--unit-size", default=10); p.add_argument("--rights", required=True,
+    p.add_argument("--unit-size", default=10); p.add_argument("--source-lang", default="zh", help="source audio language (zh, en, auto)")
+    p.add_argument("--rights", required=True,
                    help="license basis: own | licensed:<contract> | cps:<platform> | mcn:<name>")
     p.set_defaults(f=cmd_init_series)
     p = sp.add_parser("adopt"); p.add_argument("--unit", required=True); p.set_defaults(f=cmd_adopt)

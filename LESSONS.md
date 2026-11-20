@@ -55,3 +55,12 @@ Structured log of verified production failures, user corrections, and API change
 - **Symptom:** Concatenating Bilibili `ep01..ep04` with Douyin `ep05` in `init_workspace.py` emitted `Non-monotonic DTS` and produced `master_source.mp4` reporting `duration=1843.97s` (when total episode runtime was `669.01s`).
 - **Verified Root Cause:** `init_workspace.py` checked only `(width, height, codec_name, sample_rate, channels)`, missing three fatal stream mismatches between platforms: Douyin puts `audio` at stream index `0` and `video` at `1` (reversed from Bilibili), uses `HE-AACv2` instead of `AAC-LC`, and uses `time_base=1/15360` instead of `1/16000`.
 - **Guardrail Implemented (`v1.4.2`):** Updated `init_workspace.py` `specs` tuple to include `(v_profile, v_index, v_time_base, a_codec, a_profile)` plus post-concat duration verification (`abs(master_dur - sum(ep_durs))`), normalizing mixed batches with `-map 0:v:0 -map 0:a:0 -video_track_timescale 15360`.
+
+## L-009 (2026-11-20) — English `720×1280` 9:16 Portrait Pipeline Adaptation & DramaDunyam Integration
+- **Symptom:** Overseas English short-drama sources (e.g. DramaDunyam `332020`, `720×1280` 9:16 portrait with English audio and white bottom hardsubs at `y=919..958`) hit four latent landscape-Chinese assumptions in `aicn`:
+  1. `run_asr_and_scan.py` hardcoded `xc = 960` and `y_bot = 86` (`rel_y <= 86`), dropping/clipping all centered subtitles on `720w` frames, plus hardcoded `language="zh"` in both Whisper passes.
+  2. `aicn.py` Style-B defaults (`font_size=48`, `max_line_px=1500`) and dual-corner PNGs (`284×142` + `295×70`) overflowed or bloated `720w` portrait frames and triggered `verify-overlay` `line_px > W - 120` failures.
+- **Guardrail Implemented (`v1.5.0`):**
+  1. Added pure-Python `scripts/dd_tool.py` + `aicn_radar.py sync-dramadunyam` filtering clean `lang=en` and non-adult (`yetiskin != true`), auto-handling `/api/config` `dd_bilet` cookies and HTTP 412 refresh while stopping cleanly on HTTP 402 paywalls.
+  2. Adapted `run_asr_and_scan.py` (`find_hardsub_intervals`, `scan_hardsub_and_scenes`) dynamically for `width < 1000` portrait strips (`xc = width // 2`, `y_bot = 128`, scaled gap/center tolerances) and added `resolve_source_language()` reading `series_bible.json` / `--source-lang`.
+  3. Added `resolve_style_for_profile()` and proportional `resolve_watermark(..., width=W)` scaling in `aicn.py`, plus `init-series --source-lang` and `merge-series` `deliverables/9x16/` fallback.

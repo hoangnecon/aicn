@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.0 (2026-11-20)
+- **DramaDunyam Open API Engine (`scripts/dd_tool.py` + `aicn_radar.py sync-dramadunyam`, `L-009`)**:
+  - Added pure-Python stdlib CLI `scripts/dd_tool.py` (`top`, `list`, `search`, `detail`, `download`) using native `/api/config` `dd_bilet` guest session cookies (HTTP 412 auto-refresh, clean fail/skip on HTTP 402 paywalls, zero CAPTCHA/paywall bypassing).
+  - Enforces clean English (`lang=en`) and non-adult (`yetiskin != true`) filtering across `tag=ai-short-dramas`, `populer`, and `/api/siralama`.
+  - Integrated `sync-dramadunyam` into `scripts/aicn_radar.py` (`--platform dramadunyam` + `sync-all`).
+- **9:16 Portrait (`720×1280`) & English Source Compatibility (`run_asr_and_scan.py`, `aicn.py`)**:
+  - Generalized `scan_hardsub_and_scenes()` and `find_hardsub_intervals()` in `run_asr_and_scan.py` for narrow/portrait (`width < 1000`, `xc = width // 2`, extended `y_bot`) and added `resolve_source_language()` reading `--source-lang` / `project_config.json` / `series_bible.json` (`--source-lang en|zh|auto`).
+  - Added `resolve_style_for_profile()` (`720w` auto-scales `font_size=28`, padding, and `max_line_px` inside `W - 120`) and proportional corner watermark scaling in `aicn.py`, plus `init-series --source-lang` and `merge-series` `deliverables/9x16/` fallback.
+
 ## 1.4.2 (2026-11-20)
 - **Mixed-Source Concatenation Fix (`init_workspace.py`, `L-008`)**:
   - Expanded episode stream uniformity checks to verify `profile`, stream `index`, `time_base`, `audio.codec_name`, and `audio.profile` (catching Douyin vs Bilibili stream order reversal `0=audio/1=video`, `HE-AACv2` vs `AAC-LC`, and `1/15360` vs `1/16000` timescale mismatches).

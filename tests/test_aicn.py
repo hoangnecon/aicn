@@ -220,6 +220,46 @@ class CLI(unittest.TestCase):
             self.assertEqual(rs.returncode, 0, rs.stderr)
             self.assertIn("phase=produce", rs.stdout)
 
+    def test_portrait_9x16_style_and_watermark_scaling(self):
+        # Landscape keeps 48px / 1500px defaults untouched
+        st_land = aicn.resolve_style_for_profile({}, {"width": 1920, "height": 1080})
+        self.assertEqual(st_land["font_size"], 48)
+        self.assertEqual(st_land["max_line_px"], 1500)
+
+        # Portrait 720x1280 scales font_size down and clamps max_line_px inside W - 120 - 2*pad_x - 12
+        st_port = aicn.resolve_style_for_profile(aicn.DEFAULT_STYLE, {"width": 720, "height": 1280})
+        self.assertEqual(st_port["font_size"], 28)
+        self.assertLessEqual(st_port["max_line_px"] + 2 * st_port["pad_x"], 720 - 120)
+
+        with tempfile.TemporaryDirectory() as td:
+            bd = os.path.join(td, "brand")
+            os.makedirs(bd)
+            for name in ("13_top_left_logo_large.png", "15_top_right_vietsub_floating.png"):
+                with open(os.path.join(bd, name), "wb") as f:
+                    f.write(b"png")
+            wm_port = aicn.resolve_watermark(td, brand_dir=bd, width=720)
+            self.assertIsNotNone(wm_port)
+            self.assertEqual(wm_port["scale"], 0.5)
+            self.assertEqual(wm_port["tl_x"], 21)
+
+    def test_scan_find_hardsub_intervals_portrait_720(self):
+        scan_path = os.path.join(
+            os.path.dirname(HERE),
+            "vendor",
+            "video-asr-visual-audit",
+            "scripts",
+            "run_asr_and_scan.py",
+        )
+        sp_mod = importlib.util.spec_from_file_location("run_asr_and_scan", scan_path)
+        ras = importlib.util.module_from_spec(sp_mod)
+        sp_mod.loader.exec_module(ras)
+
+        # Simulate English 720x1280 subtitle box centered around x=360, rel_y=[50..88]
+        spans = [[210, 510, 50, 88]] * 10 + [None] * 2
+        ivs = ras.find_hardsub_intervals(spans, fps_scan=5, width=720, strip_h=230)
+        self.assertEqual(len(ivs), 1)
+        self.assertEqual(ivs[0]["bbox"], [210, 510, 50, 88])
+
 
 if __name__ == "__main__":
     unittest.main()

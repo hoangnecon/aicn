@@ -66,12 +66,20 @@ Powered by [`Evil0ctal/Douyin_TikTok_Download_API`](../../tools/Douyin_TikTok_Do
 - **Douyin Hot Boards:** `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py hot --board hot|entertainment|challenge`
 - *Douyin discovery pattern:* Douyin refuses `GENERAL_SEARCH` (`status_code 2483`) to guest cookies, **but** `related_posts` (`/aweme/v1/web/aweme/related/`) works without login and returns 10 adjacent viral AI short dramas per seed (with exact `create_time`, `digg_count`, `collect_count`, `author`).
 
+#### DramaDunyam English AI/Short-Drama Source (`dramadunyam.com`) — `scripts/dd_tool.py`
+Pure-Python stdlib client modeled on MIT `umairjihan/dramadunyam-stremio` patterns using the native `/api/config` guest cookie (`dd_bilet`, `zorunlu: false`, HTTP 412 auto-refresh, clean stop on HTTP 402 paywalls — zero CAPTCHA/paywall bypassing). Strictly filters `language="en"` and `yetiskin != true`:
+- **Weekly/daily rankings:** `python3 <skill>/scripts/dd_tool.py top --period hafta --lang en`
+- **Browse AI dramas (`ai-short-dramas`) or popular:** `python3 <skill>/scripts/dd_tool.py list --tag ai-short-dramas --lang en`
+- **Search / Detail:** `python3 <skill>/scripts/dd_tool.py search "<title>"` / `dd_tool.py detail <slug>`
+- **Download direct 720p MP4s + `.jpg` cover:** `python3 <skill>/scripts/dd_tool.py download <slug> --episodes all --out <inbox_raw_dir> --cover-out <posters/cover.jpg>`
+- *Note:* When creating a series hub from an English source, pass `--source-lang en` to `aicn.py init-series` so Stage 1 Whisper transcribes English cleanly and portrait `720x1280` Style-B subtitles/watermarks auto-scale.
+
 #### Unified Analytics & Search Index — `scripts/aicn_radar.py`
-Stores Hongguo (`new` + `rank` + `first_visible_time` + `likes/favorites`), Douyin (`detail` + 2-hop `related_posts` BFS + `hot`), and Bilibili (`yt-dlp bilisearch --user-agent`) into `data/drama_index.db` (SQLite + FTS5) scored by recency-weighted engagement velocity (`heat_score`):
+Stores Hongguo (`new` + `rank` + `first_visible_time` + `likes/favorites`), Douyin (`detail` + 2-hop `related_posts` BFS + `hot`), Bilibili (`yt-dlp bilisearch --user-agent`), and DramaDunyam English (`sync-dramadunyam`) into `data/drama_index.db` (SQLite + FTS5) scored by recency-weighted engagement velocity (`heat_score`):
 ```bash
 python3 <skill>/scripts/aicn_radar.py sync-all
-python3 <skill>/scripts/aicn_radar.py top --format ai --limit 15
-python3 <skill>/scripts/aicn_radar.py search "<中文关键词>" --platform all|hongguo|douyin|bilibili --sort newest|score|likes
+python3 <skill>/scripts/aicn_radar.py top --platform dramadunyam --limit 15
+python3 <skill>/scripts/aicn_radar.py search "<keywords>" --platform all|hongguo|douyin|bilibili|dramadunyam --sort newest|score|likes
 ```
 
 #### Other Original Chinese Platforms

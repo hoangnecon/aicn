@@ -23,6 +23,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SKILL_DIR.parents[1]
 HG_TOOL = SKILL_DIR / "scripts" / "hg_tool.cjs"
 DY_TOOL = SKILL_DIR / "scripts" / "dy_tool.py"
+DD_TOOL = SKILL_DIR / "scripts" / "dd_tool.py"
 DY_PY = PROJECT_ROOT / "tools" / ".venv-dy" / "bin" / "python"
 HONGGUO_REPO = PROJECT_ROOT / "tools" / "hongguo-drama"
 DOUYIN_REPO = PROJECT_ROOT / "tools" / "Douyin_TikTok_Download_API"
@@ -183,7 +184,7 @@ def upsert_series(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
 
 def infer_format(tags: list[str], fallback: str = "unknown") -> str:
     joined = " ".join(tags)
-    if any(k in joined for k in ("仿真", "AI", "ai_series")):
+    if any(k in joined for k in ("仿真", "AI", "ai_series", "ai-short-dramas")):
         return "ai"
     if any(k in joined for k in ("漫剧", "动漫", "3D", "comic")):
         return "comic"
@@ -520,6 +521,91 @@ print(json.dumps({"items": [{"info": v[0], "note": v[1]} for v in seen.values()]
     return len(items)
 
 
+def sync_dramadunyam(
+    conn: sqlite3.Connection,
+    pages: int = 2,
+    enrich_top: int = 12,
+    lang: str = "en",
+) -> int:
+    """Sync clean English, non-adult DramaDunyam AI/short-drama charts & lists into SQLite index."""
+    if str(SKILL_DIR / "scripts") not in sys.path:
+        sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    from dd_tool import DramaDunyamClient, extract_tag_names
+
+    client = DramaDunyamClient()
+    collected: dict[str, dict[str, Any]] = {}
+
+    def _merge(it: dict[str, Any], fmt_hint: str, note: str) -> None:
+        sid = str(it.get("id") or "")
+        slug = str(it.get("slug") or "")
+        if not sid or not slug:
+            return
+        tag_list = extract_tag_names(it.get("tags"))
+        if fmt_hint == "ai":
+            tag_list = list(dict.fromkeys([*tag_list, "ai-short-dramas"]))
+        entry = collected.get(sid)
+        if not entry:
+            collected[sid] = {
+                "platform": "dramadunyam",
+                "series_id": sid,
+                "slug": slug,
+                "title_zh": str(it.get("title") or ""),
+                "format": infer_format(tag_list, fmt_hint),
+                "author": str(it.get("platform") or ""),
+                "episodes": int(it.get("available_episodes") or it.get("total_episodes") or 0),
+                "tags": ",".join(tag_list),
+                "synopsis": str(it.get("description") or ""),
+                "cover_url": str(it.get("cover") or ""),
+                "source_url": f"https://dramadunyam.com/en/series/{slug}",
+                "rank_note": note,
+            }
+        else:
+            if note and note not in entry["rank_note"]:
+                entry["rank_note"] = f"{entry['rank_note']}; {note}".strip("; ")
+            if fmt_hint == "ai":
+                entry["format"] = "ai"
+
+    for p in range(1, max(1, pages) + 1):
+        res_ai = client.list_series(tag="ai-short-dramas", page=p, limit=40, lang=lang, exclude_adult=True)
+        for it in res_ai.get("items", []):
+            _merge(it, "ai", "tag:ai-short-dramas")
+
+    for idx, it in enumerate(client.top(period="hafta", lang=lang, exclude_adult=True).get("items", []), 1):
+        _merge(it, "unknown", f"siralama:hafta #{idx}")
+
+    for p in range(1, max(1, pages) + 1):
+        res_pop = client.list_series(sort_type="populer", page=p, limit=40, lang=lang, exclude_adult=True)
+        for it in res_pop.get("items", []):
+            _merge(it, "unknown", f"populer:p{p}")
+
+    for sid in list(collected.keys())[: max(0, enrich_top)]:
+        row = collected[sid]
+        try:
+            det = client.detail(row["slug"], lang=lang)
+        except Exception:
+            continue
+        if det.get("yetiskin"):
+            collected.pop(sid, None)
+            continue
+        tag_list = extract_tag_names(det.get("tags"))
+        if row["format"] == "ai" and "ai-short-dramas" not in tag_list:
+            tag_list.append("ai-short-dramas")
+        if det.get("genre"):
+            tag_list.append(str(det["genre"]))
+        row["tags"] = ",".join(dict.fromkeys([t for t in tag_list if t]))
+        row["synopsis"] = str(det.get("description") or row["synopsis"])
+        row["likes"] = int(det.get("like_count") or 0)
+        row["views"] = int(det.get("view_count") or det.get("views") or 0)
+        row["episodes"] = int(det.get("available_episodes") or det.get("total_episodes") or row["episodes"])
+        variants = det.get("cover_variants") or {}
+        row["cover_url"] = str(variants.get("1080") or variants.get("720") or det.get("cover") or row["cover_url"])
+
+    for row in collected.values():
+        upsert_series(conn, row)
+    conn.commit()
+    return len(collected)
+
+
 def format_age(published_ts: int, now_ts: int) -> str:
     if published_ts <= 0:
         return "?"
@@ -599,14 +685,19 @@ def build_parser() -> argparse.ArgumentParser:
     s_dy.add_argument("--hops", type=int, default=2)
     s_dy.add_argument("--max-nodes", type=int, default=50)
 
-    s_all = sub.add_parser("sync-all", help="Sync Hongguo + Douyin + Bilibili into unified index")
+    s_dd = sub.add_parser("sync-dramadunyam", help="Sync DramaDunyam English non-adult AI/short dramas")
+    s_dd.add_argument("--pages", type=int, default=2)
+    s_dd.add_argument("--enrich-top", type=int, default=12)
+    s_dd.add_argument("--lang", default="en")
+
+    s_all = sub.add_parser("sync-all", help="Sync Hongguo + Douyin + Bilibili + DramaDunyam into unified index")
     s_all.add_argument("--pages", type=int, default=2)
     s_all.add_argument("--enrich-top", type=int, default=15)
 
     for cname in ("search", "top"):
         sc = sub.add_parser(cname, help="Query local analytics index")
         sc.add_argument("query", nargs="?", default="", help="Chinese/VI search keywords")
-        sc.add_argument("--platform", default="all", choices=["all", "hongguo", "douyin", "bilibili"])
+        sc.add_argument("--platform", default="all", choices=["all", "hongguo", "douyin", "bilibili", "dramadunyam"])
         sc.add_argument("--format", default="all", choices=["all", "ai", "real", "comic"])
         sc.add_argument("--max-age-days", type=int, default=0)
         sc.add_argument("--sort", default="score", choices=["score", "newest", "likes"])
@@ -630,11 +721,15 @@ def main(argv: list[str] | None = None) -> int:
             seeds = args.seed or ["7707844707132476726", "7694594942861167914", "7702783920940518656"]
             n = sync_douyin(conn, seeds=seeds, hops=args.hops, max_nodes=args.max_nodes)
             print(f"[radar] Indexed {n} Douyin AI series + hot boards -> {args.db}")
+        elif args.cmd == "sync-dramadunyam":
+            n = sync_dramadunyam(conn, pages=args.pages, enrich_top=args.enrich_top, lang=args.lang)
+            print(f"[radar] Indexed {n} DramaDunyam English series -> {args.db}")
         elif args.cmd == "sync-all":
             n_hg = sync_hongguo(conn, pages=args.pages, enrich_top=args.enrich_top)
             n_dy = sync_douyin(conn, seeds=["7707844707132476726", "7694594942861167914", "7702783920940518656"], hops=2, max_nodes=40)
             n_bi = sync_bilibili(conn, queries=["AI漫剧 仿真人", "某天醒来 美少女", "重生七零 打猎"], count_per_query=6)
-            print(f"[radar] Synced total: hongguo={n_hg}, douyin={n_dy}, bilibili={n_bi} -> {args.db}")
+            n_dd = sync_dramadunyam(conn, pages=args.pages, enrich_top=min(12, args.enrich_top))
+            print(f"[radar] Synced total: hongguo={n_hg}, douyin={n_dy}, bilibili={n_bi}, dramadunyam={n_dd} -> {args.db}")
         elif args.cmd in ("search", "top"):
             cmd_search(conn, args)
     finally:

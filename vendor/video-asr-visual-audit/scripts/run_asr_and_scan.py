@@ -25,17 +25,31 @@ def find_hardsub_intervals(
     max_sub_height: int = 62,
     min_dur_s: float = 0.40,
     clause_changes: list = None,
+    width: int = 1920,
+    strip_h: int = 200,
 ) -> list:
     """
     Identify fine-grained visual subtitle sub-clauses where a true subtitle bounding box is visible.
     Splits contiguous subtitle runs into separate sub-clauses whenever:
-      1) Bounding box left/right edges jump by > 22px (|dx0| > 22 or |dx1| > 22), OR
+      1) Bounding box left/right edges jump by > dx_tol px, OR
       2) Pixel-level glyph mask IoU drops below 0.48 (recorded in clause_changes[j]), catching
          back-to-back subtitle lines of identical character count/width.
+    Adapts center (`width // 2`) and vertical thresholds for 16:9 and 9:16 portrait.
     Bridges 1-frame (0.2s) flicker gaps when the bounding box is unchanged.
     """
     n = len(spans)
-    xc = 960
+    xc = width // 2
+    is_narrow = width < 1000
+    h_min = 12 if is_narrow else 18
+    h_max = max(max_sub_height, 92 if is_narrow else max_sub_height)
+    y0_min = 20 if is_narrow else 24
+    y0_max = 112 if is_narrow else 68
+    y1_max = min(strip_h, 134) if is_narrow else 98
+    w_min = 16 if is_narrow else 28
+    w_max = int(round(width * 0.88)) if is_narrow else 1200
+    cx_tol = max(140, int(round(width * 220 / 1920))) if is_narrow else 220
+    span_tol = max(45, int(round(width * 80 / 1920))) if is_narrow else 80
+    dx_tol = 16 if is_narrow else 22
     active = [False] * n
     for i, sp in enumerate(spans):
         if sp is not None:
@@ -43,7 +57,7 @@ def find_hardsub_intervals(
             h = y1 - y0
             w = x1 - x0
             cx = (x0 + x1) // 2
-            if 18 <= h <= max_sub_height and 24 <= y0 <= 68 and y1 <= 98 and 28 <= w <= 1200 and abs(cx - xc) <= 220 and (x0 <= xc + 80 and x1 >= xc - 80):
+            if h_min <= h <= h_max and y0_min <= y0 <= y0_max and y1 <= y1_max and w_min <= w <= w_max and abs(cx - xc) <= cx_tol and (x0 <= xc + span_tol and x1 >= xc - span_tol):
                 active[i] = True
 
     # Bridge 1-frame flicker gaps only if bounding boxes before and after match closely
@@ -51,7 +65,7 @@ def find_hardsub_intervals(
         if not active[i] and active[i - 1] and active[i + 1]:
             sp_prev, sp_next = spans[i - 1], spans[i + 1]
             if sp_prev is not None and sp_next is not None:
-                if abs(sp_prev[0] - sp_next[0]) <= 22 and abs(sp_prev[1] - sp_next[1]) <= 22:
+                if abs(sp_prev[0] - sp_next[0]) <= dx_tol and abs(sp_prev[1] - sp_next[1]) <= dx_tol:
                     active[i] = True
                     spans[i] = sp_prev
 
@@ -136,11 +150,17 @@ def scan_hardsub_and_scenes(
     scene_cuts = []
     widest_frames = []
 
-    x_left = int(round(width * 0.135))   # 260 on 1920w
-    x_right = int(round(width * 0.865))  # 1660 on 1920w
-    y_top = 32
-    y_bot = 86
-    center_col = (width // 2) - x_left   # 700
+    is_narrow = width < 1000
+    x_left = int(round(width * (0.06 if is_narrow else 0.135)))
+    x_right = int(round(width * (0.94 if is_narrow else 0.865)))
+    y_top = 24 if is_narrow else 32
+    y_bot = min(strip_h - 6, 128) if is_narrow else 86
+    center_col = (width // 2) - x_left
+    gap_px = 28 if is_narrow else 55
+    center_tol = max(75, int(round(width * 110 / 1920))) if is_narrow else 110
+    min_px_cnt = 18 if is_narrow else 35
+    min_h = 12 if is_narrow else 18
+    min_w = 16 if is_narrow else 28
 
     prev_gray = None
     prev_sub_mask = None
@@ -199,16 +219,16 @@ def scan_hardsub_and_scenes(
         active_cols = np.where(col_cnt >= 2)[0]
         clusters = []
         for c in active_cols:
-            if clusters and (c - clusters[-1][1]) <= 55:
+            if clusters and (c - clusters[-1][1]) <= gap_px:
                 clusters[-1][1] = int(c)
                 clusters[-1][2] += int(col_cnt[c])
             else:
                 clusters.append([int(c), int(c), int(col_cnt[c])])
 
-        # Keep cluster that crosses near screen center [center_col - 150 .. center_col + 150]
+        # Keep cluster that crosses near screen center
         valid_clusters = [
             cl for cl in clusters
-            if cl[0] <= (center_col + 110) and cl[1] >= (center_col - 110) and cl[2] >= 35
+            if cl[0] <= (center_col + center_tol) and cl[1] >= (center_col - center_tol) and cl[2] >= min_px_cnt
         ]
 
         if valid_clusters:
@@ -222,7 +242,7 @@ def scan_hardsub_and_scenes(
             y0 = int(ys[0] + y_top)
             y1 = int(ys[-1] + y_top)
 
-            if (y1 - y0) >= 18 and (x1 - x0) >= 28:
+            if (y1 - y0) >= min_h and (x1 - x0) >= min_w:
                 spans.append([x0, x1, y0, y1])
                 widest_frames.append((x1 - x0, round(f_idx / fps_scan, 2)))
                 if prev_sub_mask is not None:
@@ -258,7 +278,13 @@ def scan_hardsub_and_scenes(
         if len(top_wide_ts) >= 8:
             break
 
-    hardsub_intervals = find_hardsub_intervals(spans, fps_scan=fps_scan, clause_changes=clause_changes)
+    hardsub_intervals = find_hardsub_intervals(
+        spans,
+        fps_scan=fps_scan,
+        clause_changes=clause_changes,
+        width=width,
+        strip_h=strip_h,
+    )
 
     payload = {
         "strip_y0": strip_y0,
@@ -335,12 +361,33 @@ def load_whisper(size):
     from faster_whisper import WhisperModel
     return WhisperModel(size, device="cpu", compute_type="int8")
 
+def resolve_source_language(workspace: str, cli_lang: str | None = None) -> str:
+    """Resolve source audio language from CLI flag, project_config.json, or series_bible.json."""
+    if cli_lang:
+        return cli_lang
+    cfg_p = os.path.join(workspace, "config", "project_config.json")
+    if os.path.exists(cfg_p):
+        with open(cfg_p, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if cfg.get("source_language"):
+            return str(cfg["source_language"])
+        hub = cfg.get("series_hub_dir") or ""
+        bible_p = os.path.join(hub, "config", "series_bible.json") if hub else ""
+        if bible_p and os.path.exists(bible_p):
+            with open(bible_p, "r", encoding="utf-8") as bf:
+                bible = json.load(bf)
+            if bible.get("source_language"):
+                return str(bible["source_language"])
+    return "zh"
+
+
 def run_multipass_whisper_asr(
     video_path: str,
     vocals_path: str,
     bbox_json: str,
     out_json: str,
     model_size: str = "small",
+    source_lang: str = "zh",
 ):
     """
     Multi-Pass Acoustic & Visual Sub-Clause Guided ASR:
@@ -352,7 +399,8 @@ def run_multipass_whisper_asr(
         with bandpass-boosted audio (vad_filter=False).
     """
     t0 = time.time()
-    print(f"[PLAN] Running Multi-Pass whisper ({model_size}) -> {out_json}", flush=True)
+    whisper_lang = None if source_lang == "auto" else source_lang
+    print(f"[PLAN] Running Multi-Pass whisper ({model_size}, lang={source_lang}) -> {out_json}", flush=True)
 
     raw_audio = decode_audio_16k(video_path)
     if os.path.exists(vocals_path):
@@ -368,7 +416,7 @@ def run_multipass_whisper_asr(
     vad_params = dict(threshold=0.28, min_speech_duration_ms=120, min_silence_duration_ms=250, speech_pad_ms=220)
     segments_gen, _ = model.transcribe(
         pass1_audio,
-        language="zh",
+        language=whisper_lang,
         word_timestamps=False,
         vad_filter=True,
         vad_parameters=vad_params,
@@ -405,6 +453,8 @@ def run_multipass_whisper_asr(
                 bdata.get("spans", []),
                 int(bdata.get("fps_scan", 5)),
                 clause_changes=bdata.get("clause_changes"),
+                width=int(bdata.get("width", 1920)),
+                strip_h=int(bdata.get("strip_h", 200)),
             )
 
         uncovered = []
@@ -445,7 +495,7 @@ def run_multipass_whisper_asr(
                         clip = clip / mx * 0.85
                     sub_gen, _ = model.transcribe(
                         clip,
-                        language="zh",
+                        language=whisper_lang,
                         beam_size=5,
                         vad_filter=False,
                         condition_on_previous_text=False,
@@ -502,6 +552,7 @@ def main():
     parser.add_argument("--video", required=True, help="Source video path.")
     parser.add_argument("--workspace", required=True, help="Workspace directory path (workspace/<slug>).")
     parser.add_argument("--color-mode", default="white", choices=["white", "yellow", "auto"], help="Hardsub color detection mode.")
+    parser.add_argument("--source-lang", default=None, help="Source language code for Whisper (e.g. zh, en, auto). Defaults to project_config/series_bible or 'zh'.")
     parser.add_argument("--skip-scan", action="store_true", help="Skip 5fps bbox scan if 01_zh_bbox_scan.json already exists.")
     parser.add_argument("--skip-asr", action="store_true", help="Skip Whisper ASR if 01_asr_raw_segments.json already exists.")
     args = parser.parse_args()
@@ -534,6 +585,8 @@ def main():
             bdata.get("spans", []),
             int(bdata.get("fps_scan", 5)),
             clause_changes=bdata.get("clause_changes"),
+            width=int(bdata.get("width", profile.get("width", 1920))),
+            strip_h=int(bdata.get("strip_h", profile.get("strip_h", 200))),
         )
         bdata["hardsub_intervals_count"] = len(ivs)
         bdata["hardsub_intervals"] = ivs
@@ -544,11 +597,13 @@ def main():
         stems_voc = os.path.join(args.workspace, "media", "stems", "vocals.wav")
         legacy_voc = os.path.join(args.workspace, "media", "demucs", "vocals.wav")
         vocals_path = stems_voc if os.path.exists(stems_voc) else legacy_voc
+        source_lang = resolve_source_language(args.workspace, args.source_lang)
         run_multipass_whisper_asr(
             video_path=args.video,
             vocals_path=vocals_path,
             bbox_json=bbox_json,
             out_json=asr_json,
+            source_lang=source_lang,
         )
 
     # Always run Multi-Band Acoustic Waveform & Sub-Clause Alignment Audit

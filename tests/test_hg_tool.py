@@ -122,6 +122,55 @@ class TestHgToolAndRsi(unittest.TestCase):
         self.assertIn('"-map", "0:v:0", "-map", "0:a:0"', src)
         self.assertIn('"-video_track_timescale"', src)
 
+    def test_dd_tool_filtering_and_episode_spec(self):
+        import dd_tool
+
+        self.assertEqual(dd_tool.parse_episode_spec("all", 4), [1, 2, 3, 4])
+        self.assertEqual(dd_tool.parse_episode_spec("1-3,5", 6), [1, 2, 3, 5])
+        with self.assertRaises(ValueError):
+            dd_tool.parse_episode_spec("1-10", 5)
+
+        items = [
+            {"id": "1", "title": "Clean EN", "language": "en", "yetiskin": False},
+            {"id": "2", "title": "Adult", "language": "en", "yetiskin": True},
+            {"id": "3", "title": "Turkish", "language": "tr", "yetiskin": False},
+        ]
+        clean = dd_tool.filter_series_items(items, lang="en", exclude_adult=True)
+        self.assertEqual([x["id"] for x in clean], ["1"])
+
+        tags = dd_tool.extract_tag_names([{"slug": "a", "name": "Rules Horror"}, "Survival"])
+        self.assertEqual(tags, ["Rules Horror", "Survival"])
+
+    def test_radar_supports_dramadunyam_platform(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.db"
+            conn = aicn_radar.connect_db(db)
+            aicn_radar.upsert_series(
+                conn,
+                {
+                    "platform": "dramadunyam",
+                    "series_id": "332020",
+                    "title_zh": "Deadliest Prison: The Female Warden Is My Plaything",
+                    "format": "ai",
+                    "author": "DramaBox",
+                    "episodes": 50,
+                    "likes": 126,
+                    "views": 511,
+                    "source_url": "https://dramadunyam.com/en/series/deadliest-prison-the-female-warden-is-my-plaything",
+                    "rank_note": "siralama:hafta #12",
+                },
+            )
+            conn.commit()
+            q = subprocess.run(
+                [sys.executable, str(RADAR_TOOL), "--db", str(db), "search", "--platform", "dramadunyam", "Prison", "--json"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(q.returncode, 0, q.stderr)
+            self.assertIn("332020", q.stdout)
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -259,7 +259,9 @@ def cmd_dub(ws, c, fh):
         stretched = list(ex.map(lambda it: stretch(it[3], it[7]), prep))
     for (gi, g, text, _w_raw, st, window, natural, tempo), w in zip(prep, stretched):
         overflow = len(w) / SR - window
-        a = int(round(st * SR)); b = min(n, a + len(w)); track[a:b] += w[: b - a]
+        a = min(n, max(0, int(round(st * SR)))); b = min(n, a + len(w))
+        if b > a:
+            track[a:b] += w[: b - a]
         cuts = split_points(w, [max(1, len(segs[i]["tts_text"].split())) for i in g])
         for j, i in enumerate(g):
             piece = w[cuts[j]:cuts[j + 1]]
@@ -480,6 +482,7 @@ def cmd_master(ws, c, fh):
                f":measured_thresh={m['input_thresh']}:offset={m['target_offset']}:linear=true")
         run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", f"{pre},{ln2},aresample={SR},apad", "-t", f"{dur:.3f}",
              "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
+        i, pk = lufs_file(out)
     else:
         # Native 48 kHz linear EBU R128 master (~28x faster than 192 kHz loudnorm; identical linear gain + lookahead limiter)
         o = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},ebur128=peak=true", "-f", "null", "-"],
@@ -492,7 +495,14 @@ def cmd_master(ws, c, fh):
         af2 = f"{pre},volume={gain_db:.3f}dB,alimiter=limit={lim:.5f}:level=false:attack=5:release=50:asc=false,apad"
         run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", af2, "-t", f"{dur:.3f}",
              "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
-    i, pk = lufs_file(out)
+        i, pk = lufs_file(out)
+        if pk > float(c["true_peak_db"]) + 0.2:
+            # Rare extreme inter-sample transient: 4x oversampled true-peak limit (~2s)
+            lim_tp = 10.0 ** ((float(c["true_peak_db"]) - 0.1) / 20.0)
+            af_tp = f"{pre},volume={gain_db:.3f}dB,aresample=192000,alimiter=limit={lim_tp:.5f}:level=false:attack=5:release=50:asc=false,aresample={SR},apad"
+            run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", af_tp, "-t", f"{dur:.3f}",
+                 "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
+            i, pk = lufs_file(out)
     print(f"[master] {out}: {i:.1f} LUFS, peak {pk:.1f} dBFS ({time.time() - t0:.1f}s)")
 
 

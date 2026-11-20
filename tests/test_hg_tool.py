@@ -1,0 +1,60 @@
+import os
+import subprocess
+import unittest
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parents[1]
+HG_TOOL = SKILL_DIR / "scripts" / "hg_tool.cjs"
+
+
+class TestHgToolAndRsi(unittest.TestCase):
+    def test_hg_tool_exists_and_help_runs(self):
+        self.assertTrue(HG_TOOL.exists(), f"Missing {HG_TOOL}")
+        res = subprocess.run(
+            ["node", str(HG_TOOL), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for cmd in ("rank", "new", "search", "episodes", "download", "fetch-covers"):
+            self.assertIn(cmd, res.stdout)
+
+    def test_hg_tool_unknown_command_fails_nonzero(self):
+        res = subprocess.run(
+            ["node", str(HG_TOOL), "nonexistent-subcmd"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Unknown command", res.stderr)
+
+    def test_hg_tool_missing_args_fail_cleanly(self):
+        for argv in (["search"], ["episodes"], ["download"], ["fetch-covers"]):
+            res = subprocess.run(
+                ["node", str(HG_TOOL), *argv],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(res.returncode, 0, f"Expected failure for {argv}")
+            self.assertIn("Usage:", res.stderr)
+
+    def test_rsi_docs_and_lessons_present(self):
+        for rel in (
+            "LESSONS.md",
+            "references/sourcing_and_analytics.md",
+            "references/recursive_self_improvement.md",
+        ):
+            p = SKILL_DIR / rel
+            self.assertTrue(p.exists(), f"Missing RSI/sourcing doc: {p}")
+            self.assertGreater(p.stat().st_size, 200)
+
+    def test_no_legacy_ohg_binary_in_path(self):
+        res = subprocess.run(["which", "ohg"], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0, f"Retired ohg binary still on PATH: {res.stdout}")
+
+
+if __name__ == "__main__":
+    unittest.main()

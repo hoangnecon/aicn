@@ -9,13 +9,15 @@ Stage 4 renders each batch in one hardware-accelerated FFmpeg pass (≈ 1.7 min 
 Silicon's Metal GPU, CPU, and VideoToolbox Media Engine across batches, and `merge-series`
 stream-copies all verified batches into the final full-series master.
 
-- `SKILL.md`: what the agent reads (full-series contract, stages, edit loop, rules).
+- `SKILL.md`: what the agent reads (full-series contract, sourcing/analytics, stages, edit loop, RSI protocol, rules).
 - `scripts/aicn.py`: the engine (`doctor`, `discover`, `init-series`, `adopt`, `plan`, `render`, `verify-overlay`, `run-series`, `merge-series`, `clean`, `log`, `progress`; legacy `tts-sync`).
 - `scripts/aicn_audio.py`: Stage 3 audio (Demucs MLX stems, sentence-level CPU VieNeu dub with 2×4 threads + parallel rubberband, cached-Z frequency-aware mix, fast 48 kHz -14 LUFS master, audio gate).
+- `scripts/hg_tool.cjs`: Hongguo discovery, freshness/trend analytics, cover JPEG fetcher, and 1080p CENC-decrypted downloader (backed by `tools/hongguo-drama`).
 - `vendor/`: the five stage skills it drives, with their gate scripts. See `vendor/README.md`.
-- `references/`: folder contract, stage commands, caching design, production time.
+- `references/`: sourcing & analytics, recursive self-improvement (RSI), folder contract, stage commands, caching design, production time.
+- `LESSONS.md`: live RSI ledger of measured incidents and codified guardrails.
 - `templates/`: hub and unit CHANGELOG / PROGRESS / CHECKLIST.
-- `tests/`: unit tests for the pure logic and CLI.
+- `tests/`: unit tests for the pure logic, audio engine, and `hg_tool.cjs`.
 
 ## Install
 

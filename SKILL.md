@@ -27,8 +27,10 @@ inputs changed. Everything else comes from cache. Nothing is recomputed because 
 |---|---|
 | `<skill>` | the folder holding this file |
 | Engine | `python3 <skill>/scripts/aicn.py <cmd>` (`--help` lists commands) |
+| Hongguo Sourcing CLI | `node <skill>/scripts/hg_tool.cjs <cmd>` (backed by `tools/hongguo-drama`; replaces retired `ohg`) |
 | Stage scripts | `<skill>/vendor/<stage-skill>/scripts/*.py`, run with `$AICN_PY` (default `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`) |
 | Gate tokens | `<unit>/.cicd/stage_N_gate.json`, signed, 100/100 required |
+| RSI Ledger | `<skill>/LESSONS.md` + `references/recursive_self_improvement.md` |
 
 ## 0. Once per machine: doctor
 
@@ -53,6 +55,20 @@ It lists each Series Hub (`workspace/<series>/` with `units/` and
 **The next stage for a unit is the first position that is not `P`.**
 Then read, in order: hub `PROGRESS.md`, the last 20 lines of the unit `CHANGELOG.md`,
 the unit `CHECKLIST.md`. Do not open media to find out where things stand.
+
+## 1b. Sourcing, Discovery Analytics & Candidate Lists (`tools/hongguo-drama`)
+
+Full sourcing & analytics guide: `references/sourcing_and_analytics.md`.
+Primary engine: **`jackotom/hongguo-drama`** at `<project-root>/tools/hongguo-drama` via `node <skill>/scripts/hg_tool.cjs` (`openhongguo`/`ohg` is retired and deleted).
+
+- **Freshness-first discovery:** Always combine `hg_tool.cjs new --genre ai|real|all` (sorted by launch date descending, `红果首发`) with `hg_tool.cjs rank --category hot-ai-drama|hot-real-drama|hot-comic-drama` and `hg_tool.cjs search "<kw>"`. Do not pitch stale/old dramas as "trending".
+- **Analytics filter:** Prefer `AI仿真人剧` (`hot-ai-drama`), `真人喜剧` (`hot-real-drama`), or `3D漫剧` (`hot-comic-drama`) in the **50–120 ep (~60–150 min)** sweet spot; verify playable episodes via `hg_tool.cjs episodes <series_id>` before pitching.
+- **Mandatory Candidate List Contract:** Every shortlist presented to the user MUST be written to an artifact and include for **every** candidate:
+  1. **Vietnamese translated title** + original Chinese title (`ZH`) + valid Vietnamese `--series-slug`.
+  2. `series_id`, format/genre, episode count, estimated total duration, and recency/trend signal.
+  3. **Vietnamese synopsis** (2–4 sentences covering hook, comedy/drama beat, and main cast).
+  4. **Local `.jpg` cover thumbnail** fetched & converted via `hg_tool.cjs fetch-covers` and embedded directly in the artifact.
+- **1080p Download + CENC Decrypt:** `node <skill>/scripts/hg_tool.cjs download <series_id> --episodes 1-10 --out <inbox_batch_dir> --quality 1080p` (uses V5 `video_tab` GET signing + local `spade_a` key derivation + `ffmpeg -decryption_key`).
 
 ## 2. Folder contract
 
@@ -143,6 +159,14 @@ Full design, parameters and tuning: `references/audio_mix.md`.
 Measured numbers and the formula: `references/production_time.md`.
 Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in its first table.
 
+## 9. Recursive Self-Improvement (RSI)
+
+Full protocol: `references/recursive_self_improvement.md`. Live ledger: `LESSONS.md`.
+Whenever an upstream API breaks, a QA gate fails, the user corrects an output/workflow, or a full series finishes:
+1. **Detect & Measure:** Log exact error/metric (`Measured` vs `Assumed` vs `Unknown`) as `L-NNN` in `LESSONS.md`.
+2. **Codify into Guardrails:** Turn every lesson into code (`scripts/`), a regression test (`tests/`), or a hard contract/Red Flag in `SKILL.md` — never prose-only promises.
+3. **Verify & Bump:** Run the full `unittest` suite + live smoke test, update `CHANGELOG.md`, commit, and tag `skills/aicn`.
+
 ## Common mistakes
 
 | Symptom | Cause | Fix |
@@ -171,6 +195,9 @@ Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in
 - "faster-whisper is what the script used" → run `doctor`; on Apple Silicon use MLX.
 - "Upload one unit/batch as a standalone episode" → never. `units/` are internal working batches; every published video must be the full series assembled by `aicn.py merge-series`.
 - "Skip dubbing (`sub_only`) to hit a time target" → never. Every full-series release requires complete Vietnamese dubbing + subtitles.
+- "Use `ohg` / `openhongguo` to download" → retired and deleted; always use `node <skill>/scripts/hg_tool.cjs` (`tools/hongguo-drama`).
+- "Present a candidate list with only Chinese titles or without thumbnails" → never. Always include Vietnamese title, Vietnamese synopsis, `--series-slug`, recency/trend signal, and embedded local `.jpg` covers.
+- "I'll remember not to make that mistake next time" → never prose-only; log `L-NNN` in `LESSONS.md` and codify into code, tests, or a hard gate.
 
-References: `references/stages.md`, `references/audio_mix.md`, `references/folder_contract.md`,
-`references/incremental_build.md`, `references/production_time.md`.
+References: `references/sourcing_and_analytics.md`, `references/recursive_self_improvement.md`, `references/stages.md`, `references/audio_mix.md`, `references/folder_contract.md`,
+`references/incremental_build.md`, `references/production_time.md`, `LESSONS.md`.

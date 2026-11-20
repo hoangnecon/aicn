@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.0 (2026-11-20)
+- **Primary Hongguo Engine Switch (`jackotom/hongguo-drama` via `scripts/hg_tool.cjs`)**:
+  - Retired and deleted `openhongguo` (`ohg v0.4.0`) after live HTTP debugging confirmed ByteDance returns HTTP 200 / 0 bytes on legacy POST playback routes.
+  - Added unified Node.js CLI `scripts/hg_tool.cjs` backed by `tools/hongguo-drama` (`rank`, `new`, `search`, `episodes`, `download`, `fetch-covers`), using the working `GET /reading/bookapi/video_tab/multi_video_model/v1/` V5 bodyless signature + local `spade_a` CENC-AES-CTR key derivation + `ffmpeg -decryption_key` decryption.
+  - Live verified end-to-end on Ep 1 of 《来自未来的女儿》 (`7696412960813485081`, 1080p HEVC `1920x1080`, 8.65 MB, 141.7s, 9.1s total).
+- **Sourcing, Analytics & Candidate Presentation Contract (`references/sourcing_and_analytics.md`)**:
+  - Added freshness-first discovery (`hg_tool.cjs new` sorted by launch date descending + `rank` hot charts) so candidate picks never drift to stale/old titles.
+  - Codified Mandatory Candidate List Presentation Contract in `SKILL.md`: every shortlist presented to the user must include Vietnamese translated title, Chinese title, Vietnamese `--series-slug`, metadata/recency signal, Vietnamese synopsis, and embedded local `.jpg` cover thumbnails (`hg_tool.cjs fetch-covers`).
+- **Recursive Self-Improvement (RSI) Protocol (`references/recursive_self_improvement.md` + `LESSONS.md`)**:
+  - Added formal 4-step RSI loop (`Detect & Measure -> Root-Cause Audit -> Codify Guardrail -> Verify & Bump`) and pre-populated `LESSONS.md` (`L-001..L-005`).
+  - Added unit test suite `tests/test_hg_tool.py` covering `hg_tool.cjs` CLI, episode spec parsing, and repo resolution.
+
 ## 1.3.1 (2026-11-20)
 - **Series naming & folder/markdown contract**:
   - `aicn.py init-series` now enforces Vietnamese translated, no-accent, lowercase, hyphen-separated `--series-slug` (`^[a-z0-9]+(-[a-z0-9]+)*$`, e.g. `nam-18-tuoi-toi-che-tao-than-khi`).

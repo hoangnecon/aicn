@@ -21,13 +21,14 @@ Reference measurement batch: `unit_07_ep61_70` (10 episodes, 609.54 s, 1080p30, 
 | Stage 5 hardlink + parallel QA extract | ~12 s (+790 MB copy) | **~4 s** (0 B extra) | hardlink + 4-worker ffmpeg |
 | **Machine time / 10-min batch** | **≈ 13.0 min** | **≈ 7.5 min** (**-42%**) | full dub + full sub + watermark |
 
-## Full 80-episode series (8 batches, ≈ 100 min, full dub + sub + watermark)
+## Full 80-episode series (8 batches, ≈ 100–144 min, full dub + sub + watermark)
 
 | Execution mode | Machine wall time | Notes |
 |---|---|---|
 | `v1.2.1` sequential (8 × 13.0 min) | ≈ **104 min** (P) | single-engine sequential |
 | `v1.3.0` sequential (8 × 7.5 min) | ≈ **60 min** (P) | -42% faster per stage |
-| **`v1.3.0` overlapped (`aicn.py run-series`)** | **≈ 32–38 min** (P) | Metal GPU (`separate`) ∥ CPU (`dub+mix+master`) ∥ Media Engine (`render`) overlap across batches (`prep` ≈ 8–10 min + `produce` ≈ 26–28 min + `merge-series` ≈ 3 s) |
+| `v1.5.x` batch-barrier run (`do-dai-hoc-la-len-dinh`, 81 eps / 143.8 min) | **~6.5 h** (M) | 2h10m all-batch Stage-2 barrier + `strip_y0=1306` rescan + `series_bible.json` Stage 0 re-sync |
+| **`v1.6.0` streaming overlapped (`run-series --units ...`)** | **≈ 38–48 min** (P) | Zero Stage-2 barrier (stream units S1→S5), overlapped `prep` (Metal ∥ CPU), hub-shared TTS cache, auto `strip_y0` (0 rescans), 2–3 lean workers with `gpu/cpu/media` locks |
 
 *Human/agent work (audit frames, translation, mandatory Stage 5 visual QA viewing) runs in parallel or before `--phase produce` and depends on glossary reuse.*
 

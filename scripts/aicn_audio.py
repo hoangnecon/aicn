@@ -133,14 +133,17 @@ def cmd_separate(ws, c, fh):
 
 
 # ---------------------------------------------------------------- dub
-def group_lines(segs, max_gap):
-    """Comma-chained clauses of one speaker become one sentence (TTS reads short fragments badly)."""
+def group_lines(segs, max_gap, max_group_segs=4, max_group_dur=8.0):
+    """Comma-chained clauses of one speaker become one sentence (TTS reads short fragments badly),
+    capped in count and span so prosody stays natural without risking multi-clause drift."""
     groups, cur = [], []
     for i, s in enumerate(segs):
         if cur:
             p = segs[cur[-1]]
             chained = not re.search(r"[.!?…]\s*$", p["tts_text"].strip())
-            if chained and s.get("speaker") == p.get("speaker") and float(s["start"]) - float(p["end"]) < max_gap:
+            span_ok = (float(s["end"]) - float(segs[cur[0]]["start"])) <= max_group_dur
+            if (chained and len(cur) < max_group_segs and span_ok
+                    and s.get("speaker") == p.get("speaker") and float(s["start"]) - float(p["end"]) < max_gap):
                 cur.append(i); continue
             groups.append(cur)
         cur = [i]
@@ -224,11 +227,22 @@ def presynth(jobs, workers, threads=0):
         list(ex.map(_tts_job, jobs))
 
 
+def _tts_cache_dir(ws):
+    pc = aicn.jload(os.path.join(ws, "config", "project_config.json"), {}) or {}
+    hub = pc.get("series_hub_dir", "")
+    if hub and os.path.isdir(hub):
+        d = os.path.join(hub, ".cache", "tts_sent")
+    else:
+        d = os.path.join(ws, ".cache", "tts_sent")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def cmd_dub(ws, c, fh):
     segs = aicn.jload(os.path.join(ws, "data", "02_bilingual_script.json"))
     dur = float(profile(ws)["duration"]); n = int(round(dur * SR))
     groups = group_lines(segs, c["group_max_gap_s"])
-    cache = os.path.join(ws, ".cache", "tts_sent"); os.makedirs(cache, exist_ok=True)
+    cache = _tts_cache_dir(ws)
     tts = None; track = np.zeros(n, np.float32); aligned = [None] * len(segs); log = []; synth = 0; t0 = time.time()
     wav_dir = os.path.join(ws, "media", "tts_segments"); os.makedirs(wav_dir, exist_ok=True)
     jobs, seen = [], set()
@@ -240,45 +254,67 @@ def cmd_dub(ws, c, fh):
         if not os.path.exists(p_) and p_ not in seen:
             seen.add(p_); jobs.append((text, voice, c["temperature"], c["top_k"], p_))
     presynth(jobs, int(c.get("tts_workers", 2)), int(c.get("tts_threads", 4))); synth = len(jobs)
-    # Prepare raw cleaned waves and target tempos, then run rubberband time-stretch in parallel
-    prep = []
+    # Prepare raw cleaned waves, split into per-clause pieces, and run rubberband time-stretch in parallel
+    prep_clauses = []
+    group_meta = []
     for gi, g in enumerate(groups):
         text = " ".join(segs[i]["tts_text"].strip() for i in g)
         voice = segs[g[0]].get("voice") or c["voice"]
         key = aicn.h_obj({"t": text, "v": voice, "e": aicn.TTS_ENGINE_TAG, "temp": c["temperature"], "k": c["top_k"]})
         raw_p = os.path.join(cache, key + ".wav")
-        w = clean(sf.read(raw_p, dtype="float32")[0], c)
+        w_raw = clean(sf.read(raw_p, dtype="float32")[0], c)
         st = float(segs[g[0]]["start"])
-        nxt = float(segs[groups[gi + 1][0]]["start"]) if gi + 1 < len(groups) else dur - 0.05
-        window = max(0.25, nxt - c["lead_gap_s"] - st)
-        natural = len(w) / SR
-        tempo = max(c["base_tempo"], min(c["max_tempo"], natural / window))
-        prep.append((gi, g, text, w, st, window, natural, tempo))
-    rb_workers = min(6, os.cpu_count() or 4, max(1, len(prep)))
-    with ThreadPoolExecutor(max_workers=rb_workers) as ex:
-        stretched = list(ex.map(lambda it: stretch(it[3], it[7]), prep))
-    for (gi, g, text, _w_raw, st, window, natural, tempo), w in zip(prep, stretched):
-        overflow = len(w) / SR - window
-        a = min(n, max(0, int(round(st * SR)))); b = min(n, a + len(w))
-        if b > a:
-            track[a:b] += w[: b - a]
-        cuts = split_points(w, [max(1, len(segs[i]["tts_text"].split())) for i in g])
+        nxt_grp = float(segs[groups[gi + 1][0]]["start"]) if gi + 1 < len(groups) else dur - 0.05
+        window = max(0.25, nxt_grp - c["lead_gap_s"] - st)
+        natural = len(w_raw) / SR
+        cuts = split_points(w_raw, [max(1, len(segs[i]["tts_text"].split())) for i in g])
+        c_start_idx = len(prep_clauses)
         for j, i in enumerate(g):
-            piece = w[cuts[j]:cuts[j + 1]]
-            sf.write(os.path.join(wav_dir, f"seg_{i:04d}.wav"), piece if len(piece) > 480 else np.zeros(4800, np.float32), SR)
-            sp_s, sp_e = st + cuts[j] / SR, st + cuts[j + 1] / SR
+            raw_piece = w_raw[cuts[j]:cuts[j + 1]]
+            s0 = float(segs[i]["start"])
+            nxt_line = float(segs[i + 1]["start"]) if i + 1 < len(segs) else dur - 0.05
+            gap = c["lead_gap_s"] if (j + 1 == len(g)) else 0.03
+            win_j = max(0.25, nxt_line - gap - s0)
+            nat_j = len(raw_piece) / SR
+            tempo_j = max(c["base_tempo"], min(c["max_tempo"], nat_j / win_j)) if len(raw_piece) > 480 else 1.0
+            prep_clauses.append((gi, j, i, raw_piece, tempo_j))
+        group_meta.append((gi, g, text, st, window, natural, c_start_idx, len(prep_clauses)))
+    rb_workers = min(6, os.cpu_count() or 4, max(1, len(prep_clauses)))
+    with ThreadPoolExecutor(max_workers=rb_workers) as ex:
+        stretched_clauses = list(ex.map(lambda it: stretch(it[3], it[4]) if len(it[3]) > 480 else it[3], prep_clauses))
+    prev_sp_e = -1.0
+    for gi, g, text, st, window, natural, c0, c1 in group_meta:
+        piece_tempos = []
+        piece_durs = 0.0
+        for idx_c in range(c0, c1):
+            _, j, i, _raw_p, tempo_j = prep_clauses[idx_c]
+            piece = stretched_clauses[idx_c].astype(np.float32, copy=True)
+            f = min(int(0.005 * SR), len(piece) // 4)
+            if f > 0:
+                piece[:f] *= np.linspace(0, 1, f, dtype=np.float32)
+                piece[-f:] *= np.linspace(1, 0, f, dtype=np.float32)
             s0, e0 = float(segs[i]["start"]), float(segs[i]["end"])
+            sp_s = max(s0, prev_sp_e + 0.02) if prev_sp_e >= 0.0 else s0
+            a = min(n, max(0, int(round(sp_s * SR)))); b = min(n, a + len(piece))
+            if b > a:
+                track[a:b] += piece[: b - a]
+            sf.write(os.path.join(wav_dir, f"seg_{i:04d}.wav"), piece if len(piece) > 480 else np.zeros(4800, np.float32), SR)
+            sp_e = sp_s + len(piece) / SR
+            prev_sp_e = sp_e
+            piece_tempos.append(tempo_j)
+            piece_durs += len(piece) / SR
             nxt_line = float(segs[i + 1]["start"]) if i + 1 < len(segs) else dur
             slot_end = max(s0 + 0.15, min(max(e0, sp_e), nxt_line - 0.04))
             aligned[i] = {"id": i, "slot_start": round(s0, 3), "slot_end": round(slot_end, 3),
                           "speech_start": round(sp_s, 3), "speech_end": round(sp_e, 3), "audio_end": round(sp_e, 3),
-                          "pause_after": round(max(0.0, nxt_line - sp_e), 3), "tempo": round(tempo, 3),
+                          "pause_after": round(max(0.0, nxt_line - sp_e), 3), "tempo": round(tempo_j, 3),
                           "group": gi, "zh_text": segs[i].get("zh_text", ""), "sub_text": segs[i]["sub_text"],
                           "tts_text": segs[i]["tts_text"]}
+        overflow = prev_sp_e - (st + window)
         syl = len(text.split())
         log.append({"group": gi, "ids": g, "start": round(st, 3), "natural_s": round(natural, 2), "window_s": round(window, 2),
-                    "tempo": round(tempo, 3), "overflow_s": round(overflow, 2), "syl_per_s": round(syl / (len(w) / SR), 2),
-                    "text": text})
+                    "tempo": round(max(piece_tempos, default=1.0), 3), "overflow_s": round(overflow, 2),
+                    "syl_per_s": round(syl / max(0.05, piece_durs), 2), "text": text})
     os.makedirs(os.path.join(ws, "media", "audio"), exist_ok=True)
     sf.write(os.path.join(ws, "media", "audio", "dub_voice_48k.wav"), track, SR, subtype="FLOAT")
     aicn.jdump(os.path.join(ws, "data", "03_aligned_subtitles.json"), aligned)
@@ -543,6 +579,17 @@ def cmd_verify(ws, c, fh):
         over = [l for l in log if l["overflow_s"] > 0.05]
         chk("dub_fits", not over and all(l["tempo"] <= c["max_tempo"] + 1e-6 for l in log),
             f"{len(log)} sentences, max tempo {max([l['tempo'] for l in log], default=0):.2f}x, overflow {[l['ids'] for l in over][:5]}")
+        script_segs = aicn.jload(os.path.join(ws, "data", "02_bilingual_script.json"), [])
+        aligned_segs = aicn.jload(os.path.join(ws, "data", "03_aligned_subtitles.json"), [])
+        sync_bad = []
+        min_d, max_d = 0.0, 0.0
+        for idx, (s0_it, al_it) in enumerate(zip(script_segs, aligned_segs)):
+            d = float(al_it.get("speech_start", al_it["slot_start"])) - float(s0_it["start"])
+            min_d, max_d = min(min_d, d), max(max_d, d)
+            if d < -0.15 or d > 0.75:
+                sync_bad.append((idx, round(d, 3)))
+        chk("dub_sync", len(aligned_segs) == len(script_segs) and not sync_bad,
+            f"speech_start vs script start in [{min_d:+.3f}s, {max_d:+.3f}s] (allowed [-0.15, +0.75]), bad={sync_bad[:5]}")
     passed = all(x["passed"] for x in checks)
     aicn.jdump(os.path.join(ws, "data", "03_mix_report.json"), {"passed": passed, "version": AUDIO_VERSION, "checks": checks,
                                                                  "params": c})

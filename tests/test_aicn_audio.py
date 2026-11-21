@@ -55,6 +55,14 @@ class Grouping(unittest.TestCase):
         s = [line(0, 0, 1, "Đi thôi!"), line(1, 1.1, 2, "Nhanh lên.")]
         self.assertEqual(self.m.group_lines(s, 0.6), [[0], [1]])
 
+    def test_group_lines_caps_count_and_span(self):
+        # 10 comma-chained lines over 17s must not merge into one mega-group
+        s = [line(i, i * 1.7, i * 1.7 + 1.5, f"Mệnh đề số {i},") for i in range(10)]
+        groups = self.m.group_lines(s, 0.6)
+        self.assertTrue(all(len(g) <= 4 for g in groups), groups)
+        for g in groups:
+            self.assertLessEqual(s[g[-1]]["end"] - s[g[0]]["start"], 8.0)
+
 
 @unittest.skipUnless(HAVE, "numpy/scipy/soundfile not installed")
 class Signal(unittest.TestCase):
@@ -160,6 +168,80 @@ class Signal(unittest.TestCase):
             i, pk = self.m.lufs_file(out)
             self.assertAlmostEqual(i, -14.0, delta=0.5)
             self.assertLessEqual(pk, -0.7)
+
+    @unittest.skipUnless(shutil.which("rubberband"), "rubberband not installed")
+    def test_cmd_dub_places_each_clause_at_own_start_no_early_drift(self):
+        sys.path.insert(0, SCRIPTS)
+        import aicn
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "data"))
+            os.makedirs(os.path.join(d, ".cache", "tts_sent"))
+            segs = [
+                {"id": i, "start": round(i * 2.0, 2), "end": round(i * 2.0 + 1.7, 2),
+                 "speaker": "A", "tts_text": f"Mệnh đề {i} rất hay,", "sub_text": f"Mệnh đề {i} rất hay,"}
+                for i in range(4)
+            ]
+            segs[-1]["tts_text"] = "Mệnh đề 3 kết thúc."
+            segs[-1]["sub_text"] = "Mệnh đề 3 kết thúc."
+            aicn.jdump(os.path.join(d, "data", "00_video_profile.json"), {"duration": 10.0, "localization_mode": "voice_dub"})
+            aicn.jdump(os.path.join(d, "data", "02_bilingual_script.json"), segs)
+            # Pre-populate cached group TTS WAV shorter (4.4s) than the 8.0s group span -> previously caused ~3s early drift
+            c = dict(self.m.DEFAULTS)
+            text = " ".join(s["tts_text"] for s in segs)
+            key = aicn.h_obj({"t": text, "v": c["voice"], "e": aicn.TTS_ENGINE_TAG, "temp": c["temperature"], "k": c["top_k"]})
+            clause_wav = np.concatenate([self.tone(0.95), np.zeros(int(0.15 * self.sr), np.float32)])
+            soundfile.write(os.path.join(d, ".cache", "tts_sent", key + ".wav"), np.tile(clause_wav, 4), self.sr, subtype="FLOAT")
+            self.m.cmd_dub(d, c, aicn.FastHash(d))
+            aligned = aicn.jload(os.path.join(d, "data", "03_aligned_subtitles.json"))
+            self.assertEqual(len(aligned), 4)
+            for s0, al in zip(segs, aligned):
+                drift = al["speech_start"] - s0["start"]
+                self.assertGreaterEqual(drift, -0.05, f"Early drift on seg {al['id']}: {drift}")
+                self.assertLessEqual(drift, 0.25, f"Late drift on seg {al['id']}: {drift}")
+
+    def test_stage3_gate_rejects_early_speech_drift_and_accepts_synced(self):
+        sys.path.insert(0, SCRIPTS)
+        import aicn
+        v3_dir = os.path.join(HERE, "..", "vendor", "vieneu-voice-pacing-mixer", "scripts")
+        orch_dir = os.path.join(HERE, "..", "vendor", "video-localization-orchestrator", "scripts")
+        sys.path.insert(0, v3_dir)
+        sys.path.insert(0, orch_dir)
+        from cicd_gate import write_gate_token
+        from verify_stage_3 import run_stage_3_verification
+        with tempfile.TemporaryDirectory() as d:
+            for sub in ("data", "media", "media/tts_segments", ".cicd"):
+                os.makedirs(os.path.join(d, sub), exist_ok=True)
+            aicn.jdump(os.path.join(d, "data", "00_video_profile.json"), {"duration": 10.0, "localization_mode": "voice_dub"})
+            segs = [
+                {"id": 0, "start": 1.0, "end": 2.5, "zh_text": "一", "sub_text": "Một,", "tts_text": "Một,"},
+                {"id": 1, "start": 7.0, "end": 8.5, "zh_text": "二", "sub_text": "Hai.", "tts_text": "Hai."},
+            ]
+            aicn.jdump(os.path.join(d, "data", "02_bilingual_script.json"), segs)
+            for idx in range(2):
+                soundfile.write(os.path.join(d, "media", "tts_segments", f"seg_{idx:04d}.wav"), self.tone(1.0), self.sr)
+            soundfile.write(os.path.join(d, "media", "master_audio_48k.wav"), np.stack([self.tone(10.0), self.tone(10.0)], axis=1), self.sr)
+            with open(os.path.join(d, "data", "subtitles_full.srt"), "w", encoding="utf-8") as f:
+                f.write("1\n00:00:01,000 --> 00:00:02,500\nMột,\n\n2\n00:00:07,000 --> 00:00:08,500\nHai.\n\n")
+            with open(os.path.join(d, "03_pacing_and_audio_report.md"), "w", encoding="utf-8") as f:
+                f.write("# ok\n")
+            write_gate_token(d, 2, "Stage 2", [{"id": "s2", "passed": True, "weight": 100, "detail": "ok"}],
+                             metrics={}, artifact_paths=["data/02_bilingual_script.json"])
+            # 1) Reproduce -5.33s early speech_start drift -> Stage 3 gate MUST fail (SystemExit 2)
+            bad_aligned = [
+                {"id": 0, "slot_start": 1.0, "slot_end": 2.5, "speech_start": 1.0, "speech_end": 1.6, "pause_after": 0.4, "tempo": 1.1},
+                {"id": 1, "slot_start": 7.0, "slot_end": 8.5, "speech_start": 1.666, "speech_end": 2.9, "pause_after": 0.4, "tempo": 1.1},
+            ]
+            aicn.jdump(os.path.join(d, "data", "03_aligned_subtitles.json"), bad_aligned)
+            with self.assertRaises(SystemExit):
+                run_stage_3_verification(d)
+            # 2) Synced speech_start -> Stage 3 gate MUST pass
+            good_aligned = [
+                {"id": 0, "slot_start": 1.0, "slot_end": 2.5, "speech_start": 1.0, "speech_end": 2.1, "pause_after": 0.4, "tempo": 1.1},
+                {"id": 1, "slot_start": 7.0, "slot_end": 8.5, "speech_start": 7.0, "speech_end": 8.1, "pause_after": 0.4, "tempo": 1.1},
+            ]
+            aicn.jdump(os.path.join(d, "data", "03_aligned_subtitles.json"), good_aligned)
+            res = run_stage_3_verification(d)
+            self.assertEqual(res["status"], "PASS")
 
 
 if __name__ == "__main__":

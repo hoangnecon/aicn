@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.6.0 (2026-11-21)
+- **Full-Series RSI Audit & ~45m Streaming Pipeline Optimization (`L-011`)**:
+  - **Audio/Scene Sync & Frame Integrity (`init_workspace.py`, `aicn.py`)**: Added `r_fps`/`avg_fps` to `init_workspace.py` `specs` with mode-fps + `setpts=PTS-STARTPTS`/`-avoid_negative_ts make_zero` normalization; added `av_sync_and_frame_integrity` hard gate in `aicn.py verify-overlay` and uniform stream-spec + post-concat A/V sync checks in `merge-series`.
+  - **Auto `strip_y0` Calibration & `1080×1920` Portrait Fix (`init_workspace.py`, `run_asr_and_scan.py`, `aicn.py`)**: Added `calibrate_strip_y0()` pre-flight keyframe sampling in `init_workspace.py`; fixed portrait detection from `width < 1000` to `height > width` in `run_asr_and_scan.py` and `aicn.py resolve_style_for_profile()`.
+  - **Decoupled `series_bible.json` & Hub-Shared TTS Cache (`init_workspace.py`, `aicn_audio.py`)**: Removed `config/series_bible.json` from `stage_0_gate.json` `artifact_paths` so Stage 2 glossary edits never invalidate Stage 0; shared `.cache/tts_sent` at `<hub>/.cache/tts_sent` across all units.
+  - **Streaming & Lock-Safe Orchestration (`aicn.py`, `SKILL.md`, `production_time.md`)**: Added `--units` streaming, overlapped Metal/CPU `prep`, and cross-process `fcntl.flock` (`gpu/cpu/media`) in `cmd_run_series`, plus lean 2–3 worker cap contract.
+  - **Regression Tests (`tests/test_aicn.py`)**: Added tests for `1080×1920` portrait detection/style, `calibrate_strip_y0` + decoupled `series_bible.json`, and Stage 4 `av_sync_and_frame_integrity` rejection (50/50 tests passing).
+
+## 1.5.1 (2026-11-20)
+- **Per-Clause Dub Sync Fix & Stage 3 Sync Gate (`aicn_audio.py`, `verify_stage_3.py`, `L-010`)**:
+  - Fixed multi-clause early voice desync (measured up to `-5.334s` in `nam-18-tuoi-toi-che-tao-than-khi` `unit_01` `grp=157`): `group_lines()` now caps groups (`max_group_segs=4`, `max_group_dur=8.0`), and `cmd_dub()` splits each synthesized group WAV into per-clause pieces, time-stretches each piece to its own clause window, and places every piece at `max(s0, prev_sp_e + 0.02)` instead of placing the whole group contiguously.
+  - Added `dub_sync` hard check in `aicn_audio.py` `cmd_verify` and `speech_start` drift enforcement (`[-0.15s, +0.75s]` vs `02_bilingual_script.json` `start`) in `verify_stage_3.py` so Stage 3 blocks any early/late audio desync.
+  - Added 3 unit/regression tests in `tests/test_aicn_audio.py` (47/47 tests passing).
+
 ## 1.5.0 (2026-11-20)
 - **DramaDunyam Open API Engine (`scripts/dd_tool.py` + `aicn_radar.py sync-dramadunyam`, `L-009`)**:
   - Added pure-Python stdlib CLI `scripts/dd_tool.py` (`top`, `list`, `search`, `detail`, `download`) using native `/api/config` `dd_bilet` guest session cookies (HTTP 412 auto-refresh, clean fail/skip on HTTP 402 paywalls, zero CAPTCHA/paywall bypassing).

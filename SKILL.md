@@ -105,13 +105,17 @@ Exact commands per stage: `references/stages.md`.
 
 | Stage | Does | Gate | Cached by |
 |---|---|---|---|
-| 0 Init | series hub + internal working batches (`units/*`), profile, episode manifest | stage_0 | n/a |
-| 1 Prep (Stems + ASR + 5 fps scan + audit) | `aicn_audio.py separate` (Metal), MLX Whisper, 5 fps Chinese hardsub intervals, audit frames (`run-series --phase prep`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
-| 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) | `validate_bilingual_script.py` | none needed (seconds) |
-| 3 Audio (full dub) | `aicn_audio.py all`: stems (cached) → CPU VieNeu TTS (2×4 threads) + parallel rubberband → cached-Z mix → fast 48 kHz master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: per sentence sha256(text, voice, engine, sampling) |
-| 4 Overlay (style B) | `render` (one ffmpeg pass: hwdec + VBR `--codec h264\|hevc\|h264_high`, optional `--brand-dir` dual-corner watermark) | `aicn.py verify-overlay` | whole batch: sha256(source, display cues, hardsub intervals, style, font, watermark, audio, encoder, renderer version); unchanged → skipped |
-| 5 Batch QA | hardlink staging MP4, 4-worker QA frame extraction, **view every frame**, verify batch (`run-series --phase produce` automates S3→S5-extract with 3-engine overlap) | `verify_stage_5.py` | hardlink (0 extra bytes) |
-| 6 Full-Series Release | **`aicn.py merge-series --hub <hub>`** once **ALL** working batches PASS Stage 5 → single full-series MP4 + SRT; optional `aicn.py clean` per batch | all batches `P` at Stage 5 | stream copy (seconds) |
+| 0 Init | series hub + internal working batches (`units/*`), auto-calibrated `strip_y0`, fps/PTS-normalized `master_source.mp4` | stage_0 (decoupled from `series_bible.json`) | `source/master_source.mp4` |
+| 1 Prep (Stems + ASR + 5 fps scan + audit) | `run-series --phase prep` (Metal `separate+ASR` overlapped with CPU `waveform+audit`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
+| 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) + living `series_bible.json` | `validate_bilingual_script.py` | stream each unit immediately on Stage 1 PASS |
+| 3 Audio (full dub) | `aicn_audio.py all`: stems (cached) → CPU VieNeu TTS (2×4 threads) + parallel rubberband → cached-Z mix → fast 48 kHz master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: hub-shared `<hub>/.cache/tts_sent/<sha>.wav` |
+| 4 Overlay (style B) | `render` (one ffmpeg pass: hwdec + VBR `--codec h264\|hevc\|h264_high`, optional `--brand-dir` dual-corner watermark) | `aicn.py verify-overlay` (A/V sync + frame count) | whole batch: sha256(source, display cues, hardsub intervals, style, font, watermark, audio, encoder, renderer version); unchanged → skipped |
+| 5 Batch QA | hardlink staging MP4, 4-worker QA frame extraction, **view every frame**, verify batch (`run-series --phase produce --units ...` streams S3→S5 with 3-engine locks) | `verify_stage_5.py` | hardlink (0 extra bytes) |
+| 6 Full-Series Release | **`aicn.py merge-series --hub <hub>`** once **ALL** working batches PASS Stage 5 (verifies uniform stream specs & A/V sync) → single full-series MP4 + SRT | all batches `P` at Stage 5 | stream copy (seconds) |
+
+**Streaming & Lean Worker Cap (mandatory for ~45m target):**
+- **Never wait for all batches at Stage 2:** stream units independently (`Stage 1 → 2 → 3 → 4 → 5`) via `aicn.py run-series --hub <hub> --phase produce --units <unit>` as soon as each unit passes Stage 2.
+- **Keep at most 2–3 workers active** (1–2 Stage 2 translators + 1 `run-series` runner; auto-kill/pause idle workers). Never spawn >1 Metal job or >1 VieNeu TTS job concurrently; `run-series` enforces cross-process `gpu.lock` / `cpu.lock` / `media.lock`.
 
 The project requires **full Vietnamese dubbing (`voice_dub`) + full Vietnamese subtitles** on
 every published series. Never downgrade to `sub_only` as a shortcut.

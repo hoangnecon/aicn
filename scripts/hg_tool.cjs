@@ -241,7 +241,7 @@ async function cmdDownload(positional, flags) {
       if (!url) throw new Error('No playable stream URL in response');
 
       const spade = play.spadeA || play.spade_a || play.keyMaterial || play.variants?.[0]?.spadeA;
-      let keyHex = play.keyHex || play.key || '';
+      let keyHex = play.contentKey || play.keyHex || play.key || '';
       if (!keyHex && spade) {
         const keyBuf = deriveKey(spade);
         if (keyBuf) keyHex = Buffer.isBuffer(keyBuf) ? keyBuf.toString('hex') : String(keyBuf);

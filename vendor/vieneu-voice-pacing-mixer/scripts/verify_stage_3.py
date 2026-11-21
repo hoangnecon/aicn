@@ -51,8 +51,9 @@ def run_stage_3_verification(ws: str):
         chk1_passed = os.path.exists(master_wav) and os.path.getsize(master_wav) > 100_000 and len(script_segs) > 0
         chk1_detail = f"sub_only mode: native stereo audio preserved ({master_wav})"
 
-    # Check 2 & 3: Aligned subtitles drift, overlap, tempo, pauses
+    # Check 2 & 3: Aligned subtitles drift, speech_start sync, overlap, tempo, pauses
     drift_errors = []
+    speech_drift_errors = []
     overlap_errors = []
     tempos = []
     pauses = []
@@ -67,6 +68,12 @@ def run_stage_3_verification(ws: str):
             au_end = float(s_al.get("speech_end", s_al.get("audio_end", et_al)))
             if abs(st_al - st_orig) > 0.025:
                 drift_errors.append(f"Seg #{idx}: slot_start={st_al} drifted from script start={st_orig}")
+            sp_st = float(s_al.get("speech_start", st_al))
+            sp_drift = sp_st - st_orig
+            if loc_mode == "voice_dub" and (sp_drift < -0.15 or sp_drift > 0.75):
+                speech_drift_errors.append(
+                    f"Seg #{idx}: speech_start={sp_st:.3f}s drifted {sp_drift:+.3f}s from script start={st_orig:.3f}s"
+                )
             if idx + 1 < len(aligned_segs):
                 next_st = float(aligned_segs[idx + 1]["slot_start"])
                 if et_al > next_st + 0.005:
@@ -119,10 +126,10 @@ def run_stage_3_verification(ws: str):
         },
         {
             "id": "hard_locked_slot_start_zero_drift",
-            "description": "Every segment in 03_aligned_subtitles.json has hard-locked slot_start (drift <= 25ms) and 0 overlaps",
+            "description": "Every segment in 03_aligned_subtitles.json has hard-locked slot_start (<=25ms), speech_start in [-0.15s, +0.75s] of script start, and 0 overlaps",
             "weight": 25,
-            "passed": len(aligned_segs) == len(script_segs) and len(drift_errors) == 0 and len(overlap_errors) == 0,
-            "detail": f"drift_errors={len(drift_errors)}, overlap_errors={len(overlap_errors)}"
+            "passed": len(aligned_segs) == len(script_segs) and len(drift_errors) == 0 and len(speech_drift_errors) == 0 and len(overlap_errors) == 0,
+            "detail": f"drift_errors={len(drift_errors)}, speech_drift_errors={len(speech_drift_errors)} {speech_drift_errors[:2]}, overlap_errors={len(overlap_errors)}"
         },
         {
             "id": "natural_tempo_and_breathing_pauses",

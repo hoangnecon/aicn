@@ -260,6 +260,107 @@ class CLI(unittest.TestCase):
         self.assertEqual(len(ivs), 1)
         self.assertEqual(ivs[0]["bbox"], [210, 510, 50, 88])
 
+    def test_portrait_1080x1920_style_and_scan_detection(self):
+        # 1080x1920 portrait must NOT be treated as 16:9 landscape
+        st = aicn.resolve_style_for_profile(aicn.DEFAULT_STYLE, {"width": 1080, "height": 1920})
+        self.assertLess(st["font_size"], 48)
+        self.assertLessEqual(st["max_line_px"] + 2 * st["pad_x"], 1080 - 120)
+
+        scan_path = os.path.join(
+            os.path.dirname(HERE), "vendor", "video-asr-visual-audit", "scripts", "run_asr_and_scan.py"
+        )
+        sp_mod = importlib.util.spec_from_file_location("run_asr_and_scan", scan_path)
+        ras = importlib.util.module_from_spec(sp_mod)
+        sp_mod.loader.exec_module(ras)
+
+        # 1080x1920 hardsub box centered at x=540, rel_y=[60..145] (h=85px, y1=145 > 98)
+        spans = [[240, 840, 60, 145]] * 8
+        ivs = ras.find_hardsub_intervals(spans, fps_scan=5, width=1080, height=1920, strip_h=240)
+        self.assertEqual(len(ivs), 1)
+        self.assertEqual(ivs[0]["bbox"], [240, 840, 60, 145])
+
+    def test_calibrate_strip_y0_and_decoupled_series_bible(self):
+        init_path = os.path.join(
+            os.path.dirname(HERE), "vendor", "video-localization-orchestrator", "scripts", "init_workspace.py"
+        )
+        sp_mod = importlib.util.spec_from_file_location("init_workspace", init_path)
+        iw = importlib.util.module_from_spec(sp_mod)
+        sp_mod.loader.exec_module(iw)
+
+        gate_path = os.path.join(
+            os.path.dirname(HERE), "vendor", "video-localization-orchestrator", "scripts", "cicd_gate.py"
+        )
+        gp_mod = importlib.util.spec_from_file_location("cicd_gate", gate_path)
+        cg = importlib.util.module_from_spec(gp_mod)
+        gp_mod.loader.exec_module(cg)
+
+        import json
+        from PIL import Image, ImageDraw
+        with tempfile.TemporaryDirectory() as td:
+            # Build a 1080x1920 portrait test video with bright outlined bar at y=1257..1327
+            png = os.path.join(td, "frame.png")
+            img = Image.new("RGB", (1080, 1920), (40, 40, 50))
+            dr = ImageDraw.Draw(img)
+            dr.rectangle([260, 1254, 820, 1330], fill=(10, 10, 10))
+            for x in range(280, 800, 28):
+                dr.rectangle([x, 1260, x + 16, 1324], fill=(250, 250, 250))
+            img.save(png)
+            vid = os.path.join(td, "ep01.mp4")
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-y", "-loop", "1", "-i", png,
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                "-t", "3.0", "-r", "25", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", vid
+            ], check=True)
+
+            y0, sh, cal = iw.calibrate_strip_y0(vid, 1080, 1920, 3.0)
+            self.assertTrue(cal)
+            self.assertLess(y0, 1257)
+            self.assertGreater(y0 + sh, 1327)
+
+            # Run init_workspace.py and verify editing series_bible.json does NOT break Stage 0 gate
+            ws_root = os.path.join(td, "ws")
+            subprocess.run([
+                sys.executable, init_path,
+                "--workspace-root", ws_root,
+                "--slug", "unit_01",
+                "--video", vid,
+            ], check=True, stdout=subprocess.DEVNULL)
+            unit_dir = os.path.join(ws_root, "unit_01")
+            cg.require_gate(unit_dir, 0)
+            bible_p = os.path.join(unit_dir, "config", "series_bible.json")
+            with open(bible_p, "r", encoding="utf-8") as f:
+                bible = json.load(f)
+            bible["glossary"] = {"主角": "Nhân vật chính"}
+            with open(bible_p, "w", encoding="utf-8") as f:
+                json.dump(bible, f)
+            # Stage 0 gate must STILL pass after Stage 2 series_bible.json edit
+            cg.require_gate(unit_dir, 0)
+
+    def test_verify_overlay_rejects_av_duration_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            u = os.path.join(td, "unit_01")
+            for d in ("data", "config", "media", "source", ".cache"):
+                os.makedirs(os.path.join(u, d), exist_ok=True)
+            aicn.jdump(os.path.join(u, "data", "00_video_profile.json"), {"width": 1080, "height": 1920, "duration": 2.0, "r_fps": 25.0, "is_vfr": False})
+            aicn.jdump(os.path.join(u, "data", "00_episodes_manifest.json"), {"episodes": []})
+            aicn.jdump(os.path.join(u, "data", "01_zh_bbox_scan.json"), {"strip_y0": 1200, "hardsub_intervals": []})
+            aicn.jdump(os.path.join(u, "data", "03_aligned_subtitles.json"), [])
+            aicn.jdump(os.path.join(u, "data", "04_overlay_geometry_log.json"), {"cues": []})
+            aicn.jdump(os.path.join(u, "config", "overlay_style.json"), {})
+            aicn.jdump(os.path.join(u, ".cache", "build_state.json"), {"render": {"engine": "ffmpeg"}})
+            stg = os.path.join(u, "media", ".staging_render.mp4")
+            # Video 2.0s vs Audio 3.2s -> 1.2s A/V drift must FAIL Stage 4 gate
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=320x240:d=2.0:r=25",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=3.2",
+                "-c:v", "libx264", "-c:a", "aac", stg
+            ], check=True)
+            with self.assertRaises(SystemExit) as ctx:
+                aicn.cmd_verify_overlay(type("A", (), {"unit": u, "no_gate": True})())
+            self.assertEqual(ctx.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,11 +23,86 @@ def probe_video(video_path: str) -> dict:
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration,size,bit_rate",
-        "-show_entries", "stream=index,codec_name,codec_type,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels",
+        "-show_entries", "stream=index,codec_name,codec_type,profile,time_base,start_time,duration,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels",
         "-of", "json", video_path
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return json.loads(res.stdout)
+
+
+def calibrate_strip_y0(video_path: str, width: int, height: int, duration: float) -> tuple[int, int, bool]:
+    """Sample ~12 keyframes across the video to auto-calibrate the hardsub vertical band (strip_y0, strip_h)."""
+    is_portrait = height > width
+    default_y0 = int(round(height * (0.63 if is_portrait else 0.8148)))
+    default_h = int(round(height * 0.22)) if is_portrait else (height - default_y0)
+    if duration <= 1.0 or not os.path.exists(video_path):
+        return default_y0, default_h, False
+    try:
+        import numpy as np
+    except Exception:
+        return default_y0, default_h, False
+
+    band_y0 = int(round(height * 0.52)) if is_portrait else int(round(height * 0.72))
+    band_h = min(height - band_y0, int(round(height * (0.40 if is_portrait else 0.27))))
+    if band_h < 60:
+        return default_y0, default_h, False
+
+    sample_fps = max(0.02, min(1.0, 12.0 / max(1.0, duration)))
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", video_path,
+        "-vf", f"fps={sample_fps:.5f},crop={width}:{band_h}:0:{band_y0}",
+        "-frames:v", "14", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=20)
+        buf = proc.stdout
+    except Exception:
+        return default_y0, default_h, False
+
+    frame_bytes = width * band_h * 3
+    n_frames = len(buf) // frame_bytes
+    if n_frames < 2:
+        return default_y0, default_h, False
+
+    x0 = int(round(width * 0.15))
+    x1 = int(round(width * 0.85))
+    y_spans = []
+    for k in range(n_frames):
+        arr = np.frombuffer(buf[k * frame_bytes:(k + 1) * frame_bytes], dtype=np.uint8).reshape((band_h, width, 3))
+        roi = arr[:, x0:x1, :]
+        luma = (0.299 * roi[:, :, 0] + 0.587 * roi[:, :, 1] + 0.114 * roi[:, :, 2]).astype(np.float32)
+        bright = luma >= 185.0
+        if not np.any(bright):
+            continue
+        # Require dark stroke neighbor in a 5x5 window (approximated via 2-px shifted min)
+        padded = np.pad(luma, 2, mode="edge")
+        dark_nbr = np.minimum(
+            np.minimum(padded[:-4, 2:-2], padded[4:, 2:-2]),
+            np.minimum(padded[2:-2, :-4], padded[2:-2, 4:]),
+        ) < 125.0
+        stroke = bright & dark_nbr
+        row_cnt = stroke.sum(axis=1)
+        active_rows = np.where(row_cnt >= max(8, int(round((x1 - x0) * 0.015))))[0]
+        if len(active_rows) >= 6:
+            # Find largest contiguous vertical cluster (subtitle line(s))
+            diffs = np.diff(active_rows)
+            splits = np.where(diffs > 12)[0]
+            groups = np.split(active_rows, splits + 1)
+            best = max(groups, key=len)
+            h_span = int(best[-1] - best[0] + 1)
+            if 10 <= h_span <= int(round(height * 0.12)):
+                y_spans.append((int(best[0]) + band_y0, int(best[-1]) + band_y0))
+
+    if len(y_spans) < 2:
+        return default_y0, default_h, False
+
+    y_min = int(np.median([s[0] for s in y_spans]))
+    y_max = int(np.median([s[1] for s in y_spans]))
+    pad_top = max(48, int(round(height * 0.03)))
+    pad_bot = max(60, int(round(height * 0.04)))
+    cal_y0 = max(0, y_min - pad_top)
+    cal_h = min(height - cal_y0, max(200, (y_max - cal_y0) + pad_bot))
+    return cal_y0, cal_h, True
 
 
 def parse_fps(fps_str: str) -> float:
@@ -125,6 +200,8 @@ def ingest_and_build_episodes_manifest(
                 vs.get("profile", ""),
                 int(vs.get("index", 0)),
                 vs.get("time_base", ""),
+                round(parse_fps(vs.get("r_frame_rate", "30/1")), 3),
+                round(parse_fps(vs.get("avg_frame_rate", "30/1")), 3),
                 as_.get("codec_name", "aac"),
                 as_.get("profile", ""),
                 int(as_.get("sample_rate", 48000)),
@@ -140,27 +217,37 @@ def ingest_and_build_episodes_manifest(
         if uniform:
             print(f"[INIT] Concatenating {len(canonical_eps)} uniform episodes -> {master_dst}", flush=True)
             subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", master_dst],
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+                 "-avoid_negative_ts", "make_zero", "-c", "copy", master_dst],
                 check=True,
             )
-            m_dur = float((probe_video(master_dst).get("format") or {}).get("duration") or 0.0)
-            if expected_dur > 0 and abs(m_dur - expected_dur) > max(3.0, 0.02 * expected_dur):
+            m_info = probe_video(master_dst)
+            m_dur = float((m_info.get("format") or {}).get("duration") or 0.0)
+            m_vs = next((s for s in m_info.get("streams", []) if s.get("codec_type") == "video"), {})
+            m_as = next((s for s in m_info.get("streams", []) if s.get("codec_type") == "audio"), {})
+            m_av_diff = abs(float(m_vs.get("duration") or m_dur) - float(m_as.get("duration") or m_dur))
+            if (expected_dur > 0 and abs(m_dur - expected_dur) > max(3.0, 0.02 * expected_dur)) or m_av_diff > 0.30:
                 print(
-                    f"[INIT] WARNING: stream-copy concat duration mismatch ({m_dur:.2f}s vs expected {expected_dur:.2f}s); falling back to normalized concat.",
+                    f"[INIT] WARNING: stream-copy concat mismatch (dur={m_dur:.2f}s vs expected {expected_dur:.2f}s, av_diff={m_av_diff:.3f}s); falling back to normalized concat.",
                     flush=True,
                 )
                 need_norm = True
         if need_norm:
             w0, h0 = specs[0][0], specs[0][1]
-            print(f"[INIT] Normalizing & concatenating {len(canonical_eps)} mixed-spec episodes -> {master_dst}", flush=True)
+            fps_list = [sp[6] for sp in specs if sp[6] > 1.0]
+            target_fps = max(set(fps_list), key=fps_list.count) if fps_list else 30.0
+            fps_str = str(int(round(target_fps))) if abs(target_fps - round(target_fps)) < 1e-2 else f"{target_fps:.3f}"
+            print(f"[INIT] Normalizing & concatenating {len(canonical_eps)} mixed-spec episodes ({w0}x{h0}@{fps_str}fps) -> {master_dst}", flush=True)
             norm_eps = []
             for idx, ep_p in enumerate(canonical_eps, start=1):
                 norm_p = os.path.join(source_dir, f".norm_ep{idx:02d}.mp4")
                 subprocess.run([
                     "ffmpeg", "-y", "-i", ep_p,
                     "-map", "0:v:0", "-map", "0:a:0",
-                    "-vf", f"scale={w0}:{h0}:force_original_aspect_ratio=decrease,pad={w0}:{h0}:(ow-iw)/2:(oh-ih)/2,fps=30",
+                    "-vf", f"scale={w0}:{h0}:force_original_aspect_ratio=decrease,pad={w0}:{h0}:(ow-iw)/2:(oh-ih)/2,fps={fps_str},setpts=PTS-STARTPTS",
+                    "-af", "asetpts=PTS-STARTPTS",
                     "-video_track_timescale", "15360",
+                    "-avoid_negative_ts", "make_zero",
                     "-c:v", "h264_videotoolbox", "-b:v", "5500k",
                     "-c:a", "aac", "-ar", "48000", "-ac", "2",
                     norm_p
@@ -170,7 +257,8 @@ def ingest_and_build_episodes_manifest(
                 for np_path in norm_eps:
                     f.write(f"file '{os.path.basename(np_path)}'\n")
             subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", master_dst],
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+                 "-avoid_negative_ts", "make_zero", "-c", "copy", master_dst],
                 check=True,
             )
             for np_path in norm_eps:
@@ -585,14 +673,8 @@ def main():
     avg_fps = parse_fps(v_stream.get("avg_frame_rate", "30/1"))
     is_vfr = abs(r_fps - avg_fps) > 0.5
 
-    if width >= height:
-        aspect_mode = "landscape_16x9"
-        strip_y0 = int(round(height * 0.8148))
-        strip_h = height - strip_y0
-    else:
-        aspect_mode = "vertical_9x16"
-        strip_y0 = int(round(height * 0.68))
-        strip_h = int(round(height * 0.18))
+    aspect_mode = "landscape_16x9" if width >= height else "vertical_9x16"
+    strip_y0, strip_h, strip_calibrated = calibrate_strip_y0(master_source_path, width, height, duration)
 
     profile = {
         "schema_version": "2.0",
@@ -614,6 +696,7 @@ def main():
         "aspect_mode": aspect_mode,
         "strip_y0": strip_y0,
         "strip_h": strip_h,
+        "strip_calibrated": strip_calibrated,
         "audio_codec": a_stream.get("codec_name"),
         "audio_sample_rate": int(a_stream.get("sample_rate", 48000)),
         "audio_channels": int(a_stream.get("channels", 2)),
@@ -965,7 +1048,6 @@ def main():
         artifact_paths=[
             "00_project_manifest.md",
             "config/project_config.json",
-            "config/series_bible.json",
             "data/00_video_profile.json",
             "data/00_episodes_manifest.json",
         ],

@@ -35,7 +35,7 @@ SKILL_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file
 VENDOR = os.path.join(SKILL_DIR, "vendor")
 
 RENDERER_VERSION = "styleB-1.4"
-FF_RENDERER_VERSION = "ff-1.1"
+FF_RENDERER_VERSION = "ff-1.3"
 TTS_ENGINE_TAG = "vieneu-v3-turbo-48k"
 DEFAULT_STYLE = {
     "name": "B_hug_box",
@@ -305,12 +305,13 @@ def cmd_adopt(a):
 
 # ----------------------------------------------------------------- model
 def resolve_style_for_profile(base_style, prof):
-    """Adapt Style-B typography and mask padding cleanly when width < 1000 (9:16 portrait)."""
+    """Adapt Style-B typography and mask padding cleanly when portrait (W < H) or narrow (W < 1000)."""
     style = dict(DEFAULT_STYLE, **(base_style if isinstance(base_style, dict) else {}))
     W = int((prof or {}).get("width", 1920))
-    if W < 1000:
+    H = int((prof or {}).get("height", 1080))
+    if W < H or W < 1000:
         if style.get("font_size") == DEFAULT_STYLE["font_size"]:
-            style["font_size"] = max(24, min(32, int(round(W * 28 / 720))))
+            style["font_size"] = max(24, min(42, int(round(W * 28 / 720))))
         portrait_defaults = {
             "pad_x": 14,
             "pad_top": 7,
@@ -695,7 +696,20 @@ def build_timeline(ws, prof, cues, scan, style, plates, work, y0):
     bh = H - y0
     sy, pad = scan.get("strip_y0", prof.get("strip_y0", 880)), style["temporal_pad_s"]
     grow = int(style["mask_feather"] * 1.5)
-    items = [("m", tuple(iv["bbox"]), iv["start"] - pad, iv["end"] + pad) for iv in scan.get("hardsub_intervals", [])]
+    ivs = scan.get("hardsub_intervals", [])
+    items = [("m", tuple(iv["bbox"]), iv["start"] - pad, iv["end"] + pad) for iv in ivs]
+    if ivs:
+        xs0 = sorted(iv["bbox"][0] for iv in ivs)
+        xs1 = sorted(iv["bbox"][1] for iv in ivs)
+        rys0 = sorted(iv["bbox"][2] for iv in ivs)
+        rys1 = sorted(iv["bbox"][3] for iv in ivs)
+        med_bb = (xs0[len(xs0)//4], xs1[(3*len(xs1))//4], rys0[0], rys1[-1])
+    else:
+        med_bb = (int(W * 0.18), int(W * 0.82), 25, 95)
+    for c in cues:
+        mid_c = (c["show_a"] + c["show_b"]) / 2.0
+        if not any(iv["start"] - 0.15 <= mid_c <= iv["end"] + 0.15 for iv in ivs):
+            items.append(("m", med_bb, c["show_a"] - pad, c["show_b"] + pad))
     items += [("p", c["id"], c["show_a"] - pad, c["show_b"] + pad) for c in cues]
 
     def mask_img(bbs):
@@ -747,11 +761,44 @@ def ffprobe_duration(p):
                                 capture_output=True, text=True).stdout.strip() or 0)
 
 
+def ffprobe_streams(p):
+    out = subprocess.check_output([
+        "ffprobe", "-v", "error", "-show_entries",
+        "stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,time_base,start_time,duration,nb_frames,sample_rate,channels",
+        "-of", "json", p,
+    ], text=True)
+    return json.loads(out).get("streams", [])
+
+
+def resolve_fps(ws, prof):
+    """Return profile FPS or probe master_source.mp4 r_frame_rate so overlays match source cadence."""
+    if prof.get("fps"):
+        return prof["fps"]
+    src = os.path.join(ws, "source", "master_source.mp4")
+    if os.path.exists(src):
+        try:
+            out = subprocess.check_output(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", src],
+                text=True, timeout=10,
+            ).strip().splitlines()[0].rstrip(",")
+            if "/" in out:
+                n, d = out.split("/", 1)
+                val = float(n) / float(d)
+            else:
+                val = float(out)
+            if val > 1.0:
+                return int(val) if abs(val - round(val)) < 1e-3 else round(val, 3)
+        except Exception:
+            pass
+    return 30
+
+
 def render_ffmpeg(ws, prof, style, work, audio, out, y0, enc=None, wm=None):
     enc = enc or resolve_encode(style)
     W, H = int(prof.get("width", 1920)), int(prof.get("height", 1080))
     bh = H - y0
-    fps = prof.get("fps", 30)
+    fps = resolve_fps(ws, prof)
     if style.get("mask_mode", "blur") == "solid":
         r, g, b = style.get("solid_rgb", [0, 0, 0])
         head = f"[0:v]null[base];color=c=0x{r:02x}{g:02x}{b:02x}:s={W}x{bh}:r={fps},format=rgba[cov];"
@@ -774,19 +821,20 @@ def render_ffmpeg(ws, prof, style, work, audio, out, y0, enc=None, wm=None):
     if os.path.exists(audio):
         cmd += ["-i", audio]; audio_idx = next_idx; next_idx += 1
     if wm:
-        cmd += ["-i", wm["tl"], "-i", wm["tr"]]
+        cmd += ["-framerate", str(fps), "-loop", "1", "-i", wm["tl"],
+                "-framerate", str(fps), "-loop", "1", "-i", wm["tr"]]
         tl_i, tr_i = next_idx, next_idx + 1
         sc = float(wm.get("scale", 1.0))
         if sc < 0.999:
             fg += (f"[2:v]format=rgba,fps={fps}[pl];[v1][pl]overlay=0:{y0}:eof_action=pass:format=auto[v2];"
                    f"[{tl_i}:v]scale=trunc(iw*{sc:.3f}/2)*2:-1[tlw];"
                    f"[{tr_i}:v]scale=trunc(iw*{sc:.3f}/2)*2:-1[trw];"
-                   f"[v2][tlw]overlay={wm['tl_x']}:{wm['tl_y']}:format=auto[v3];"
-                   f"[v3][trw]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:format=auto,format={enc['pix_fmt']}[v]")
+                   f"[v2][tlw]overlay={wm['tl_x']}:{wm['tl_y']}:shortest=1:format=auto[v3];"
+                   f"[v3][trw]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:shortest=1:format=auto,format={enc['pix_fmt']}[v]")
         else:
             fg += (f"[2:v]format=rgba,fps={fps}[pl];[v1][pl]overlay=0:{y0}:eof_action=pass:format=auto[v2];"
-                   f"[v2][{tl_i}:v]overlay={wm['tl_x']}:{wm['tl_y']}:format=auto[v3];"
-                   f"[v3][{tr_i}:v]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:format=auto,format={enc['pix_fmt']}[v]")
+                   f"[v2][{tl_i}:v]overlay={wm['tl_x']}:{wm['tl_y']}:shortest=1:format=auto[v3];"
+                   f"[v3][{tr_i}:v]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:shortest=1:format=auto,format={enc['pix_fmt']}[v]")
     else:
         fg += f"[2:v]format=rgba,fps={fps}[pl];[v1][pl]overlay=0:{y0}:eof_action=pass:format=auto,format={enc['pix_fmt']}[v]"
     cmd += ["-filter_complex", fg, "-map", "[v]"]
@@ -970,18 +1018,39 @@ def cmd_verify_overlay(a):
     missing_chunks = [p for p in chunk_files if not os.path.exists(p)]
     staging = os.path.join(ws, "media", ".staging_render.mp4")
     dur_ok = False
+    av_sync_ok = False
+    av_detail = "missing staging"
     if os.path.exists(staging):
-        d = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", staging],
-                                 capture_output=True, text=True).stdout.strip() or 0)
-        dur_ok = abs(d - float(prof.get("duration", d))) <= 0.30
+        stg_streams = ffprobe_streams(staging)
+        sv = next((s for s in stg_streams if s.get("codec_type") == "video"), {})
+        sa = next((s for s in stg_streams if s.get("codec_type") == "audio"), {})
+        v_dur = float(sv.get("duration") or 0.0)
+        a_dur = float(sa.get("duration") or v_dur)
+        v_st = float(sv.get("start_time") or 0.0)
+        a_st = float(sa.get("start_time") or 0.0)
+        dur_ok = abs(v_dur - float(prof.get("duration", v_dur))) <= 0.30
+        av_dur_ok = abs(v_dur - a_dur) <= 0.30
+        av_st_ok = abs(v_st - a_st) <= 0.12
+        frames_ok = True
+        frame_note = ""
+        src_p = os.path.join(ws, "source", "master_source.mp4")
+        if not prof.get("is_vfr") and os.path.exists(src_p) and sv.get("nb_frames"):
+            src_v = next((s for s in ffprobe_streams(src_p) if s.get("codec_type") == "video"), {})
+            src_f = int(src_v.get("nb_frames") or 0)
+            out_f = int(sv.get("nb_frames") or 0)
+            if src_f > 0 and out_f > 0:
+                frames_ok = abs(out_f - src_f) <= max(5, int(round(0.005 * src_f)))
+                frame_note = f", frames={out_f}/{src_f}"
+        av_sync_ok = dur_ok and av_dur_ok and av_st_ok and frames_ok
+        av_detail = f"v={v_dur:.3f}s a={a_dur:.3f}s v_st={v_st:.3f}s a_st={a_st:.3f}s{frame_note}"
     checks = [
-        {"id": "no_blank_blurred_hardsub", "weight": 30, "passed": not drift_bad,
+        {"id": "no_blank_blurred_hardsub", "weight": 25, "passed": not drift_bad,
          "detail": f"{len(drift_bad)} Chinese lines blurred with no Vietnamese > {tol}s: {drift_bad[:12]}"},
         {"id": "max_two_lines_and_width", "weight": 25, "passed": bool(geom) and not lines_bad and len(geom) == len(cues),
          "detail": f"geometry={len(geom)}/{len(cues)} bad={lines_bad[:12]}"},
         {"id": "per_interval_mask_chunks_present", "weight": 20, "passed": bool(chunk_files) and not missing_chunks,
          "detail": f"chunks={len(chunk_files)} missing={len(missing_chunks)} intervals={len(ivs)}"},
-        {"id": "staging_render_duration", "weight": 25, "passed": dur_ok, "detail": staging},
+        {"id": "av_sync_and_frame_integrity", "weight": 30, "passed": av_sync_ok, "detail": av_detail},
     ]
     arts = ["data/04_overlay_geometry_log.json", "config/overlay_style.json", "media/.staging_render.mp4"]
     actual_renderer = FF_RENDERER_VERSION if state.get("render", {}).get("engine") == "ffmpeg" else RENDERER_VERSION
@@ -1078,6 +1147,20 @@ def cmd_merge_series(a):
         cand_srt = (glob.glob(os.path.join(hub, "deliverables", "subtitles", f"*{os.path.basename(u)}*.srt"))
                     + [os.path.join(u, "data", "subtitles_full.srt")])
         srts.append(next((p for p in cand_srt if os.path.exists(p)), None))
+    batch_specs = set()
+    for p in mp4s:
+        st = ffprobe_streams(p)
+        vs = next((s for s in st if s.get("codec_type") == "video"), {})
+        as_ = next((s for s in st if s.get("codec_type") == "audio"), {})
+        vd, ad = float(vs.get("duration") or 0.0), float(as_.get("duration") or 0.0)
+        if abs(vd - ad) > 0.30:
+            sys.exit(f"[merge-series] A/V duration drift in {os.path.basename(p)}: video={vd:.3f}s audio={ad:.3f}s (diff={vd-ad:+.3f}s)")
+        batch_specs.add((
+            vs.get("width"), vs.get("height"), vs.get("codec_name"), vs.get("r_frame_rate"),
+            as_.get("codec_name"), as_.get("sample_rate"), as_.get("channels"),
+        ))
+    if len(batch_specs) > 1:
+        sys.exit(f"[merge-series] Mismatched stream specs across batches (cannot stream-copy safely): {batch_specs}")
     slug = os.path.basename(hub)
     out_mp4 = os.path.join(hub, "deliverables", f"final_{slug}_full_vi.mp4")
     out_srt = os.path.join(hub, "deliverables", "subtitles", f"final_{slug}_full_vi.srt")
@@ -1087,8 +1170,14 @@ def cmd_merge_series(a):
     with open(lst, "w", encoding="utf-8") as f:
         f.writelines(f"file '{p}'\n" for p in mp4s)
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
-                    "-c", "copy", "-movflags", "+faststart", out_mp4 + ".part.mp4"], check=True)
+                    "-avoid_negative_ts", "make_zero", "-c", "copy", "-movflags", "+faststart", out_mp4 + ".part.mp4"], check=True)
     os.replace(out_mp4 + ".part.mp4", out_mp4)
+    full_st = ffprobe_streams(out_mp4)
+    f_vs = next((s for s in full_st if s.get("codec_type") == "video"), {})
+    f_as = next((s for s in full_st if s.get("codec_type") == "audio"), {})
+    f_vd, f_ad = float(f_vs.get("duration") or 0.0), float(f_as.get("duration") or 0.0)
+    if abs(f_vd - f_ad) > 0.50 or abs(f_vd - sum(durs)) > 1.0:
+        sys.exit(f"[merge-series] Full-series A/V sync gate failed: video={f_vd:.3f}s audio={f_ad:.3f}s expected={sum(durs):.3f}s")
     offset, cue_idx = 0.0, 1
     with open(out_srt, "w", encoding="utf-8") as out_f:
         for sp, dur in zip(srts, durs):
@@ -1121,17 +1210,22 @@ def _qa_timestamps_for(u):
 
 def cmd_run_series(a):
     """Hardware-overlapped full-series batch runner (Metal GPU + CPU + Media Engine).
-    - prep:    separate (Metal) + Stage 1 ASR/scan/waveform/audit-frames for batches with Stage 0 PASS.
+    - prep:    Metal (separate + ASR/scan) overlapped with CPU (waveform + audit-frames) for Stage 0 PASS batches.
     - produce: 3-engine overlapped pipeline (Metal separate -> CPU dub/mix/master/verify -> Media Engine render/verify-overlay/QA-extract)
-               for batches with Stage 2 PASS. Never bypasses visual QA or Stage 5 human/agent review."""
+               for batches with Stage 2 PASS. Supports --units u1,u2 for streaming per-unit execution without waiting for all batches."""
+    import contextlib
+    import fcntl
     import threading
     from concurrent.futures import ThreadPoolExecutor
     hub = os.path.abspath(a.hub)
     if not is_hub(hub):
         sys.exit(f"[run-series] {hub} is not a Series Hub")
     units = sorted(u for u in glob.glob(os.path.join(hub, "units", "*")) if is_unit(u))
+    if getattr(a, "units", None):
+        want = {x.strip() for x in a.units.split(",") if x.strip()}
+        units = [u for u in units if os.path.basename(u) in want]
     if not units:
-        sys.exit(f"[run-series] no working batches under {hub}/units/")
+        sys.exit(f"[run-series] no matching working batches under {hub}/units/")
     py = os.environ.get("AICN_PY", "/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python")
     if not os.path.exists(py):
         py = sys.executable
@@ -1139,6 +1233,21 @@ def cmd_run_series(a):
     aicn_py = os.path.join(SKILL_DIR, "scripts", "aicn.py")
     s1_dir = os.path.join(VENDOR, "video-asr-visual-audit", "scripts")
     s5_dir = os.path.join(VENDOR, "video-localization-qa-review", "scripts")
+
+    lock_dir = os.path.join(hub, ".cache", "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    t_locks = {"gpu": threading.Lock(), "cpu": threading.Lock(), "media": threading.Lock()}
+
+    @contextlib.contextmanager
+    def _engine_lock(kind):
+        lp = os.path.join(lock_dir, f"{kind}.lock")
+        with t_locks[kind]:
+            with open(lp, "a+") as lf:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
 
     def _run(tag, cmd):
         t0 = time.time()
@@ -1151,20 +1260,26 @@ def cmd_run_series(a):
     if a.phase == "prep":
         todo = [u for u in units if len(gate_status(u)) >= 2 and gate_status(u)[0] == "P" and gate_status(u)[1] != "P"]
         print(f"[run-series] phase=prep hub={os.path.basename(hub)} batches={len(todo)}/{len(units)} dry_run={a.dry_run}", flush=True)
-        for u in todo:
+
+        def _prep_one(u):
             bn = os.path.basename(u)
             src = os.path.join(u, "source", "master_source.mp4")
-            _run(f"{bn}:separate", [py, audio_py, "separate", "--unit", u])
-            _run(f"{bn}:asr+scan", [py, os.path.join(s1_dir, "run_asr_and_scan.py"), "--video", src, "--workspace", u, "--color-mode", "auto"])
-            _run(f"{bn}:waveform", [py, os.path.join(s1_dir, "analyze_voice_waveform.py"), "--workspace", u, "--snap-and-split"])
-            _run(f"{bn}:audit-frames", [py, os.path.join(s1_dir, "extract_audit_frames.py"), "--video", src, "--workspace", u])
+            with _engine_lock("gpu"):
+                _run(f"{bn}:separate[Metal]", [py, audio_py, "separate", "--unit", u])
+                _run(f"{bn}:asr+scan[Metal+Scan]", [py, os.path.join(s1_dir, "run_asr_and_scan.py"), "--video", src, "--workspace", u, "--color-mode", "auto"])
+            with _engine_lock("cpu"):
+                _run(f"{bn}:waveform[CPU]", [py, os.path.join(s1_dir, "analyze_voice_waveform.py"), "--workspace", u, "--snap-and-split"])
+                _run(f"{bn}:audit-frames[CPU]", [py, os.path.join(s1_dir, "extract_audit_frames.py"), "--video", src, "--workspace", u])
+            return bn
+
+        with ThreadPoolExecutor(max_workers=min(2, max(1, len(todo)))) as ex:
+            list(ex.map(_prep_one, todo))
         print(f"[run-series] prep finished in {(time.time() - t_all) / 60:.1f} min. Next: visually inspect frames/audit/ and run verify_stage_1.py.", flush=True)
         return
 
     # phase == "produce": 3-engine overlapped pipeline across batches with Stage 2 PASS
     todo = [u for u in units if len(gate_status(u)) >= 6 and gate_status(u)[2] == "P" and gate_status(u)[5] != "P"]
     print(f"[run-series] phase=produce hub={os.path.basename(hub)} batches={len(todo)}/{len(units)} dry_run={a.dry_run}", flush=True)
-    gpu_lock, cpu_lock, media_lock = threading.Lock(), threading.Lock(), threading.Lock()
     render_flags = []
     if a.codec:
         render_flags += ["--codec", a.codec]
@@ -1179,14 +1294,14 @@ def cmd_run_series(a):
         bn = os.path.basename(u)
         gs = gate_status(u)
         if gs[3] != "P":
-            with gpu_lock:
+            with _engine_lock("gpu"):
                 _run(f"{bn}:separate[Metal]", [py, audio_py, "separate", "--unit", u])
-            with cpu_lock:
+            with _engine_lock("cpu"):
                 for step in ("dub", "mix", "master", "verify"):
                     _run(f"{bn}:{step}[CPU]", [py, audio_py, step, "--unit", u])
         qa_man = os.path.join(u, "data", "04_qa_frames_manifest.json")
         if gs[4] != "P" or not os.path.exists(qa_man):
-            with media_lock:
+            with _engine_lock("media"):
                 _run(f"{bn}:render[MediaEngine]", [py, aicn_py, "render", "--unit", u, *render_flags])
                 _run(f"{bn}:verify-overlay", [py, aicn_py, "verify-overlay", "--unit", u])
                 src = os.path.join(u, "source", "master_source.mp4")
@@ -1331,6 +1446,7 @@ def main():
     p.add_argument("--allow-incomplete", action="store_true"); p.set_defaults(f=cmd_merge_series)
     p = sp.add_parser("run-series"); p.add_argument("--hub", required=True)
     p.add_argument("--phase", choices=["prep", "produce"], required=True)
+    p.add_argument("--units", default=None, help="comma-separated unit names to stream (e.g. unit_01_ep01_10,unit_02_ep11_20)")
     p.add_argument("--codec", choices=list(ENCODE_PRESETS), default=None)
     p.add_argument("--quality", type=int, default=None)
     p.add_argument("--mask", choices=["blur", "solid"], default=None)

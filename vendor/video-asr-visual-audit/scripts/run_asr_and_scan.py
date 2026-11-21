@@ -27,6 +27,7 @@ def find_hardsub_intervals(
     clause_changes: list = None,
     width: int = 1920,
     strip_h: int = 200,
+    height: int = 1080,
 ) -> list:
     """
     Identify fine-grained visual subtitle sub-clauses where a true subtitle bounding box is visible.
@@ -34,22 +35,22 @@ def find_hardsub_intervals(
       1) Bounding box left/right edges jump by > dx_tol px, OR
       2) Pixel-level glyph mask IoU drops below 0.48 (recorded in clause_changes[j]), catching
          back-to-back subtitle lines of identical character count/width.
-    Adapts center (`width // 2`) and vertical thresholds for 16:9 and 9:16 portrait.
+    Adapts center (`width // 2`) and vertical thresholds for 16:9 and 9:16 portrait (720w & 1080w).
     Bridges 1-frame (0.2s) flicker gaps when the bounding box is unchanged.
     """
     n = len(spans)
     xc = width // 2
-    is_narrow = width < 1000
-    h_min = 12 if is_narrow else 18
-    h_max = max(max_sub_height, 92 if is_narrow else max_sub_height)
-    y0_min = 20 if is_narrow else 24
-    y0_max = 112 if is_narrow else 68
-    y1_max = min(strip_h, 134) if is_narrow else 98
-    w_min = 16 if is_narrow else 28
-    w_max = int(round(width * 0.88)) if is_narrow else 1200
-    cx_tol = max(140, int(round(width * 220 / 1920))) if is_narrow else 220
-    span_tol = max(45, int(round(width * 80 / 1920))) if is_narrow else 80
-    dx_tol = 16 if is_narrow else 22
+    is_portrait = (height > width) or (width < 1000)
+    h_min = 12 if width < 1000 else 16
+    h_max = max(max_sub_height, int(round(115 * width / 1080)) if is_portrait else max_sub_height)
+    y0_min = 12 if is_portrait else 24
+    y0_max = max(112, strip_h - 45) if is_portrait else max(68, strip_h - 50)
+    y1_max = (strip_h - 8) if is_portrait else min(strip_h, 98)
+    w_min = 16 if is_portrait else 28
+    w_max = int(round(width * 0.90)) if is_portrait else 1200
+    cx_tol = max(140, int(round(width * 220 / 1920))) if is_portrait else 220
+    span_tol = max(45, int(round(width * 80 / 1920))) if is_portrait else 80
+    dx_tol = 16 if width < 1000 else 22
     active = [False] * n
     for i, sp in enumerate(spans):
         if sp is not None:
@@ -121,6 +122,7 @@ def scan_hardsub_and_scenes(
     width: int = 1920,
     fps_scan: int = 5,
     color_mode: str = "auto",
+    height: int = 1080,
 ):
     """
     Stroke-Validated Center-Clustered Hardsub & Glyph-IoU Clause Transition Scanner:
@@ -150,17 +152,17 @@ def scan_hardsub_and_scenes(
     scene_cuts = []
     widest_frames = []
 
-    is_narrow = width < 1000
-    x_left = int(round(width * (0.06 if is_narrow else 0.135)))
-    x_right = int(round(width * (0.94 if is_narrow else 0.865)))
-    y_top = 24 if is_narrow else 32
-    y_bot = min(strip_h - 6, 128) if is_narrow else 86
+    is_portrait = (height > width) or (width < 1000)
+    x_left = int(round(width * (0.06 if is_portrait else 0.135)))
+    x_right = int(round(width * (0.94 if is_portrait else 0.865)))
+    y_top = 14 if is_portrait else 32
+    y_bot = min(strip_h - 6, max(128, strip_h - 14)) if is_portrait else 86
     center_col = (width // 2) - x_left
-    gap_px = 28 if is_narrow else 55
-    center_tol = max(75, int(round(width * 110 / 1920))) if is_narrow else 110
-    min_px_cnt = 18 if is_narrow else 35
-    min_h = 12 if is_narrow else 18
-    min_w = 16 if is_narrow else 28
+    gap_px = max(24, int(round(width * 36 / 1080))) if is_portrait else 55
+    center_tol = max(75, int(round(width * 110 / 1920))) if is_portrait else 110
+    min_px_cnt = 18 if width < 1000 else 35
+    min_h = 12 if width < 1000 else 16
+    min_w = 16 if width < 1000 else 28
 
     prev_gray = None
     prev_sub_mask = None
@@ -284,12 +286,14 @@ def scan_hardsub_and_scenes(
         clause_changes=clause_changes,
         width=width,
         strip_h=strip_h,
+        height=height,
     )
 
     payload = {
         "strip_y0": strip_y0,
         "strip_h": strip_h,
         "width": width,
+        "height": height,
         "fps_scan": fps_scan,
         "num_frames": len(spans),
         "duration_scanned": round(len(spans) / fps_scan, 2),
@@ -576,6 +580,7 @@ def main():
             width=int(profile.get("width", 1920)),
             fps_scan=5,
             color_mode=args.color_mode,
+            height=int(profile.get("height", 1080)),
         )
     else:
         print(f"[SKIP] BBox scan already exists: {bbox_json}", flush=True)
@@ -587,6 +592,7 @@ def main():
             clause_changes=bdata.get("clause_changes"),
             width=int(bdata.get("width", profile.get("width", 1920))),
             strip_h=int(bdata.get("strip_h", profile.get("strip_h", 200))),
+            height=int(bdata.get("height", profile.get("height", 1080))),
         )
         bdata["hardsub_intervals_count"] = len(ivs)
         bdata["hardsub_intervals"] = ivs

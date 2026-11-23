@@ -1,4 +1,4 @@
-#!/Users/hoangnguyen142/Work/AICN/tools/.venv-dy/bin/python
+#!/usr/bin/env python3
 """
 dy_tool.py — Douyin (抖音) Discovery, Collection/Mix Analytics & No-Watermark Downloader.
 Uses Evil0ctal/Douyin_TikTok_Download_API native signing (ABogus + websign) + curl_cffi TLS
@@ -19,14 +19,17 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
-from curl_cffi import requests
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import aicn_platform as ap  # noqa: E402
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SKILL_DIR.parents[1]
 DOUYIN_REPO = PROJECT_ROOT / "tools" / "Douyin_TikTok_Download_API"
 COOKIE_CACHE = PROJECT_ROOT / "tools" / ".dy_cookies.json"
-FFPROBE = "/opt/homebrew/bin/ffprobe" if Path("/opt/homebrew/bin/ffprobe").exists() else "ffprobe"
-FFMPEG = "/opt/homebrew/bin/ffmpeg" if Path("/opt/homebrew/bin/ffmpeg").exists() else "ffmpeg"
+FFPROBE = ap.find_tool("ffprobe")
+FFMPEG = ap.find_tool("ffmpeg")
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -74,13 +77,13 @@ def mint_guest_cookies(seed_url: str = "https://www.douyin.com/video/77078447071
 
     from playwright.sync_api import sync_playwright
 
-    chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    chrome_path = ap.find_chrome()
     with sync_playwright() as p:
         launch_kw: dict[str, Any] = {
             "headless": True,
             "args": ["--disable-blink-features=AutomationControlled"],
         }
-        if Path(chrome_path).exists():
+        if chrome_path:
             launch_kw["executable_path"] = chrome_path
         browser = p.chromium.launch(**launch_kw)
         ctx = browser.new_context(locale="zh-CN", user_agent=UA, viewport={"width": 1920, "height": 1080})
@@ -102,6 +105,7 @@ class DouyinClient:
     """Thin signed client backed by Evil0ctal ABogus + websign + curl_cffi Chrome TLS."""
 
     def __init__(self, force_mint: bool = False) -> None:
+        from curl_cffi import requests
         self.abogus, self.websign = _load_evil0ctal()
         if force_mint and COOKIE_CACHE.exists():
             COOKIE_CACHE.unlink()
@@ -286,6 +290,7 @@ def summarize_aweme(ad: dict[str, Any]) -> dict[str, Any]:
 
 
 def download_media(url: str, out_path: Path, is_image: bool = False) -> None:
+    from curl_cffi import requests
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     r = requests.get(

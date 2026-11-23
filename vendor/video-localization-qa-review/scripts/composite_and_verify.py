@@ -16,8 +16,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-sys.path.insert(0, ORCH_SCRIPTS)
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+for _p in (ORCH_SCRIPTS, AICN_SCRIPTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import require_gate, sha256_file
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 def default_qa_timestamps(duration: float, count: int = 12) -> list[float]:
@@ -77,9 +84,11 @@ def main():
         use_dual_wm = bool(wm_cfg.get("enabled")) and os.path.exists(tl_logo) and os.path.exists(tr_badge)
 
         print(f"[PLAN] Compositing staging video -> {staging_mp4} (duration={total_sec:.2f}s, dual_watermark={use_dual_wm}, -sn no mov_text)", flush=True)
+        ff_bin = ap.find_tool("ffmpeg") if ap else "ffmpeg"
+        vcodec_args = ap.vendor_h264_encode_args("5000k") if ap else ["-c:v", "h264_videotoolbox", "-b:v", "5000k", "-pix_fmt", "yuv420p"]
         if use_dual_wm:
             cmd = [
-                "ffmpeg", "-y", "-nostats", "-progress", "pipe:1",
+                ff_bin, "-y", "-nostats", "-progress", "pipe:1",
                 "-i", args.video,
                 "-i", audio_in,
                 "-loop", "1", "-i", tl_logo,
@@ -91,9 +100,7 @@ def main():
                 "-map", "[vout]",
                 "-map", "1:a:0",
                 "-sn",
-                "-c:v", "h264_videotoolbox",
-                "-b:v", "5000k",
-                "-pix_fmt", "yuv420p",
+                *vcodec_args,
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-ar", "48000",
@@ -103,7 +110,7 @@ def main():
             ]
         else:
             cmd = [
-                "ffmpeg", "-y", "-nostats", "-progress", "pipe:1",
+                ff_bin, "-y", "-nostats", "-progress", "pipe:1",
                 "-i", args.video,
                 "-i", audio_in,
                 "-map", "0:v:0",
@@ -154,14 +161,14 @@ def main():
         fname = f"frame_{ts_int}s.jpg"
         out_jpg = os.path.join(qa_dir, fname)
         subprocess.run([
-            "ffmpeg", "-y", "-ss", str(ts), "-i", staging_mp4,
+            ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-ss", str(ts), "-i", staging_mp4,
             "-frames:v", "1", "-q:v", "2", "-loglevel", "error", out_jpg
         ], check=True)
         print(f"[QA FRAME] Extracted {fname} (t={ts}s)", flush=True)
         return {
             "timestamp": ts,
             "filename": fname,
-            "rel_path": os.path.join("frames", "qa", fname),
+            "rel_path": os.path.join("frames", "qa", fname).replace("\\", "/"),
             "sha256": sha256_file(out_jpg),
             "cv_status": "PASS",
         }

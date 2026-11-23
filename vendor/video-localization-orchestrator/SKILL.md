@@ -149,10 +149,10 @@ workspace/<slug>/
 ## Commands Reference
 
 ### 1A. Initialize a Single Video Workspace (`--topology single`)
-Always execute using `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`:
+Always execute using `$AICN_PY` (macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`, Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`):
 
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
+$AICN_PY .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
   --topology single \
   --video "bilibili/input.mp4" \
   --slug "bilibili-anthropic-distill" \
@@ -167,7 +167,7 @@ Always execute using `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`:
 Automatically ingests all episodes in `--episodes-dir` into `source/episodes/`, concatenates into `source/master_source.mp4`, and writes `data/00_episodes_manifest.json`:
 
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
+$AICN_PY .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
   --topology series_compilation \
   --episodes-dir "downloads/quy_khu_s01" \
   --slug "drama-quy-khu-s01" \
@@ -182,7 +182,7 @@ Automatically ingests all episodes in `--episodes-dir` into `source/episodes/`, 
 Creates/updates `workspace/<series-slug>/` (holding the shared `config/series_bible.json` and `deliverables/`) and initializes a working unit at `workspace/<series-slug>/units/<unit-slug>/`:
 
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
+$AICN_PY .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
   --topology series_episodic \
   --series-slug "drama-quy-khu" \
   --unit-slug "s01-ep01-05" \
@@ -195,13 +195,13 @@ Creates/updates `workspace/<series-slug>/` (holding the shared `config/series_bi
 
 ### 2. Inspect Overall CI/CD Pipeline Gate Status
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-localization-orchestrator/scripts/cicd_gate.py \
+$AICN_PY .agents/skills/video-localization-orchestrator/scripts/cicd_gate.py \
   --workspace "workspace/bilibili-anthropic-distill"
 ```
 
 ### 3. Enforce a Specific Gate Programmatically
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-localization-orchestrator/scripts/cicd_gate.py \
+$AICN_PY .agents/skills/video-localization-orchestrator/scripts/cicd_gate.py \
   --workspace "workspace/bilibili-anthropic-distill" \
   --require-stage 2
 ```

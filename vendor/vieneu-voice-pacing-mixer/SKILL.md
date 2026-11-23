@@ -19,8 +19,8 @@ Enforces a **4-check, 100-point CI/CD gate (`verify_stage_3.py` -> `.cicd/stage_
 ## Internal Sub-Skills Catalog (8 Core Capabilities)
 
 ### Sub-Skill 4.1: `VieNeu-TTS v3 Turbo` Engine & Multi-Persona Dispatch
-- Always run with `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python` (never system `python3`).
-- Instantiate `Vieneu()` with default cached `fp32` ONNX weights (`RTF ≈ 0.32` on Apple Silicon). Never pass `precision="int8"` unless already cached locally.
+- Always run with `$AICN_PY` (macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`, Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`; never bare system `python`).
+- Instantiate `Vieneu()` with default cached `fp32` ONNX weights (`RTF ≈ 0.32` on Apple Silicon / desktop CPU). Never pass `precision="int8"` unless already cached locally.
 - Supports single-narrator (`--voice "Hải Đăng"`) and multi-speaker drama scripts (where each item in `02_bilingual_script.json` can specify `"voice": "Hải Đăng" | "Ngọc" | "Bình" | "Tuyên"`). See [audio_dsp_and_pacing_manual.md](./references/audio_dsp_and_pacing_manual.md) for voice persona selection.
 
 ### Sub-Skill 4.2: Plosive-Safe Silence Trimming (`trim_silence`)
@@ -58,7 +58,7 @@ Enforces 4 weighted deterministic checks (`100/100` required to sign `.cicd/stag
 
 ### Step 3A: Synthesize 48kHz Voice Segments & Audit Pacing
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/vieneu-voice-pacing-mixer/scripts/synthesize_and_audit_pacing.py \
+$AICN_PY .agents/skills/vieneu-voice-pacing-mixer/scripts/synthesize_and_audit_pacing.py \
   --workspace "workspace/bilibili-anthropic-distill" \
   --voice "Hải Đăng" \
   --only-missing
@@ -66,13 +66,13 @@ Enforces 4 weighted deterministic checks (`100/100` required to sign `.cicd/stag
 
 ### Step 3B: Assemble 48kHz Stereo Master Audio & Sign Stage 3 Gate
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/vieneu-voice-pacing-mixer/scripts/assemble_master_audio.py \
+$AICN_PY .agents/skills/vieneu-voice-pacing-mixer/scripts/assemble_master_audio.py \
   --workspace "workspace/bilibili-anthropic-distill"
 ```
 
 ### Step 3C: Standalone Stage 3 CI/CD Gate Check
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/vieneu-voice-pacing-mixer/scripts/verify_stage_3.py \
+$AICN_PY .agents/skills/vieneu-voice-pacing-mixer/scripts/verify_stage_3.py \
   --workspace "workspace/bilibili-anthropic-distill"
 ```
 Do NOT proceed to Stage 4 render until `.cicd/stage_3_gate.json` reports `Status: PASS | Score: 100.0/100`.

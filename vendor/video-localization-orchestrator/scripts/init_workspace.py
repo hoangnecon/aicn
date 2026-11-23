@@ -15,13 +15,21 @@ import subprocess
 import sys
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+AICN_SCRIPTS = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "scripts"))
+for _p in (_HERE, AICN_SCRIPTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import write_gate_token, sha256_file
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 def probe_video(video_path: str) -> dict:
     cmd = [
-        "ffprobe", "-v", "error",
+        ap.find_tool("ffprobe") if ap else "ffprobe", "-v", "error",
         "-show_entries", "format=duration,size,bit_rate",
         "-show_entries", "stream=index,codec_name,codec_type,profile,time_base,start_time,duration,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels",
         "-of", "json", video_path
@@ -136,13 +144,13 @@ def ingest_and_build_episodes_manifest(
         uniform = len(set(specs)) == 1
         with open(concat_txt, "w", encoding="utf-8") as f:
             for ep_p in canonical_eps:
-                rel_p = os.path.relpath(ep_p, source_dir)
+                rel_p = os.path.relpath(ep_p, source_dir).replace("\\", "/")
                 f.write(f"file '{rel_p}'\n")
         need_norm = not uniform
         if uniform:
             print(f"[INIT] Concatenating {len(canonical_eps)} uniform episodes -> {master_dst}", flush=True)
             subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+                [ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
                  "-avoid_negative_ts", "make_zero", "-c", "copy", master_dst],
                 check=True,
             )
@@ -164,16 +172,17 @@ def ingest_and_build_episodes_manifest(
             fps_str = str(int(round(target_fps))) if abs(target_fps - round(target_fps)) < 1e-2 else f"{target_fps:.3f}"
             print(f"[INIT] Normalizing & concatenating {len(canonical_eps)} mixed-spec episodes ({w0}x{h0}@{fps_str}fps) -> {master_dst}", flush=True)
             norm_eps = []
+            vcodec_args = ap.vendor_h264_encode_args("5500k") if ap else ["-c:v", "h264_videotoolbox", "-b:v", "5500k", "-pix_fmt", "yuv420p"]
             for idx, ep_p in enumerate(canonical_eps, start=1):
                 norm_p = os.path.join(source_dir, f".norm_ep{idx:02d}.mp4")
                 subprocess.run([
-                    "ffmpeg", "-y", "-i", ep_p,
+                    ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-i", ep_p,
                     "-map", "0:v:0", "-map", "0:a:0",
                     "-vf", f"scale={w0}:{h0}:force_original_aspect_ratio=decrease,pad={w0}:{h0}:(ow-iw)/2:(oh-ih)/2,fps={fps_str},setpts=PTS-STARTPTS",
                     "-af", "asetpts=PTS-STARTPTS",
                     "-video_track_timescale", "15360",
                     "-avoid_negative_ts", "make_zero",
-                    "-c:v", "h264_videotoolbox", "-b:v", "5500k",
+                    *vcodec_args,
                     "-c:a", "aac", "-ar", "48000", "-ac", "2",
                     norm_p
                 ], check=True)
@@ -182,7 +191,7 @@ def ingest_and_build_episodes_manifest(
                 for np_path in norm_eps:
                     f.write(f"file '{os.path.basename(np_path)}'\n")
             subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+                [ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
                  "-avoid_negative_ts", "make_zero", "-c", "copy", master_dst],
                 check=True,
             )
@@ -205,7 +214,7 @@ def ingest_and_build_episodes_manifest(
     concat_txt = os.path.join(source_dir, "concat_list.txt")
     with open(concat_txt, "w", encoding="utf-8") as f:
         for ep_p in canonical_eps:
-            rel_p = os.path.relpath(ep_p, source_dir)
+            rel_p = os.path.relpath(ep_p, source_dir).replace("\\", "/")
             f.write(f"file '{rel_p}'\n")
 
     # Build data/00_episodes_manifest.json

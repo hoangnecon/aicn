@@ -12,8 +12,15 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-sys.path.insert(0, ORCH_SCRIPTS)
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+for _p in (ORCH_SCRIPTS, AICN_SCRIPTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import require_gate, sha256_file
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 def select_smart_timestamps(workspace: str, explicit_ts: str = "") -> list:
@@ -82,7 +89,7 @@ def main():
         fname = f"frame_{ts_int:04d}s.jpg"
         out_jpg = os.path.join(out_dir, fname)
         cmd = [
-            "ffmpeg", "-y",
+            ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y",
             "-ss", str(ts),
             "-i", args.video,
             "-frames:v", "1",
@@ -91,7 +98,7 @@ def main():
             out_jpg
         ]
         subprocess.run(cmd, check=True)
-        rel_path = os.path.join("frames", "audit", fname)
+        rel_path = os.path.join("frames", "audit", fname).replace("\\", "/")
         print(f"[AUDIT FRAME] Extracted {rel_path} (t={ts}s)", flush=True)
         return {
             "timestamp": ts,

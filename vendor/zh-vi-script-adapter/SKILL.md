@@ -79,10 +79,10 @@ Enforces 6 weighted deterministic checks (`100/100` required to sign `.cicd/stag
 
 ## Mandatory Validation Command
 
-Run `validate_bilingual_script.py` after generating or editing `data/02_bilingual_script.json`:
+Run `validate_bilingual_script.py` using `$AICN_PY` (macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`, Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`) after generating or editing `data/02_bilingual_script.json`:
 
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/zh-vi-script-adapter/scripts/validate_bilingual_script.py \
+$AICN_PY .agents/skills/zh-vi-script-adapter/scripts/validate_bilingual_script.py \
   --workspace "workspace/bilibili-anthropic-distill"
 ```
 

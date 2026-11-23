@@ -17,10 +17,16 @@ import numpy as np
 import soundfile as sf
 
 ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-sys.path.insert(0, ORCH_SCRIPTS)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+for _p in (ORCH_SCRIPTS, AICN_SCRIPTS, os.path.dirname(os.path.abspath(__file__))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import require_gate
 from verify_stage_3 import run_stage_3_verification
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 def trim_silence(wav: np.ndarray, sr: int = 48000, thresh: float = 0.008) -> np.ndarray:
@@ -37,7 +43,7 @@ def apply_atempo(wav: np.ndarray, sr: int, tempo: float) -> np.ndarray:
     if abs(tempo - 1.0) < 0.015:
         return wav
     cmd = [
-        "ffmpeg", "-y",
+        ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y",
         "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0",
         "-filter:a", f"atempo={tempo:.4f}",
         "-f", "f32le", "-ar", str(sr), "-ac", "1", "pipe:1"
@@ -51,7 +57,7 @@ def load_bgm_48k_stereo(bgm_path: str, total_samples: int, sr: int = 48000) -> n
     if not os.path.exists(bgm_path):
         return np.zeros((total_samples, 2), dtype=np.float32)
     cmd = [
-        "ffmpeg", "-y", "-i", bgm_path,
+        ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-i", bgm_path,
         "-f", "f32le", "-ar", str(sr), "-ac", "2", "pipe:1"
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)

@@ -19,8 +19,10 @@ import numpy as np
 import soundfile as sf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 import aicn  # noqa: E402  (jload, jdump, h_obj, FastHash, cicd)
+import aicn_platform as ap  # noqa: E402
 
 SR = 48000
 AUDIO_VERSION = "aicn-audio-1.1"
@@ -70,12 +72,12 @@ def run(cmd, **kw):
 
 
 def load(p, ch=2, sr=SR):
-    raw = run(["ffmpeg", "-v", "error", "-i", p, "-f", "f32le", "-ar", str(sr), "-ac", str(ch), "pipe:1"]).stdout
+    raw = run([ap.find_tool("ffmpeg"), "-v", "error", "-i", p, "-f", "f32le", "-ar", str(sr), "-ac", str(ch), "pipe:1"]).stdout
     return np.frombuffer(raw, np.float32).reshape(-1, ch).copy()
 
 
 def lufs_file(p):
-    o = subprocess.run(["ffmpeg", "-nostats", "-i", p, "-af", "ebur128=peak=true", "-f", "null", "-"],
+    o = subprocess.run([ap.find_tool("ffmpeg"), "-nostats", "-i", p, "-af", "ebur128=peak=true", "-f", "null", "-"],
                        capture_output=True, text=True).stderr
     i = float(re.findall(r"I:\s+(-?[\d.]+) LUFS", o)[-1])
     pk = re.findall(r"Peak:\s+(-?[\d.inf]+) dBFS", o)
@@ -87,7 +89,7 @@ def lufs(x):
     arr = np.asarray(x, dtype=np.float32)
     ch = 1 if arr.ndim == 1 else arr.shape[1]
     proc = subprocess.run(
-        ["ffmpeg", "-nostats", "-f", "f32le", "-ar", str(SR), "-ac", str(ch),
+        [ap.find_tool("ffmpeg"), "-nostats", "-f", "f32le", "-ar", str(SR), "-ac", str(ch),
          "-i", "pipe:0", "-af", "ebur128=peak=true", "-f", "null", "-"],
         input=np.ascontiguousarray(arr).tobytes(), capture_output=True,
     )
@@ -117,19 +119,28 @@ def cmd_separate(ws, c, fh):
     if meta.get("key") == key and all(os.path.exists(os.path.join(d, f)) for f in ("vocals.wav", "accomp.wav")):
         print("[separate] cached"); return
     os.makedirs(d, exist_ok=True); t0 = time.time()
+    bk = ap.detect_demucs_backend(sys.executable)
+    if bk["engine"] == "missing":
+        sys.exit("[aicn-audio] Demucs not available: install `demucs` in AICN_PY or install `uv` (for uvx)")
     with tempfile.TemporaryDirectory() as tmp:
         wav = os.path.join(tmp, "source.wav")
-        run(["ffmpeg", "-v", "error", "-y", "-i", src, "-vn", "-ac", "2", "-ar", "44100", wav])
-        run(["uvx", "--from", "demucs-mlx", "demucs-mlx", "-n", c["demucs_model"], "-o", tmp, wav])
+        run([ap.find_tool("ffmpeg"), "-v", "error", "-y", "-i", src, "-vn", "-ac", "2", "-ar", "44100", wav])
+        if bk["engine"] == "mlx":
+            run([ap.find_tool("uvx"), "--from", "demucs-mlx", "demucs-mlx", "-n", c["demucs_model"], "-o", tmp, wav])
+        else:
+            dev = "cuda" if bk["engine"] == "torch-cuda" else "cpu"
+            run([sys.executable, "-m", "demucs.separate", "--two-stems=vocals", "--device", dev,
+                 "-n", c["demucs_model"], "-o", tmp, wav])
         sd = os.path.join(tmp, c["demucs_model"], "source")
         if not os.path.isdir(sd):
             sd = os.path.join(tmp, "source")
         voc = load(os.path.join(sd, "vocals.wav"))
-        acc = sum(load(os.path.join(sd, f"{s}.wav")) for s in ("drums", "bass", "other"))
+        no_voc = os.path.join(sd, "no_vocals.wav")
+        acc = load(no_voc) if os.path.exists(no_voc) else sum(load(os.path.join(sd, f"{s}.wav")) for s in ("drums", "bass", "other"))
     sf.write(os.path.join(d, "vocals.wav"), voc, SR, subtype="FLOAT")
     sf.write(os.path.join(d, "accomp.wav"), acc, SR, subtype="FLOAT")
-    aicn.jdump(meta_p, {"key": key, "source": src, "model": c["demucs_model"], "seconds": round(time.time() - t0, 1)})
-    print(f"[separate] {c['demucs_model']} -> media/stems in {time.time() - t0:.1f}s")
+    aicn.jdump(meta_p, {"key": key, "source": src, "model": c["demucs_model"], "backend": bk["engine"], "seconds": round(time.time() - t0, 1)})
+    print(f"[separate] {c['demucs_model']} ({bk['label']}) -> media/stems in {time.time() - t0:.1f}s")
 
 
 # ---------------------------------------------------------------- dub
@@ -158,7 +169,7 @@ def stretch(w, tempo):
     with tempfile.TemporaryDirectory() as tmp:
         a, b = os.path.join(tmp, "a.wav"), os.path.join(tmp, "b.wav")
         sf.write(a, w, SR, subtype="FLOAT")
-        run(["rubberband", "-3", "-F", "-q", "--tempo", f"{tempo:.4f}", a, b])
+        run([ap.find_tool("rubberband"), "-3", "-F", "-q", "--tempo", f"{tempo:.4f}", a, b])
         out, _ = sf.read(b, dtype="float32")
     return out if out.ndim == 1 else out.mean(1)
 
@@ -496,13 +507,14 @@ def write_stage3_report(ws, mode, checks, c):
 
 
 def cmd_master(ws, c, fh):
+    ff = ap.find_tool("ffmpeg")
     mode = profile(ws).get("localization_mode", "voice_dub")
     src = os.path.join(ws, "media", "audio", "premaster_48k.wav")
     if mode == "sub_only":
         n_cues = write_sub_only_alignment(ws)
         print(f"[master] sub_only: aligned {n_cues} cues -> 03_aligned_subtitles.json & subtitles_full.srt")
         os.makedirs(os.path.dirname(src), exist_ok=True)
-        run(["ffmpeg", "-v", "error", "-y", "-i", source_path(ws), "-vn", "-ac", "2", "-ar", str(SR), "-c:a", "pcm_f32le", src])
+        run([ff, "-v", "error", "-y", "-i", source_path(ws), "-vn", "-ac", "2", "-ar", str(SR), "-c:a", "pcm_f32le", src])
     if not os.path.exists(src):
         sys.exit("[aicn-audio] no premaster: run `mix`")
     pre = "acompressor=threshold=-18dB:ratio=2:attack=20:release=250:makeup=1"
@@ -511,17 +523,17 @@ def cmd_master(ws, c, fh):
     t0 = time.time()
     if c.get("master_mode", "fast") == "loudnorm":
         ln = f"loudnorm=I={c['target_lufs']}:TP={c['true_peak_db']}:LRA={c['lra']}"
-        o = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},{ln}:print_format=json", "-f", "null", "-"],
+        o = subprocess.run([ff, "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},{ln}:print_format=json", "-f", "null", "-"],
                            capture_output=True, text=True).stderr
         m = json.loads(o[o.rindex("{"): o.rindex("}") + 1])
         ln2 = (f"{ln}:measured_I={m['input_i']}:measured_TP={m['input_tp']}:measured_LRA={m['input_lra']}"
                f":measured_thresh={m['input_thresh']}:offset={m['target_offset']}:linear=true")
-        run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", f"{pre},{ln2},aresample={SR},apad", "-t", f"{dur:.3f}",
+        run([ff, "-v", "error", "-y", "-i", src, "-af", f"{pre},{ln2},aresample={SR},apad", "-t", f"{dur:.3f}",
              "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
         i, pk = lufs_file(out)
     else:
         # Native 48 kHz linear EBU R128 master (~28x faster than 192 kHz loudnorm; identical linear gain + lookahead limiter)
-        o = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},ebur128=peak=true", "-f", "null", "-"],
+        o = subprocess.run([ff, "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},ebur128=peak=true", "-f", "null", "-"],
                            capture_output=True, text=True).stderr
         hits = re.findall(r"I:\s+(-?[\d.]+) LUFS", o)
         meas_i = float(hits[-1]) if hits else float(c["target_lufs"])
@@ -529,14 +541,14 @@ def cmd_master(ws, c, fh):
         # -0.55 dB sample-peak margin guarantees 4x oversampled true peak stays comfortably below true_peak_db + 0.3
         lim = 10.0 ** ((float(c["true_peak_db"]) - 0.55) / 20.0)
         af2 = f"{pre},volume={gain_db:.3f}dB,alimiter=limit={lim:.5f}:level=false:attack=5:release=50:asc=false,apad"
-        run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", af2, "-t", f"{dur:.3f}",
+        run([ff, "-v", "error", "-y", "-i", src, "-af", af2, "-t", f"{dur:.3f}",
              "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
         i, pk = lufs_file(out)
         if pk > float(c["true_peak_db"]) + 0.2:
             # Rare extreme inter-sample transient: 4x oversampled true-peak limit (~2s)
             lim_tp = 10.0 ** ((float(c["true_peak_db"]) - 0.1) / 20.0)
             af_tp = f"{pre},volume={gain_db:.3f}dB,aresample=192000,alimiter=limit={lim_tp:.5f}:level=false:attack=5:release=50:asc=false,aresample={SR},apad"
-            run(["ffmpeg", "-v", "error", "-y", "-i", src, "-af", af_tp, "-t", f"{dur:.3f}",
+            run([ff, "-v", "error", "-y", "-i", src, "-af", af_tp, "-t", f"{dur:.3f}",
                  "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
             i, pk = lufs_file(out)
     print(f"[master] {out}: {i:.1f} LUFS, peak {pk:.1f} dBFS ({time.time() - t0:.1f}s)")

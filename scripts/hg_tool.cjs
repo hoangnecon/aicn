@@ -8,6 +8,7 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
@@ -15,7 +16,7 @@ function resolveRepoDir() {
   const candidates = [
     process.env.AICN_HONGGUO_REPO,
     path.resolve(__dirname, '../../../tools/hongguo-drama'),
-    '/Users/hoangnguyen142/Work/AICN/tools/hongguo-drama',
+    path.join(os.homedir(), 'tools/hongguo-drama'),
   ].filter(Boolean);
   for (const dir of candidates) {
     if (fs.existsSync(path.join(dir, 'src/native/app-source.js'))) {
@@ -27,17 +28,36 @@ function resolveRepoDir() {
   );
 }
 
-const REPO_DIR = resolveRepoDir();
-const nativeDir = path.join(REPO_DIR, 'src/native');
+let _hgNative = null;
+function loadHongguo() {
+  if (_hgNative) return _hgNative;
+  const nativeDir = path.join(resolveRepoDir(), 'src/native');
+  _hgNative = {
+    ...require(path.join(nativeDir, 'hongguo-app-catalog.js')),
+    ...require(path.join(nativeDir, 'hongguo-app-new.js')),
+    ...require(path.join(nativeDir, 'hongguo-app-search.js')),
+    ...require(path.join(nativeDir, 'hongguo.js')),
+    ...require(path.join(nativeDir, 'app-source.js')),
+  };
+  return _hgNative;
+}
 
-const { browseList, catalogCover } = require(path.join(nativeDir, 'hongguo-app-catalog.js'));
-const { listNewReleases } = require(path.join(nativeDir, 'hongguo-app-new.js'));
-const { searchApp } = require(path.join(nativeDir, 'hongguo-app-search.js'));
-const { fetchEpisodeList, deriveKey } = require(path.join(nativeDir, 'hongguo.js'));
-const { fetchAppPlayUrl } = require(path.join(nativeDir, 'app-source.js'));
+function resolveBin(name, envKey) {
+  if (process.env[envKey] && fs.existsSync(process.env[envKey])) {
+    return process.env[envKey];
+  }
+  const exe = process.platform === 'win32' ? `${name}.exe` : name;
+  const candidates = process.platform === 'win32'
+    ? [path.join(os.homedir(), '.local', 'bin', exe)]
+    : [`/opt/homebrew/bin/${name}`, `/usr/local/bin/${name}`, path.join(os.homedir(), '.local', 'bin', name)];
+  for (const cand of candidates) {
+    if (fs.existsSync(cand)) return cand;
+  }
+  return name;
+}
 
-const FFMPEG = fs.existsSync('/opt/homebrew/bin/ffmpeg') ? '/opt/homebrew/bin/ffmpeg' : 'ffmpeg';
-const FFPROBE = fs.existsSync('/opt/homebrew/bin/ffprobe') ? '/opt/homebrew/bin/ffprobe' : 'ffprobe';
+const FFMPEG = resolveBin('ffmpeg', 'AICN_FFMPEG');
+const FFPROBE = resolveBin('ffprobe', 'AICN_FFPROBE');
 
 function parseArgs(argv) {
   const args = argv.slice(2);
@@ -108,6 +128,7 @@ async function cmdRank(flags) {
   const category = flags.category || 'hot-ai-drama';
   const page = parseInt(flags.page || '1', 10);
   const genre = flags.genre || '';
+  const { browseList } = loadHongguo();
   const res = await browseList({ category, genre, page, forceRefresh: true });
   if (!res || res.success === false) {
     throw new Error(`browseList failed: ${res?.error || 'unknown error'}`);
@@ -129,6 +150,7 @@ async function cmdNew(flags) {
   const pages = parseInt(flags.pages || '2', 10);
   const limit = parseInt(flags.limit || '20', 10);
   const filterGenre = flags.genre || 'all'; // all | ai | real
+  const { listNewReleases } = loadHongguo();
   const res = await listNewReleases({ pages, forceRefresh: true });
   let items = res.items || [];
   if (filterGenre === 'ai') {
@@ -152,6 +174,7 @@ async function cmdNew(flags) {
 async function cmdSearch(positional, flags) {
   const keyword = positional.join(' ').trim();
   if (!keyword) throw new Error('Usage: hg_tool.cjs search "<keyword>" [--page 1] [--json]');
+  const { searchApp } = loadHongguo();
   const page = parseInt(flags.page || '1', 10);
   const res = await searchApp(keyword, { page });
   const items = res?.items || res?.results || res?.list || (Array.isArray(res) ? res : []);
@@ -170,6 +193,7 @@ async function cmdSearch(positional, flags) {
 async function cmdEpisodes(positional, flags) {
   const seriesId = positional[0];
   if (!seriesId) throw new Error('Usage: hg_tool.cjs episodes <series_id> [--json]');
+  const { fetchEpisodeList, catalogCover } = loadHongguo();
   const data = await fetchEpisodeList(seriesId);
   const eps = data?.episodes || data?.list || (Array.isArray(data) ? data : []);
   const totalSec = eps.reduce((acc, e) => acc + (Number(e.duration) || 0), 0);
@@ -206,6 +230,7 @@ async function cmdDownload(positional, flags) {
   if (!seriesId || !outDir) {
     throw new Error('Usage: hg_tool.cjs download <series_id> --out <dir> [--episodes 1-10] [--quality 1080p|auto] [--delay-ms 1500]');
   }
+  const { fetchEpisodeList, deriveKey, fetchAppPlayUrl } = loadHongguo();
   const quality = flags.quality || '1080p';
   const delayMs = parseInt(flags['delay-ms'] || '1500', 10);
 
@@ -300,6 +325,7 @@ async function cmdFetchCovers(flags) {
   if (!inputPath || !outDir) {
     throw new Error('Usage: hg_tool.cjs fetch-covers --input <catalog.json> --out <covers_dir>');
   }
+  const { catalogCover } = loadHongguo();
   fs.mkdirSync(outDir, { recursive: true });
   const raw = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
   const items = Array.isArray(raw) ? raw : (raw.items || raw.candidates || []);

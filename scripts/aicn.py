@@ -32,26 +32,21 @@ import sys
 import time
 from datetime import datetime
 
-SKILL_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import aicn_platform as ap  # noqa: E402
+
+SKILL_DIR = os.path.normpath(os.path.join(HERE, ".."))
 VENDOR = os.path.join(SKILL_DIR, "vendor")
 
 FF_RENDERER_VERSION = "v2-dub-wm-2.0"
 TTS_ENGINE_TAG = "vieneu-v3-turbo-48k"
-ENCODE_PRESETS = {
-    "h264":      {"vcodec": "h264_videotoolbox", "q": 58, "pix_fmt": "yuv420p", "hwdec": True},
-    "hevc":      {"vcodec": "hevc_videotoolbox", "q": 60, "tag": "hvc1", "pix_fmt": "yuv420p", "hwdec": True},
-    "h264_high": {"vcodec": "h264_videotoolbox", "bitrate": "5000k", "pix_fmt": "yuv420p", "hwdec": True},
-}
+ENCODE_PRESETS = ("h264", "hevc", "h264_high")
 
 
-def resolve_encode(cfg_or_style, codec=None, quality=None):
-    preset_name = codec or (cfg_or_style or {}).get("codec", "h264")
-    enc = dict(ENCODE_PRESETS.get(preset_name, ENCODE_PRESETS["h264"]))
-    q = quality if quality is not None else (cfg_or_style or {}).get("quality")
-    if q is not None:
-        enc["q"] = int(q)
-        enc.pop("bitrate", None)
-    return enc
+def resolve_encode(cfg_or_style, codec=None, quality=None, backend=None):
+    return ap.resolve_encode_preset(cfg_or_style, codec=codec, quality=quality, backend=backend)
 
 
 def resolve_watermark(ws, brand_dir=None, width=1920):
@@ -185,7 +180,7 @@ def cmd_discover(a):
     if not found:
         print(f"[discover] no Series Hub under {root} (looked in ./ and ./workspace/*)")
     for hub in found:
-        print(f"\nSERIES  {os.path.relpath(hub, root)}")
+        print(f"\nSERIES  {ap.normalize_rel_path(hub, root)}")
         for f in ("CHANGELOG.md", "PROGRESS.md", "config/series_bible.json", "00_series_manifest.md"):
             print(f"  {'ok ' if os.path.exists(os.path.join(hub, f)) else 'MISSING'} {f}")
         inbox = glob.glob(os.path.join(hub, "source_inbox", "**", "*.mp4"), recursive=True)
@@ -202,7 +197,7 @@ def cmd_discover(a):
             print(f"  {os.path.basename(u):28s} {gs:10s}  {'yes' if adopted else 'no ':3s}      {'yes' if final else 'no'}")
         full_mp4 = os.path.join(hub, "deliverables", f"final_{os.path.basename(hub)}_full_vi.mp4")
         if os.path.exists(full_mp4):
-            print(f"  FULL RELEASE: READY ({os.path.relpath(full_mp4, hub)}, {os.path.getsize(full_mp4)/1e6:.1f} MB; {n_pass}/{len(units)} batches PASS)")
+            print(f"  FULL RELEASE: READY ({ap.normalize_rel_path(full_mp4, hub)}, {os.path.getsize(full_mp4)/1e6:.1f} MB; {n_pass}/{len(units)} batches PASS)")
         else:
             print(f"  FULL RELEASE: PENDING ({n_pass}/{len(units)} working batches PASS -> run `merge-series` once all batches PASS)")
     print("\nlegend: P=PASS F=FAIL x=PASS but artifact deleted -=missing. Working batches are internal slices; publish only the full-series release.")
@@ -290,7 +285,9 @@ def load_unit(ws):
 
 def stage1_key(ws, fh):
     src = os.path.join(ws, "source", "master_source.mp4")
-    return h_obj({"src": fh(src) if os.path.exists(src) else None, "asr": "mlx-whisper"})
+    asr_engine = ap.detect_asr_backend()["engine"]
+    asr_tag = "mlx-whisper" if asr_engine == "mlx" else asr_engine
+    return h_obj({"src": fh(src) if os.path.exists(src) else None, "asr": asr_tag})
 
 
 def ff_render_key(ws, fh, enc=None, wm=None):
@@ -382,13 +379,13 @@ def cmd_tts_sync(a):
 
 # ----------------------------------------------------------------- media helpers & renderer
 def ffprobe_duration(p):
-    return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p],
+    return float(subprocess.run([ap.find_tool("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p],
                                 capture_output=True, text=True).stdout.strip() or 0)
 
 
 def ffprobe_streams(p):
     out = subprocess.check_output([
-        "ffprobe", "-v", "error", "-show_entries",
+        ap.find_tool("ffprobe"), "-v", "error", "-show_entries",
         "stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,time_base,start_time,duration,nb_frames,sample_rate,channels",
         "-of", "json", p,
     ], text=True)
@@ -403,7 +400,7 @@ def resolve_fps(ws, prof):
     if os.path.exists(src):
         try:
             out = subprocess.check_output(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                [ap.find_tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", src],
                 text=True, timeout=10,
             ).strip().splitlines()[0].rstrip(",")
@@ -426,10 +423,9 @@ def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
     src_mp4 = os.path.join(ws, "source", "master_source.mp4")
     has_audio = os.path.exists(audio)
 
-    cmd = ["ffmpeg", "-v", "error", "-y"]
+    cmd = [ap.find_tool("ffmpeg"), "-v", "error", "-y"]
     if wm:
-        if enc.get("hwdec"):
-            cmd += ["-hwaccel", "videotoolbox"]
+        cmd += ap.build_hwaccel_input_args(enc)
         cmd += ["-i", src_mp4]
         audio_idx = None
         next_idx = 1
@@ -455,13 +451,7 @@ def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
             )
         cmd += ["-filter_complex", fg, "-map", "[v]"]
         cmd += ["-map", f"{audio_idx}:a", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if audio_idx is not None else ["-an"]
-        cmd += ["-c:v", enc["vcodec"]]
-        if "q" in enc:
-            cmd += ["-q:v", str(enc["q"])]
-        elif "bitrate" in enc:
-            cmd += ["-b:v", enc["bitrate"]]
-        if enc.get("tag"):
-            cmd += ["-tag:v", enc["tag"]]
+        cmd += ap.build_vcodec_args(enc)
         cmd += ["-g", str(int(round(fps * 2))), "-fps_mode", "passthrough", "-sn", "-movflags", "+faststart", out + ".part.mp4"]
     else:
         cmd += ["-i", src_mp4]
@@ -492,7 +482,16 @@ def cmd_render(a):
     if prev.get("key") == key and os.path.exists(out):
         print("[render] unchanged -> staging is current"); fh.save(); return
     t0 = time.time()
-    enc_desc = "stream-copy" if not wm else (f"{enc['vcodec']}(q={enc['q']})" if "q" in enc else f"{enc['vcodec']}({enc.get('bitrate')})")
+    if not wm:
+        enc_desc = "stream-copy"
+    elif "q" in enc:
+        enc_desc = f"{enc['vcodec']}(q={enc['q']})"
+    elif "cq" in enc:
+        enc_desc = f"{enc['vcodec']}(cq={enc['cq']})"
+    elif "crf" in enc:
+        enc_desc = f"{enc['vcodec']}(crf={enc['crf']})"
+    else:
+        enc_desc = f"{enc['vcodec']}({enc.get('bitrate')})"
     print(f"[render] ffmpeg one pass, enc={enc_desc} wm={'on' if wm else 'off'} -> {out}", flush=True)
     render_ffmpeg(ws, prof, audio, out, enc=enc, wm=wm)
     sz_mb = os.path.getsize(out) / 1e6
@@ -601,7 +600,7 @@ def cmd_clean(a):
             if not a.dry_run:
                 os.remove(p)
         freed += sz
-        print(f"  {'would-rm' if a.dry_run else 'removed ':8s} {sz / 1e6:7.1f} MB  {os.path.relpath(p, ws)}")
+        print(f"  {'would-rm' if a.dry_run else 'removed ':8s} {sz / 1e6:7.1f} MB  {ap.normalize_rel_path(p, ws)}")
     note = "deep: Stage 3/4 gates will show x, Stage 5 stays P" if getattr(a, "deep", False) else "PPPPPP gates intact"
     print(f"[clean] {'would free' if a.dry_run else 'freed'} {freed / 1e6:.1f} MB in {os.path.basename(ws)} ({note})")
 
@@ -676,8 +675,8 @@ def cmd_merge_series(a):
     lst = os.path.join(hub, ".cache", "merge_concat.txt")
     os.makedirs(os.path.dirname(lst), exist_ok=True)
     with open(lst, "w", encoding="utf-8") as f:
-        f.writelines(f"file '{p}'\n" for p in mp4s)
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+        f.writelines(ap.ffmpeg_concat_line(p) for p in mp4s)
+    subprocess.run([ap.find_tool("ffmpeg"), "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
                     "-avoid_negative_ts", "make_zero", "-c", "copy", "-movflags", "+faststart", out_mp4 + ".part.mp4"], check=True)
     os.replace(out_mp4 + ".part.mp4", out_mp4)
     full_st = ffprobe_streams(out_mp4)
@@ -699,7 +698,7 @@ def cmd_merge_series(a):
     hub_log = os.path.join(hub, "CHANGELOG.md")
     if os.path.exists(hub_log):
         with open(hub_log, "a", encoding="utf-8") as f:
-            f.write(f"- {now()} [release] hub: merged {len(mp4s)} batches ({sum(durs)/60:.1f} min{ep_note}, {sz_mb:.1f} MB) -> {os.path.relpath(out_mp4, hub)}\n")
+            f.write(f"- {now()} [release] hub: merged {len(mp4s)} batches ({sum(durs)/60:.1f} min{ep_note}, {sz_mb:.1f} MB) -> {ap.normalize_rel_path(out_mp4, hub)}\n")
     if os.path.exists(os.path.join(hub, "PROGRESS.md")):
         refresh_progress(hub)
     print(f"[merge-series] FULL SERIES READY: {len(mp4s)} batches ({sum(durs)/60:.1f} min{ep_note}, {sz_mb:.1f} MB) -> {out_mp4}")
@@ -723,13 +722,10 @@ def _qa_timestamps_for(u):
 
 
 def cmd_run_series(a):
-    """Hardware-overlapped full-series batch runner (Metal GPU + CPU + Media Engine).
-    - prep:    Metal (separate + ASR) overlapped with CPU (waveform + audit-frames) for Stage 0 PASS batches.
-    - produce: 3-engine overlapped pipeline (Metal separate -> CPU dub/mix/master/verify -> Media Engine render/verify-render/QA-extract)
+    """Hardware-overlapped full-series batch runner (GPU + CPU + Video Encoder).
+    - prep:    GPU/MLX (separate + ASR) overlapped with CPU (waveform + audit-frames) for Stage 0 PASS batches.
+    - produce: 3-engine overlapped pipeline (GPU separate -> CPU dub/mix/master/verify -> VideoEncoder render/verify-render/QA-extract)
                for batches with Stage 2 PASS. Supports --units u1,u2 for streaming per-unit execution without waiting for all batches."""
-    import contextlib
-    import fcntl
-    import threading
     from concurrent.futures import ThreadPoolExecutor
     hub = os.path.abspath(a.hub)
     if not is_hub(hub):
@@ -740,28 +736,22 @@ def cmd_run_series(a):
         units = [u for u in units if os.path.basename(u) in want]
     if not units:
         sys.exit(f"[run-series] no matching working batches under {hub}/units/")
-    py = os.environ.get("AICN_PY", "/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python")
-    if not os.path.exists(py):
-        py = sys.executable
+    py = ap.find_python()
     audio_py = os.path.join(SKILL_DIR, "scripts", "aicn_audio.py")
     aicn_py = os.path.join(SKILL_DIR, "scripts", "aicn.py")
     s1_dir = os.path.join(VENDOR, "video-asr-visual-audit", "scripts")
     s5_dir = os.path.join(VENDOR, "video-localization-qa-review", "scripts")
 
+    gpu_info = ap.get_gpu_info(py)
+    demucs_tag = "Metal" if ap.detect_demucs_backend(py, gpu_info)["device"] == "mps" else ("CUDA" if gpu_info.get("cuda") else "CPU")
+    asr_tag = "Metal" if ap.detect_asr_backend(py, gpu_info)["device"] == "mps" else ("CUDA" if gpu_info.get("cuda") else "CPU")
+    vid_tag = {"videotoolbox": "MediaEngine", "nvenc": "NVENC", "cpu": "CPU"}[ap.detect_video_backend()]
+
     lock_dir = os.path.join(hub, ".cache", "locks")
     os.makedirs(lock_dir, exist_ok=True)
-    t_locks = {"gpu": threading.Lock(), "cpu": threading.Lock(), "media": threading.Lock()}
 
-    @contextlib.contextmanager
     def _engine_lock(kind):
-        lp = os.path.join(lock_dir, f"{kind}.lock")
-        with t_locks[kind]:
-            with open(lp, "a+") as lf:
-                fcntl.flock(lf, fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lf, fcntl.LOCK_UN)
+        return ap.file_lock(os.path.join(lock_dir, f"{kind}.lock"))
 
     def _run(tag, cmd):
         t0 = time.time()
@@ -779,8 +769,8 @@ def cmd_run_series(a):
             bn = os.path.basename(u)
             src = os.path.join(u, "source", "master_source.mp4")
             with _engine_lock("gpu"):
-                _run(f"{bn}:separate[Metal]", [py, audio_py, "separate", "--unit", u])
-                _run(f"{bn}:asr[Metal]", [py, os.path.join(s1_dir, "run_asr_and_scan.py"), "--video", src, "--workspace", u])
+                _run(f"{bn}:separate[{demucs_tag}]", [py, audio_py, "separate", "--unit", u])
+                _run(f"{bn}:asr[{asr_tag}]", [py, os.path.join(s1_dir, "run_asr_and_scan.py"), "--video", src, "--workspace", u])
             with _engine_lock("cpu"):
                 _run(f"{bn}:waveform[CPU]", [py, os.path.join(s1_dir, "analyze_voice_waveform.py"), "--workspace", u, "--snap-and-split"])
                 _run(f"{bn}:audit-frames[CPU]", [py, os.path.join(s1_dir, "extract_audit_frames.py"), "--video", src, "--workspace", u])
@@ -807,14 +797,14 @@ def cmd_run_series(a):
         gs = gate_status(u)
         if gs[3] != "P":
             with _engine_lock("gpu"):
-                _run(f"{bn}:separate[Metal]", [py, audio_py, "separate", "--unit", u])
+                _run(f"{bn}:separate[{demucs_tag}]", [py, audio_py, "separate", "--unit", u])
             with _engine_lock("cpu"):
                 for step in ("dub", "mix", "master", "verify"):
                     _run(f"{bn}:{step}[CPU]", [py, audio_py, step, "--unit", u])
         qa_man = os.path.join(u, "data", "04_qa_frames_manifest.json")
         if gs[4] != "P" or not os.path.exists(qa_man):
             with _engine_lock("media"):
-                _run(f"{bn}:render[MediaEngine]", [py, aicn_py, "render", "--unit", u, *render_flags])
+                _run(f"{bn}:render[{vid_tag}]", [py, aicn_py, "render", "--unit", u, *render_flags])
                 _run(f"{bn}:verify-render", [py, aicn_py, "verify-render", "--unit", u])
                 src = os.path.join(u, "source", "master_source.mp4")
                 stg = os.path.join(u, "media", ".staging_render.mp4")
@@ -866,7 +856,7 @@ def refresh_progress(hub):
         rows.append(f"| {os.path.basename(u)} | `{gs}` | {lr.get('at', '-')} ({lr.get('rendered', '-')} new/{lr.get('reused', '-')} reused) | {fin} |")
     full_mp4 = os.path.join(hub, "deliverables", f"final_{os.path.basename(hub)}_full_vi.mp4")
     if os.path.exists(full_mp4):
-        rel = f"**Full-series release:** READY (`{os.path.relpath(full_mp4, hub)}`, {os.path.getsize(full_mp4)/1e6:.1f} MB; {n_pass}/{len(units)} batches PASS)"
+        rel = f"**Full-series release:** READY (`{ap.normalize_rel_path(full_mp4, hub)}`, {os.path.getsize(full_mp4)/1e6:.1f} MB; {n_pass}/{len(units)} batches PASS)"
     else:
         rel = f"**Full-series release:** PENDING ({n_pass}/{len(units)} batches PASS — run `aicn.py merge-series --hub .` once all batches PASS)"
     block = "<!-- AUTO:UNITS -->\n" + rel + "\n\n" + "\n".join(rows) + "\n<!-- /AUTO:UNITS -->"
@@ -889,33 +879,60 @@ def cmd_progress(a):
 def cmd_doctor(a):
     """Probe the machine once and write config/machine.json so every stage uses the native stack."""
     import platform
-    sh = lambda *c: subprocess.run(c, capture_output=True, text=True).stdout
-    m = {"at": now(), "os": platform.platform(), "arch": platform.machine(),
-         "chip": sh("sysctl", "-n", "machdep.cpu.brand_string").strip(),
-         "cores": os.cpu_count(), "ram_gb": round(int(sh("sysctl", "-n", "hw.memsize") or 0) / 2**30, 1)}
-    filters, encoders = sh("ffmpeg", "-hide_banner", "-filters"), sh("ffmpeg", "-hide_banner", "-encoders")
-    m["ffmpeg"] = {"version": (sh("ffmpeg", "-version").split("\n") or [""])[0],
-                   "filters": {f: f" {f} " in filters for f in ("overlay", "scale_vt")},
-                   "encoders": {e: e in encoders for e in ("h264_videotoolbox", "hevc_videotoolbox", "libx264")}}
-    py = os.environ.get("AICN_PY", "/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python")
+    py = ap.find_python()
+    gpu = ap.get_gpu_info(py)
+    encoders = ap.probe_ffmpeg_encoders()
+    filters = ap.probe_ffmpeg_filters()
+    video_backend = ap.detect_video_backend(encoders)
+    asr_info = ap.detect_asr_backend(py, gpu)
+    demucs_info = ap.detect_demucs_backend(py, gpu)
+
+    m = {
+        "at": now(),
+        "os": platform.platform(),
+        "arch": platform.machine(),
+        "chip": ap.get_cpu_brand(),
+        "cores": os.cpu_count(),
+        "ram_gb": ap.get_ram_gb(),
+        "gpu": gpu,
+        "ffmpeg": {
+            "path": ap.find_tool("ffmpeg"),
+            "version": ap.get_ffmpeg_version(),
+            "filters": filters,
+            "encoders": encoders,
+            "backend": video_backend,
+        },
+    }
     probe = lambda mod: subprocess.run([py, "-c", f"import {mod}"], capture_output=True).returncode == 0
-    m["python"] = {"path": py, **{k: probe(k) for k in ("mlx.core", "mlx_whisper", "faster_whisper", "soundfile")}}
-    m["tools"] = {t: bool(shutil.which(t)) for t in ("rubberband", "uvx", "ffprobe")}
+    m["python"] = {
+        "path": py,
+        **{k: probe(k) for k in ("torch", "demucs", "vieneu", "mlx.core", "mlx_whisper", "faster_whisper", "soundfile")},
+    }
+    tool_names = ("ffmpeg", "ffprobe", "rubberband", "uvx", "node")
+    m["tools"] = {t: ap.tool_exists(t) for t in tool_names}
+    m["tool_paths"] = {t: ap.find_tool(t) for t in tool_names}
     hub = os.path.expanduser("~/.cache/huggingface/hub")
     m["models"] = sorted(d for d in (os.listdir(hub) if os.path.isdir(hub) else []) if "whisper" in d.lower())
-    enc_choices = [e for e in ("h264_videotoolbox", "hevc_videotoolbox") if m["ffmpeg"]["encoders"][e]]
+    if video_backend == "videotoolbox":
+        enc_choices = [e for e in ("h264_videotoolbox", "hevc_videotoolbox") if encoders.get(e)]
+    elif video_backend == "nvenc":
+        enc_choices = [e for e in ("h264_nvenc", "hevc_nvenc") if encoders.get(e)]
+    else:
+        enc_choices = [e for e in ("libx264", "libx265") if encoders.get(e)]
+    rb_hint = "MISSING (run install.ps1)" if ap.is_windows() else "MISSING (brew install rubberband)"
     m["choose"] = {
-        "asr": "mlx-whisper (Metal)" if m["python"]["mlx_whisper"] else "faster-whisper (CPU int8)",
-        "render": "ffmpeg one-pass (dub + watermark / stream-copy)",
+        "asr": asr_info["label"],
+        "render": f"ffmpeg one-pass ({video_backend}: dub + watermark / stream-copy)",
         "encoder": " + ".join(enc_choices) if enc_choices else "libx264",
-        "stems": "demucs-mlx via uvx" if m["tools"]["uvx"] else "MISSING",
-        "stretch": "rubberband R3" if m["tools"]["rubberband"] else "MISSING (brew install rubberband)",
+        "stems": demucs_info["label"],
+        "stretch": "rubberband R3" if m["tools"]["rubberband"] else rb_hint,
+        "gpu": f"{gpu.get('backend')} ({gpu.get('name')}, {gpu.get('vram_gb')} GB)" if gpu.get("vram_gb") else f"{gpu.get('backend')} ({gpu.get('name')})",
     }
     out = os.path.join(os.path.abspath(a.root), "config", "machine.json")
     jdump(out, m)
     for k, v in m["choose"].items():
         print(f"  {k:8s} {v}")
-    print(f"[doctor] {m['chip']} {m['cores']} cores {m['ram_gb']} GB -> {out}")
+    print(f"[doctor] {m['chip']} | {m['cores']} cores | {m['ram_gb']} GB RAM -> {out}")
 
 
 # ----------------------------------------------------------------- main
@@ -941,7 +958,7 @@ def main():
     p = sp.add_parser("render"); p.add_argument("--unit", required=True)
     p.add_argument("--no-gate", action="store_true", help="tests only")
     p.add_argument("--codec", choices=list(ENCODE_PRESETS), default=None, help="encoder preset: h264 | hevc | h264_high")
-    p.add_argument("--quality", type=int, default=None, help="VideoToolbox -q:v quality (e.g. 55-62)")
+    p.add_argument("--quality", type=int, default=None, help="Encoder quality (-q:v VideoToolbox / -cq NVENC / -crf x264)")
     p.add_argument("--brand-dir", default=None, help="folder with 13_top_left_logo_large.png & 15_top_right_vietsub_floating.png")
     p.set_defaults(f=cmd_render)
     p = sp.add_parser("verify-overlay"); p.add_argument("--unit", required=True); p.add_argument("--no-gate", action="store_true")

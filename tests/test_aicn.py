@@ -33,23 +33,50 @@ class TTSKey(unittest.TestCase):
 
 class EncodeAndKey(unittest.TestCase):
     def test_resolve_encode_presets_and_quality_override(self):
-        h264 = aicn.resolve_encode({})
-        self.assertEqual(h264["vcodec"], "h264_videotoolbox")
-        self.assertEqual(h264["q"], 58)
-        self.assertTrue(h264["hwdec"])
+        # macOS VideoToolbox
+        vt_h264 = aicn.resolve_encode({}, backend="videotoolbox")
+        self.assertEqual(vt_h264["vcodec"], "h264_videotoolbox")
+        self.assertEqual(vt_h264["q"], 58)
+        self.assertTrue(vt_h264["hwdec"])
 
-        hevc = aicn.resolve_encode({}, codec="hevc")
-        self.assertEqual(hevc["vcodec"], "hevc_videotoolbox")
-        self.assertEqual(hevc["tag"], "hvc1")
-        self.assertEqual(hevc["q"], 60)
+        vt_hevc = aicn.resolve_encode({}, codec="hevc", backend="videotoolbox")
+        self.assertEqual(vt_hevc["vcodec"], "hevc_videotoolbox")
+        self.assertEqual(vt_hevc["tag"], "hvc1")
+        self.assertEqual(vt_hevc["q"], 60)
 
-        hi = aicn.resolve_encode({}, codec="h264_high")
-        self.assertEqual(hi["bitrate"], "5000k")
-        self.assertNotIn("q", hi)
+        vt_hi = aicn.resolve_encode({}, codec="h264_high", backend="videotoolbox")
+        self.assertEqual(vt_hi["bitrate"], "5000k")
+        self.assertNotIn("q", vt_hi)
 
-        over = aicn.resolve_encode({}, codec="h264_high", quality=55)
-        self.assertEqual(over["q"], 55)
-        self.assertNotIn("bitrate", over)
+        vt_over = aicn.resolve_encode({}, codec="h264_high", quality=55, backend="videotoolbox")
+        self.assertEqual(vt_over["q"], 55)
+        self.assertNotIn("bitrate", vt_over)
+
+        # NVIDIA NVENC
+        nv_h264 = aicn.resolve_encode({}, backend="nvenc")
+        self.assertEqual(nv_h264["vcodec"], "h264_nvenc")
+        self.assertEqual(nv_h264["cq"], 22)
+        self.assertFalse(nv_h264["hwdec"])
+
+        nv_hevc = aicn.resolve_encode({}, codec="hevc", backend="nvenc")
+        self.assertEqual(nv_hevc["vcodec"], "hevc_nvenc")
+        self.assertEqual(nv_hevc["tag"], "hvc1")
+        self.assertEqual(nv_hevc["cq"], 24)
+
+        nv_over = aicn.resolve_encode({}, codec="h264_high", quality=19, backend="nvenc")
+        self.assertEqual(nv_over["cq"], 19)
+        self.assertNotIn("bitrate", nv_over)
+
+        # CPU libx264 / libx265
+        cpu_h264 = aicn.resolve_encode({}, backend="cpu")
+        self.assertEqual(cpu_h264["vcodec"], "libx264")
+        self.assertEqual(cpu_h264["crf"], 20)
+        self.assertFalse(cpu_h264["hwdec"])
+
+        cpu_over = aicn.resolve_encode({}, codec="hevc", quality=21, backend="cpu")
+        self.assertEqual(cpu_over["vcodec"], "libx265")
+        self.assertEqual(cpu_over["crf"], 21)
+        self.assertFalse(cpu_over["hwdec"])
 
     def test_ff_render_key_reacts_to_codec_and_watermark(self):
         with tempfile.TemporaryDirectory() as d:
@@ -232,6 +259,54 @@ class CLI(unittest.TestCase):
             aicn.cmd_verify_overlay(type("A", (), {"unit": u, "no_gate": True})())
             gate = aicn.jload(os.path.join(u, ".cicd", "stage_4_gate.json"))
             self.assertEqual(gate["status"], "PASS")
+
+    def test_watermarked_render_active_backend_and_verify_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            u = os.path.join(td, "unit_wm")
+            bd = os.path.join(td, "brand")
+            for d in ("data", "config", "media", "source", ".cache"):
+                os.makedirs(os.path.join(u, d), exist_ok=True)
+            os.makedirs(bd, exist_ok=True)
+            ff = aicn.ap.find_tool("ffmpeg")
+            for name in ("13_top_left_logo_large.png", "15_top_right_vietsub_floating.png"):
+                subprocess.run([
+                    ff, "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red@0.5:s=64x32:d=0.04",
+                    "-frames:v", "1", os.path.join(bd, name),
+                ], check=True)
+            src = os.path.join(u, "source", "master_source.mp4")
+            audio = os.path.join(u, "media", "master_audio_48k.wav")
+            subprocess.run([
+                ff, "-v", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1.5:r=25",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=1.5",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", src
+            ], check=True)
+            subprocess.run([
+                ff, "-v", "error", "-y",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=1.5",
+                "-c:a", "pcm_s16le", audio
+            ], check=True)
+            aicn.jdump(os.path.join(u, "data", "00_video_profile.json"), {"width": 320, "height": 240, "duration": 1.5, "r_fps": 25.0, "is_vfr": False})
+            aicn.jdump(os.path.join(u, "data", "00_episodes_manifest.json"), {"episodes": []})
+            aicn.jdump(os.path.join(u, "config", "project_config.json"), {"slug": "unit_wm"})
+            aicn.cmd_render(type("A", (), {"unit": u, "no_gate": True, "codec": "h264", "quality": None, "brand_dir": bd})())
+            stg = os.path.join(u, "media", ".staging_render.mp4")
+            self.assertTrue(os.path.exists(stg))
+            aicn.cmd_verify_overlay(type("A", (), {"unit": u, "no_gate": True})())
+            gate = aicn.jload(os.path.join(u, ".cicd", "stage_4_gate.json"))
+            self.assertEqual(gate["status"], "PASS")
+
+    def test_doctor_writes_machine_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self.run_cli("doctor", "--root", td)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            m = aicn.jload(os.path.join(td, "config", "machine.json"))
+            self.assertIsInstance(m, dict)
+            for key in ("gpu", "ffmpeg", "tools", "choose"):
+                self.assertIn(key, m)
+            self.assertIn("backend", m["gpu"])
+            self.assertIn("backend", m["ffmpeg"])
+            self.assertIn("asr", m["choose"])
 
 
 if __name__ == "__main__":

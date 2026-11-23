@@ -74,8 +74,9 @@ Programmatically verifies 5 weighted checks (`100/100` required):
 ## Step-by-Step Execution Workflow
 
 ### Step 1A: Separate Vocals/BGM (if not already separated)
+Run using `$AICN_PY` (macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python` or Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`):
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python -m demucs.separate \
+$AICN_PY -m demucs.separate \
   -n htdemucs --two-stems=vocals \
   -o "workspace/bilibili-anthropic-distill/media/demucs" \
   "bilibili/input.mp4"
@@ -84,7 +85,7 @@ Programmatically verifies 5 weighted checks (`100/100` required):
 
 ### Step 1B: Run 5fps Hardsub Scan, Scene-Cut Detection & Fine-Grained ASR
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-asr-visual-audit/scripts/run_asr_and_scan.py \
+$AICN_PY .agents/skills/video-asr-visual-audit/scripts/run_asr_and_scan.py \
   --video "bilibili/input.mp4" \
   --workspace "workspace/bilibili-anthropic-distill" \
   --color-mode "auto"
@@ -92,7 +93,7 @@ Programmatically verifies 5 weighted checks (`100/100` required):
 
 ### Step 1C: Extract Audit Keyframes & Generate SHA-256 Manifest
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-asr-visual-audit/scripts/extract_audit_frames.py \
+$AICN_PY .agents/skills/video-asr-visual-audit/scripts/extract_audit_frames.py \
   --video "bilibili/input.mp4" \
   --workspace "workspace/bilibili-anthropic-distill" \
   --timestamps "18,37,76,113,136,196,310,533,600,655,681,683,738"
@@ -104,7 +105,7 @@ Call `read_file` on every `.jpg` listed in `data/01_extracted_audit_manifest.jso
 
 ### Step 1E: Run Stage 1 CI/CD Gate Validator (MANDATORY)
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-asr-visual-audit/scripts/verify_stage_1.py \
+$AICN_PY .agents/skills/video-asr-visual-audit/scripts/verify_stage_1.py \
   --workspace "workspace/bilibili-anthropic-distill"
 ```
 Do NOT proceed to `zh-vi-script-adapter` until `verify_stage_1.py` prints `Status: PASS | Score: 100.0/100`.

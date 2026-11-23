@@ -14,7 +14,7 @@ while the dub is speaking, and only as far as needed for the dub to be clearly h
 
 | Step | Does | Output | Cache |
 |---|---|---|---|
-| separate | Demucs htdemucs (MLX) splits the source into vocals and accompaniment (drums + bass + other) | `media/stems/{vocals,accomp}.wav`, `stems.json` | source sha256 + model |
+| separate | Demucs `htdemucs` (`demucs-mlx` on macOS Metal, PyTorch `demucs` CUDA/CPU on Windows/Linux) splits the source into vocals and accompaniment (drums + bass + other) | `media/stems/{vocals,accomp}.wav`, `stems.json` | source sha256 + model |
 | dub | groups comma-chained clauses of one speaker into sentences, CPU `fp32` VieNeu TTS (default `tts_workers=2`, `tts_threads=4` for `>=8` jobs), cleans the hiss floor, time-stretches in parallel with rubberband R3 (formant preserved), places each sentence at its first clause, cuts it back into clauses | `media/audio/dub_voice_48k.wav`, `media/tts_segments/seg_NNNN.wav`, `data/03_aligned_subtitles.json`, `data/03_dub_sentences.json`, SRT | `.cache/tts_sent/<sha(text, voice, engine, temperature, top_k)>.wav` |
 | mix | voice chain on the dub, piped zero-disk LUFS level match, cached-Z `complex64` STFT/iSTFT per-band per-frame ducking of the original stems | `media/audio/premaster_48k.wav`, `data/03_mix_stats.json` | none (≈ 20.5 s compute per 10 min batch) |
 | master | glue compressor 2:1 + native 48 kHz EBU R128 linear gain + lookahead limiter (`master_mode="fast"`, ≈ 4.1 s vs 115 s legacy 192 kHz `loudnorm`) | `media/master_audio_48k.wav` (48 kHz, 24-bit) | none |

@@ -11,13 +11,13 @@ Reference measurement batch: `unit_07_ep61_70` (10 episodes, 609.54 s, 1080p30, 
 | Step | `v1.2.1` (M) | `v1.3.0` (M) | Notes |
 |---|---|---|---|
 | Stage 0 init + adopt | < 30 s | < 30 s | |
-| Stage 1 Demucs stems (`demucs-mlx`, Metal) | 74 s | 74 s | cached for Stage 3 |
+| Stage 1 Demucs stems (`demucs-mlx` Metal / PyTorch CUDA) | 74 s | 74 s | cached for Stage 3 |
 | Stage 1 5 fps hardsub scan | 38.9 s | **0 s (skipped in v2.0.0)** | dub + watermark + translate only |
-| Stage 1 MLX Whisper ASR (Metal) | ~80 s | **~22–28 s** (3.3×) | `word_timestamps=False` (72.0s → 21.6s on 120s warm slice) |
+| Stage 1 Whisper ASR (MLX Metal / CUDA `float16`) | ~80 s | **~22–28 s** (3.3×) | `word_timestamps=False` (72.0s → 21.6s on 120s warm slice) |
 | Stage 3 VieNeu CPU (`fp32`) + parallel rubberband | ~240 s | **~185–195 s** (+23%) | `tts_workers=2, tts_threads=4` (`gen_RTF` 0.317 → 0.258) |
 | Stage 3 frequency-aware `mix` | 78.8 s (56.5 s compute) | **~21.5 s** (20.5 s compute) | cached-Z `complex64` STFT + piped `lufs()` (2.8–3.7×) |
 | Stage 3 `master` (-14 LUFS) | **115.4 s** | **4.1 s** (**28×**) | native 48 kHz `ebur128 + alimiter` (-14.00 LUFS, -0.80 dBFS) |
-| Stage 4 one-pass render (+ 2-corner watermark) | ~145 s (2 passes) | **~100–108 s** (1 pass) | `hwaccel videotoolbox` + VBR (5.6–6.06×), -49% to -63% smaller |
+| Stage 4 one-pass render (+ 2-corner watermark) | ~145 s (2 passes) | **~100–108 s** (1 pass) | `videotoolbox` / `nvenc` VBR (or `libx264` CPU fallback), -49% to -63% smaller |
 | Stage 5 hardlink + parallel QA extract | ~12 s (+790 MB copy) | **~4 s** (0 B extra) | hardlink + 4-worker ffmpeg |
 | **Machine time / 10-min batch** | **≈ 13.0 min** | **≈ 7.5 min** (**-42%**) | full dub + full sub + watermark |
 

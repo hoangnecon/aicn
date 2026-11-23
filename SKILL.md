@@ -26,25 +26,24 @@ inputs changed. Everything else comes from cache. Nothing is recomputed because 
 | Variable | Value |
 |---|---|
 | `<skill>` | the folder holding this file |
-| Engine | `python3 <skill>/scripts/aicn.py <cmd>` (`--help` lists commands) |
+| Engine | `python <skill>/scripts/aicn.py <cmd>` (`--help` lists commands) |
 | Hongguo Sourcing CLI | `node <skill>/scripts/hg_tool.cjs <cmd>` (backed by `tools/hongguo-drama`; replaces retired `ohg`) |
-| Douyin Sourcing CLI | `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py <cmd>` (backed by `Evil0ctal/Douyin_TikTok_Download_API`) |
-| English DramaDunyam CLI | `python3 <skill>/scripts/dd_tool.py top\|list\|search\|detail\|download` (clean `lang=en`, non-adult `dramadunyam.com` API) |
-| Unified Radar & Index | `python3 <skill>/scripts/aicn_radar.py sync-all\|search\|top` (`data/drama_index.db`, Hongguo + Douyin + Bilibili + DramaDunyam) |
-| Stage scripts | `<skill>/vendor/<stage-skill>/scripts/*.py`, run with `$AICN_PY` (default `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`) |
+| Douyin Sourcing CLI | `<dy_py> <skill>/scripts/dy_tool.py <cmd>` (`tools/.venv-dy/bin/python` or `Scripts/python.exe`) |
+| English DramaDunyam CLI | `python <skill>/scripts/dd_tool.py top\|list\|search\|detail\|download` (clean `lang=en`, non-adult `dramadunyam.com` API) |
+| Unified Radar & Index | `python <skill>/scripts/aicn_radar.py sync-all\|search\|top` (`data/drama_index.db`, Hongguo + Douyin + Bilibili + DramaDunyam) |
+| Stage scripts | `<skill>/vendor/<stage-skill>/scripts/*.py`, run with `$AICN_PY` (macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`, Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`) |
 | Gate tokens | `<unit>/.cicd/stage_N_gate.json`, signed, 100/100 required |
 | RSI Ledger | `<skill>/LESSONS.md` + `references/recursive_self_improvement.md` |
 
 ## 0. Once per machine: doctor
 
 ```bash
-python3 <skill>/scripts/aicn.py doctor --root <project-root>
+python <skill>/scripts/aicn.py doctor --root <project-root>
 ```
 
-It writes `config/machine.json` and prints the stack to use. On Apple Silicon that is:
-Whisper on MLX (Metal), Demucs MLX, ffmpeg one-pass render with `h264_videotoolbox` /
-`hevc_videotoolbox` (hardware decode + quality VBR), rubberband. Python never touches video
-frames on the default path.
+It writes `config/machine.json` and prints the stack to use (`scripts/aicn_platform.py`).
+- **macOS Apple Silicon**: Whisper on MLX (Metal), Demucs MLX (`uvx`), ffmpeg one-pass render with `h264_videotoolbox` / `hevc_videotoolbox` (hardware decode + quality VBR), `rubberband`.
+- **Windows 10/11 + NVIDIA CUDA**: `faster-whisper` on CUDA (`float16`), PyTorch `demucs` on CUDA, ffmpeg one-pass render with `h264_nvenc` / `hevc_nvenc` (`-rc vbr -cq`), `rubberband` (or `libx264` CPU fallback). Python never touches video frames on the default path.
 
 ## 1. On entry: read the root
 
@@ -106,16 +105,16 @@ Exact commands per stage: `references/stages.md`.
 | Stage | Does | Gate | Cached by |
 |---|---|---|---|
 | 0 Init | series hub + internal working batches (`units/*`), fps/PTS-normalized `master_source.mp4` | stage_0 (decoupled from `series_bible.json`) | `source/master_source.mp4` |
-| 1 Prep (Stems + ASR + audit) | `run-series --phase prep` (Metal `separate+ASR` overlapped with CPU `waveform+audit`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
+| 1 Prep (Stems + ASR + audit) | `run-series --phase prep` (GPU `separate+ASR` overlapped with CPU `waveform+audit`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
 | 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) + living `series_bible.json` | `validate_bilingual_script.py` | stream each unit immediately on Stage 1 PASS |
 | 3 Audio (full dub) | `aicn_audio.py all`: stems (cached) → CPU VieNeu TTS (2×4 threads) + parallel rubberband → cached-Z mix → fast 48 kHz master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: hub-shared `<hub>/.cache/tts_sent/<sha>.wav` |
-| 4 Render (Dub + Watermark) | `render` (one ffmpeg pass: `h264_videotoolbox`/`hevc_videotoolbox` with `--brand-dir` dual-corner watermark, or instant video stream-copy when no watermark is set) | `aicn.py verify-render` / `verify-overlay` (codec/audio + A/V sync + frame count) | whole batch: sha256(source, audio, watermark, encoder, renderer version); unchanged → skipped |
+| 4 Render (Dub + Watermark) | `render` (one ffmpeg pass: hardware `videotoolbox`/`nvenc` or `libx264` with `--brand-dir` dual-corner watermark, or instant video stream-copy when no watermark is set) | `aicn.py verify-render` / `verify-overlay` (codec/audio + A/V sync + frame count) | whole batch: sha256(source, audio, watermark, encoder, renderer version); unchanged → skipped |
 | 5 Batch QA | hardlink staging MP4, 4-worker QA frame extraction, **view every frame**, verify batch (`run-series --phase produce --units ...` streams S3→S5 with 3-engine locks) | `verify_stage_5.py` | hardlink (0 extra bytes) |
 | 6 Full-Series Release | **`aicn.py merge-series --hub <hub>`** once **ALL** working batches PASS Stage 5 (verifies uniform stream specs & A/V sync) → single full-series MP4 + SRT | all batches `P` at Stage 5 | stream copy (seconds) |
 
 **Streaming & Lean Worker Cap (mandatory for ~45m target):**
 - **Never wait for all batches at Stage 2:** stream units independently (`Stage 1 → 2 → 3 → 4 → 5`) via `aicn.py run-series --hub <hub> --phase produce --units <unit>` as soon as each unit passes Stage 2.
-- **Keep at most 2–3 workers active** (1–2 Stage 2 translators + 1 `run-series` runner; auto-kill/pause idle workers). Never spawn >1 Metal job or >1 VieNeu TTS job concurrently; `run-series` enforces cross-process `gpu.lock` / `cpu.lock` / `media.lock`.
+- **Keep at most 2–3 workers active** (1–2 Stage 2 translators + 1 `run-series` runner; auto-kill/pause idle workers). Never spawn >1 GPU (Metal/CUDA) job or >1 VieNeu TTS job concurrently; `run-series` enforces cross-process `gpu.lock` / `cpu.lock` / `media.lock` via `aicn_platform.file_lock`.
 
 The project requires **full Vietnamese dubbing (`voice_dub`) + full Vietnamese subtitles** on
 every published series. Never downgrade to `sub_only` as a shortcut.
@@ -137,7 +136,7 @@ Undo is free: the old text restores the old key, and the cached TTS segment is r
 ## 5. Dub + Watermark + Translate Only (v2.0.0)
 
 `aicn v2.0.0` produces clean dubbed + watermarked video with an external `.srt` track — **no burned-in subtitle overlay, no Style-B pill plates, and no GaussianBlur hardsub masking**.
-- When `--brand-dir` (or `project_config.json["watermark"]`) is set, `render` composites the dual-corner PNGs (`13_top_left_logo_large.png` + `15_top_right_vietsub_floating.png`, scaled proportionally on portrait widths `< 1200`) via hardware `h264_videotoolbox` / `hevc_videotoolbox` with `-fps_mode passthrough -sn`.
+- When `--brand-dir` (or `project_config.json["watermark"]`) is set, `render` composites the dual-corner PNGs (`13_top_left_logo_large.png` + `15_top_right_vietsub_floating.png`, scaled proportionally on portrait widths `< 1200`) via hardware `videotoolbox` (macOS), `nvenc` (NVIDIA GPU), or `libx264` (CPU fallback) with `-fps_mode passthrough -sn`.
 - When no watermark is configured, `render` stream-copies video (`-c:v copy -sn`) and muxes `master_audio_48k.wav` in seconds.
 
 ## 6. Audio: dub over the film, never instead of it

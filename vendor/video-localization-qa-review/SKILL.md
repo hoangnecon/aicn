@@ -19,7 +19,7 @@ Stage 5 (final release gate) of the video localization pipeline. Enforces a **St
 Prevents premature completion claims. `composite_and_verify.py` deletes any stale `media/final_<slug>_vi.mp4` before encoding and writes exclusively to `media/.staging_final.mp4`. Only `verify_stage_5.py` promotes the staging file to `media/final_<slug>_vi.mp4` upon scoring `100/100`.
 
 ### Sub-Skill 6.2: Stream Sanitization & Zero-Duplicate-Subtitle Enforcement (`-sn`)
-**STRICT PROHIBITION:** Never embed a soft-subtitle stream (`mov_text` or `ass`) inside the final MP4. Passing `-sn` guarantees clean video + audio streams (with optional dual-corner watermarks). Encodes video with `h264_videotoolbox` (or stream-copy when no watermark is set) and audio with `aac -b:a 192k -ar 48000 -movflags +faststart`.
+**STRICT PROHIBITION:** Never embed a soft-subtitle stream (`mov_text` or `ass`) inside the final MP4. Passing `-sn` guarantees clean video + audio streams (with optional dual-corner watermarks). Encodes video with `h264_videotoolbox` (macOS) / `h264_nvenc` (NVIDIA) / `libx264` (CPU fallback) (or stream-copy when no watermark is set) and audio with `aac -b:a 192k -ar 48000 -movflags +faststart`.
 
 ### Sub-Skill 6.3: Flushed Real-Time Encoding Telemetry
 Parses `ffmpeg -progress pipe:1` and prints flushed progress every 10 seconds (`Encoded Xs / Ys (Z%) | speed=... | elapsed=...`).
@@ -56,8 +56,9 @@ Automates channel logo extraction (`01..06_transparent.png` from a `2x2` Master 
 ## Execution Commands
 
 ### Step 5A: Composite to Locked Staging File & Run CV Scan
+Run using `$AICN_PY` (macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`, Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`):
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-localization-qa-review/scripts/composite_and_verify.py \
+$AICN_PY .agents/skills/video-localization-qa-review/scripts/composite_and_verify.py \
   --video "bilibili/input.mp4" \
   --workspace "workspace/bilibili-anthropic-distill" \
   --slug "bilibili-anthropic-distill" \
@@ -69,7 +70,7 @@ Call `read_file` on `workspace/<slug>/frames/qa/frame_*s.jpg` and record the ver
 
 ### Step 5C: Run Stage 5 CI/CD Release Validator to Promote Final Output
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-localization-qa-review/scripts/verify_stage_5.py \
+$AICN_PY .agents/skills/video-localization-qa-review/scripts/verify_stage_5.py \
   --workspace "workspace/bilibili-anthropic-distill" \
   --release-path "bilibili/final_anthropic_distillation_vietnamese.mp4"
 ```
@@ -78,7 +79,7 @@ Never claim completion until `verify_stage_5.py` prints `Status: PASS | Score: 1
 ### Step 5D: Slice 2x2 Brand Grid, Build Dual-Corner Badges, or Burn Watermark (`apply_channel_branding.py`)
 To slice a 2x2 brand grid, rebuild the Top-Left Logo (`13`) + Top-Right `"Vietsub by <Channel>"` badges (`14=pill`, `15=floating` [default], `18=3d_wordmark`), or burn the Dual-Corner Watermark onto a `16:9` MP4:
 ```bash
-uv run --with pillow --with numpy --with scipy python3 .agents/skills/video-localization-qa-review/scripts/apply_channel_branding.py \
+uv run --with pillow --with numpy --with scipy python .agents/skills/video-localization-qa-review/scripts/apply_channel_branding.py \
   --brand-dir "workspace/branding-dau-do" \
   --channel-name "Đậu Đỏ" \
   --credit-prefix "Vietsub by " \
@@ -89,7 +90,7 @@ uv run --with pillow --with numpy --with scipy python3 .agents/skills/video-loca
 ### Step 5E (Multi-Episode Compilation Splitter): Export Individual Localized Episodes (`deliverables/episodes/`)
 When `topology == "series_compilation"` and `data/00_episodes_manifest.json` contains `>= 2` episodes, slice the verified `16:9` MP4, `9:16` MP4, and `.srt` back into individual localized episodes (with timestamps re-zeroed to `00:00:00.000` per episode):
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/video-localization-qa-review/scripts/split_compiled_episodes.py \
+$AICN_PY .agents/skills/video-localization-qa-review/scripts/split_compiled_episodes.py \
   --workspace "workspace/drama-quy-khu-s01"
 ```
 Outputs `deliverables/episodes/<ep_id>_<slug>_vi_16x9.mp4`, `<ep_id>_<slug>_vi_9x16.mp4`, `<ep_id>_<slug>_vi.srt`, and `episodes_export_manifest.json`.

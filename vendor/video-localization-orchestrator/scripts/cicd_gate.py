@@ -73,7 +73,10 @@ def write_gate_token(
                 "detail": "File does not exist on disk"
             })
         else:
-            rel_key = os.path.relpath(p, workspace) if p.startswith(workspace) else p
+            norm_p = os.path.normcase(os.path.abspath(p))
+            norm_ws = os.path.normcase(workspace)
+            under_ws = norm_p == norm_ws or norm_p.startswith(norm_ws + os.sep)
+            rel_key = os.path.relpath(os.path.abspath(p), workspace).replace("\\", "/") if under_ws else os.path.abspath(p)
             artifacts_hashed[rel_key] = {
                 "sha256": sha256_file(p),
                 "size_bytes": os.path.getsize(p)

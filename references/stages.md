@@ -6,7 +6,8 @@ Set once per shell:
 SK=<skill>                                   # folder of SKILL.md
 V=$SK/vendor
 PY=${AICN_PY:-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python}
-A="python3 $SK/scripts/aicn.py"
+# Windows PowerShell: $PY = $env:AICN_PY (e.g. C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe)
+A="python $SK/scripts/aicn.py"
 U=workspace/<series>/units/<unit>            # unit workspace
 ```
 
@@ -43,8 +44,8 @@ Or run the non-interactive prep across all batches of a series at once:
 $A run-series --hub workspace/<series> --phase prep
 ```
 
-Outputs: `media/stems/{vocals,accomp}.wav`, `01_asr_raw_segments.json` (MLX Whisper on Metal,
-`word_timestamps=False` for 3.3× speedup; `AICN_ASR=faster` forces CPU), and
+Outputs: `media/stems/{vocals,accomp}.wav`, `01_asr_raw_segments.json` (MLX Whisper on Metal on macOS,
+`faster-whisper` CUDA `float16` on NVIDIA, or CPU `int8`; `AICN_ASR=mlx|faster-cuda|faster-cpu` overrides), and
 `01_waveform_voice_audit.json`. These are frozen; `$A plan` reports when the source hash changes.
 
 ## Stage 2: bilingual script
@@ -70,7 +71,7 @@ in Stage 2, re-validate, and run `dub` again: only that sentence is re-synthesiz
 Then listen to one dubbed passage and one passage without dub.
 Details and tuning: `references/audio_mix.md`.
 
-Requirements: `rubberband` (`brew install rubberband`) and `uvx` (for `demucs-mlx`).
+Requirements: `rubberband` (`brew install rubberband` on macOS, `install.ps1 -InstallTools` on Windows) and `uvx` (for `demucs-mlx` on macOS) or `demucs` in `$AICN_PY` (PyTorch CUDA/CPU on Windows/Linux).
 
 ## Stage 4: dub + watermark render (v2.0.0)
 
@@ -80,9 +81,9 @@ $A render --unit $U [--codec h264|hevc|h264_high] [--quality N] [--brand-dir <di
 $A verify-render --unit $U  # Stage 4 gate (alias: verify-overlay)
 ```
 
-- `--codec h264` (default): `h264_videotoolbox -q:v 58` (≈ 1.86 GB / 100 min, broad compatibility).
-- `--codec hevc`: `hevc_videotoolbox -q:v 60 -tag:v hvc1` (≈ 1.35 GB / 100 min, fastest & smallest).
-- `--codec h264_high`: legacy `5000k` ABR (≈ 3.65 GB / 100 min).
+- `--codec h264` (default): `h264_videotoolbox -q:v 58` (macOS) / `h264_nvenc -rc vbr -cq 22` (NVIDIA) / `libx264 -crf 20` (CPU).
+- `--codec hevc`: `hevc_videotoolbox -q:v 60 -tag:v hvc1` (macOS) / `hevc_nvenc -rc vbr -cq 24 -tag:v hvc1` (NVIDIA) / `libx265 -crf 22` (CPU).
+- `--codec h264_high`: legacy `5000k` ABR across `h264_videotoolbox` / `h264_nvenc` / `libx264`.
 - `--brand-dir <dir>` (or `config/project_config.json["watermark"]`): composites dual-corner PNGs (`13_top_left_logo_large.png`, `15_top_right_vietsub_floating.png`) inside a single FFmpeg pass. When no watermark is configured, `render` stream-copies video (`-c:v copy -sn`).
 
 ## Stage 5: QA and release
@@ -100,7 +101,7 @@ This extracts 12 stratified QA frames across the batch for watermark/visual sani
 ## Stage 6: Full-Series Pipeline & Release (mandatory — 1 published video = 1 FULL series)
 
 ```bash
-# Hardware-overlapped full-series production after Stage 2 passes on batches (Metal ∥ CPU ∥ Media Engine)
+# Hardware-overlapped full-series production after Stage 2 passes on batches (GPU ∥ CPU ∥ Hardware Encoder)
 $A run-series --hub workspace/<series> --phase produce [--codec h264|hevc] [--brand-dir <dir>]
 
 # After visually verifying Stage 5 QA on EVERY working batch (all batches Stage 5 = P):

@@ -22,13 +22,20 @@ import time
 
 
 ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-sys.path.insert(0, ORCH_SCRIPTS)
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+for _p in (ORCH_SCRIPTS, AICN_SCRIPTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import require_gate
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 def probe_json(path: str) -> dict:
     cmd = [
-        "ffprobe", "-v", "error",
+        ap.find_tool("ffprobe") if ap else "ffprobe", "-v", "error",
         "-show_entries", "format=duration,size,bit_rate",
         "-show_entries", "stream=index,codec_name,codec_type,width,height,sample_aspect_ratio,display_aspect_ratio,r_frame_rate,sample_rate,channels",
         "-of", "json", path
@@ -81,8 +88,10 @@ def main():
         "[bg][fg]overlay=0:520:shortest=1,setsar=1:1[vout]"
     )
 
+    ff_bin = ap.find_tool("ffmpeg") if ap else "ffmpeg"
+    vcodec_args = ap.vendor_h264_encode_args("5200k") if ap else ["-c:v", "h264_videotoolbox", "-b:v", "5200k", "-pix_fmt", "yuv420p"]
     cmd = [
-        "ffmpeg", "-y", "-nostats", "-progress", "pipe:1",
+        ff_bin, "-y", "-nostats", "-progress", "pipe:1",
         "-i", src_video,
         "-i", master_16x9,
         "-filter_complex", filter_complex,
@@ -90,9 +99,7 @@ def main():
         "-map", "1:a:0",
         "-sn",
         "-aspect", "9:16",
-        "-c:v", "h264_videotoolbox",
-        "-b:v", "5200k",
-        "-pix_fmt", "yuv420p",
+        *vcodec_args,
         "-c:a", "copy",
         "-movflags", "+faststart",
         out_9x16,
@@ -133,7 +140,7 @@ def main():
         ts_int = int(round(ts))
         out_jpg = os.path.join(qa_9x16_dir, f"frame_9x16_{ts_int}s.jpg")
         subprocess.run([
-            "ffmpeg", "-y", "-ss", str(ts), "-i", out_9x16,
+            ff_bin, "-y", "-ss", str(ts), "-i", out_9x16,
             "-frames:v", "1", "-q:v", "2", "-loglevel", "error", out_jpg
         ], check=True)
 

@@ -1,4 +1,5 @@
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -10,17 +11,20 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 HG_TOOL = SKILL_DIR / "scripts" / "hg_tool.cjs"
 DY_TOOL = SKILL_DIR / "scripts" / "dy_tool.py"
 RADAR_TOOL = SKILL_DIR / "scripts" / "aicn_radar.py"
-DY_PY = SKILL_DIR.parents[1] / "tools" / ".venv-dy" / "bin" / "python"
 
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
+import aicn_platform as ap  # noqa: E402
 import aicn_radar  # noqa: E402
+
+NODE_BIN = ap.find_tool("node")
+DY_PY = Path(ap.find_dy_python(SKILL_DIR.parents[1]))
 
 
 class TestHgToolAndRsi(unittest.TestCase):
     def test_hg_tool_exists_and_help_runs(self):
         self.assertTrue(HG_TOOL.exists(), f"Missing {HG_TOOL}")
         res = subprocess.run(
-            ["node", str(HG_TOOL), "--help"],
+            [NODE_BIN, str(HG_TOOL), "--help"],
             capture_output=True,
             text=True,
             check=False,
@@ -31,7 +35,7 @@ class TestHgToolAndRsi(unittest.TestCase):
 
     def test_hg_tool_unknown_command_fails_nonzero(self):
         res = subprocess.run(
-            ["node", str(HG_TOOL), "nonexistent-subcmd"],
+            [NODE_BIN, str(HG_TOOL), "nonexistent-subcmd"],
             capture_output=True,
             text=True,
             check=False,
@@ -42,7 +46,7 @@ class TestHgToolAndRsi(unittest.TestCase):
     def test_hg_tool_missing_args_fail_cleanly(self):
         for argv in (["search"], ["episodes"], ["download"], ["fetch-covers"]):
             res = subprocess.run(
-                ["node", str(HG_TOOL), *argv],
+                [NODE_BIN, str(HG_TOOL), *argv],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -61,8 +65,8 @@ class TestHgToolAndRsi(unittest.TestCase):
             self.assertGreater(p.stat().st_size, 200)
 
     def test_no_legacy_ohg_binary_in_path(self):
-        res = subprocess.run(["which", "ohg"], capture_output=True, text=True)
-        self.assertNotEqual(res.returncode, 0, f"Retired ohg binary still on PATH: {res.stdout}")
+        found = shutil.which("ohg")
+        self.assertIsNone(found, f"Retired ohg binary still on PATH: {found}")
 
     def test_dy_tool_help_and_radar_index_roundtrip(self):
         self.assertTrue(DY_TOOL.exists(), f"Missing {DY_TOOL}")

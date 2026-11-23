@@ -17,6 +17,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from scipy import ndimage
 
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+if AICN_SCRIPTS not in sys.path:
+    sys.path.insert(0, AICN_SCRIPTS)
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
+
 
 def remove_bg_decontaminate(rgb_arr: np.ndarray, knock_out_interior_holes: bool = False, min_hole_area: int = 25) -> Image.Image:
     """
@@ -163,7 +171,10 @@ def build_dual_corner_badges(brand_dir: str, channel_name: str = "Đậu Đỏ",
     font_paths = [
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         "/System/Library/Fonts/HelveticaNeue.ttc",
-        "/Library/Fonts/Arial Bold.ttf"
+        "/Library/Fonts/Arial Bold.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     ]
     font_path = next((p for p in font_paths if os.path.exists(p)), None)
     scale = 2
@@ -245,8 +256,12 @@ def build_dual_corner_badges(brand_dir: str, channel_name: str = "Đậu Đỏ",
         wm_w = int(round(wm_tight.width * (wm_h / wm_tight.height)))
         wm_3d = wm_tight.resize((wm_w, wm_h), Image.Resampling.LANCZOS)
         seal_36 = wm_seal.resize((36, 36), Image.Resampling.LANCZOS)
-        f_it = "/System/Library/Fonts/Supplemental/Georgia Bold Italic.ttf"
-        f_sub = ImageFont.truetype(f_it if os.path.exists(f_it) else font_path, 21)
+        f_it_cands = [
+            "/System/Library/Fonts/Supplemental/Georgia Bold Italic.ttf",
+            r"C:\Windows\Fonts\georgiaz.ttf",
+        ]
+        f_it = next((p for p in f_it_cands if os.path.exists(p)), None)
+        f_sub = ImageFont.truetype(f_it if f_it else font_path, 21)
         tb = dummy.textbbox((0, 0), credit_prefix.strip(), font=f_sub)
         tw, th = tb[2] - tb[0], tb[3] - tb[1]
         in_w = 36 + 10 + tw + 9 + wm_w
@@ -288,15 +303,16 @@ def burn_dual_corner_to_video(in_mp4: str, out_mp4: str, brand_dir: str, style: 
     tr_y = center_y - tr_im.height // 2
 
     res = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", in_mp4],
+        [ap.find_tool("ffprobe") if ap else "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", in_mp4],
         capture_output=True, text=True, check=True
     )
     total_sec = float(res.stdout.strip() or 1.0)
     tmp_out = out_mp4 + ".tmp_branding.mp4"
 
     print(f"[PLAN] Burning Dual-Corner Branding (style={style}) onto {in_mp4} ({total_sec:.2f}s) -> {out_mp4}", flush=True)
+    vcodec_args = ap.vendor_h264_encode_args("5000k") if ap else ["-c:v", "h264_videotoolbox", "-b:v", "5000k", "-pix_fmt", "yuv420p"]
     cmd = [
-        "ffmpeg", "-y", "-nostats", "-progress", "pipe:1",
+        ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-nostats", "-progress", "pipe:1",
         "-i", in_mp4,
         "-i", tl_png,
         "-i", tr_png,
@@ -304,9 +320,7 @@ def burn_dual_corner_to_video(in_mp4: str, out_mp4: str, brand_dir: str, style: 
         "-map", "[vout]",
         "-map", "0:a:0",
         "-sn",
-        "-c:v", "h264_videotoolbox",
-        "-b:v", "5000k",
-        "-pix_fmt", "yuv420p",
+        *vcodec_args,
         "-c:a", "copy",
         "-movflags", "+faststart",
         tmp_out
@@ -408,7 +422,7 @@ def clean_and_brand_series_poster(
 
 def main():
     parser = argparse.ArgumentParser(description="Channel Branding, 2x2 Grid Slicing, Series Posters & 16:9 Dual-Corner Watermark Engine.")
-    parser.add_argument("--brand-dir", default="/Users/hoangnguyen142/Work/PROJ1/workspace/branding-dau-do", help="Project-level brand assets directory.")
+    parser.add_argument("--brand-dir", default=os.environ.get("AICN_BRAND_DIR", ""), help="Project-level brand assets directory (or AICN_BRAND_DIR env).")
     parser.add_argument("--series-dir", default="", help="Series folder path (e.g. workspace/drama-quy-khu-s01) where posters/ belong.")
     parser.add_argument("--slice-grid", default="", help="Optional path to 2x2 Master Brand Grid JPEG/PNG to slice into RGBA assets.")
     parser.add_argument("--build-badges", action="store_true", help="Build Top-Left Large Logo & Top-Right Vietsub Badges.")

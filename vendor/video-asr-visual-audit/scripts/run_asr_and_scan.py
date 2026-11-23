@@ -15,8 +15,15 @@ import numpy as np
 from scipy.ndimage import minimum_filter
 
 ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-sys.path.insert(0, ORCH_SCRIPTS)
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+for _p in (ORCH_SCRIPTS, AICN_SCRIPTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import require_gate
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 def find_hardsub_intervals(
@@ -141,7 +148,7 @@ def scan_hardsub_and_scenes(
         flush=True,
     )
     cmd = [
-        "ffmpeg", "-i", video_path,
+        ap.find_tool("ffmpeg") if ap else "ffmpeg", "-i", video_path,
         "-vf", f"fps={fps_scan},crop={width}:{strip_h}:0:{strip_y0}",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
     ]
@@ -315,7 +322,7 @@ def scan_hardsub_and_scenes(
 
 
 def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
-    cmd = ["ffmpeg", "-y", "-i", input_path]
+    cmd = [ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-i", input_path]
     if af_filter:
         cmd.extend(["-af", af_filter])
     cmd.extend(["-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1"])
@@ -354,15 +361,26 @@ class _MlxWhisper:
 
 
 def load_whisper(size):
-    """AICN_ASR=mlx (default when mlx_whisper imports) or AICN_ASR=faster."""
-    if os.environ.get("AICN_ASR", "mlx") == "mlx":
+    """Select Whisper backend via aicn_platform (mlx on Apple Silicon, CUDA faster-whisper on NVIDIA, CPU int8 fallback)."""
+    bk = ap.detect_asr_backend(sys.executable) if ap else {"engine": os.environ.get("AICN_ASR", "mlx")}
+    eng = bk["engine"]
+    if eng == "mlx":
         try:
             import mlx_whisper  # noqa: F401
             print(f"[ASR] engine=mlx-whisper ({size}) on Metal", flush=True)
             return _MlxWhisper(size)
         except ImportError:
-            print("[ASR] mlx_whisper missing -> faster-whisper CPU", flush=True)
+            print("[ASR] mlx_whisper missing -> falling back to faster-whisper", flush=True)
+            eng = "faster-cpu"
     from faster_whisper import WhisperModel
+    if eng == "faster-cuda":
+        for ctype in ("float16", "int8_float16"):
+            try:
+                print(f"[ASR] engine=faster-whisper ({size}) on CUDA ({ctype})", flush=True)
+                return WhisperModel(size, device="cuda", compute_type=ctype)
+            except Exception as exc:
+                print(f"[ASR] CUDA compute_type={ctype} failed ({exc}); trying fallback", flush=True)
+    print(f"[ASR] engine=faster-whisper ({size}) on CPU (int8)", flush=True)
     return WhisperModel(size, device="cpu", compute_type="int8")
 
 def resolve_source_language(workspace: str, cli_lang: str | None = None) -> str:

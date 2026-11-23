@@ -24,9 +24,17 @@ import sys
 import time
 import numpy as np
 
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+if AICN_SCRIPTS not in sys.path:
+    sys.path.insert(0, AICN_SCRIPTS)
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
+
 
 def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
-    cmd = ["ffmpeg", "-y", "-i", input_path]
+    cmd = [ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-i", input_path]
     if af_filter:
         cmd.extend(["-af", af_filter])
     cmd.extend(["-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1"])

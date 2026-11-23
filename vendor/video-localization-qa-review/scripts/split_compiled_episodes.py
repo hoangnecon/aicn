@@ -16,8 +16,15 @@ import sys
 import time
 
 ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-sys.path.insert(0, ORCH_SCRIPTS)
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+for _p in (ORCH_SCRIPTS, AICN_SCRIPTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import require_gate
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 def fmt_srt_time(seconds: float) -> str:
@@ -33,12 +40,13 @@ def fmt_srt_time(seconds: float) -> str:
 
 
 def slice_mp4_segment(src_mp4: str, dst_mp4: str, start_s: float, duration_s: float):
+    vcodec_args = ap.vendor_h264_encode_args("5200k") if ap else ["-c:v", "h264_videotoolbox", "-b:v", "5200k", "-pix_fmt", "yuv420p"]
     cmd = [
-        "ffmpeg", "-y", "-v", "error",
+        ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-v", "error",
         "-ss", f"{start_s:.3f}",
         "-i", src_mp4,
         "-t", f"{duration_s:.3f}",
-        "-c:v", "h264_videotoolbox", "-b:v", "5200k",
+        *vcodec_args,
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-sn", "-movflags", "+faststart",
         dst_mp4,

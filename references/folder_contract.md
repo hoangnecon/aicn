@@ -67,7 +67,7 @@ units/<batch>/
 ├── data/
 │   ├── 00_video_profile.json             # Width, height, fps, duration, localization_mode
 │   ├── 00_episodes_manifest.json         # Per-episode sha256 & timeline offsets
-│   ├── 01_asr_raw_segments.json          # Multi-pass MLX Whisper segments
+│   ├── 01_asr_raw_segments.json          # Multi-pass Whisper segments (MLX Metal / CUDA faster-whisper)
 │   ├── 01_waveform_voice_audit.json      # 50 ms acoustic voice mask & onset/coverage audit
 │   ├── 01_extracted_audit_manifest.json  # Stage 1 audit frames + sha256
 │   ├── 02_bilingual_script.json          # Translated clauses (`zh_text`, `sub_text`, `tts_text`, `speaker`)
@@ -78,7 +78,7 @@ units/<batch>/
 │   ├── subtitles_full.srt                # Batch Vietnamese SRT
 │   └── 04_qa_frames_manifest.json        # Stage 5 QA frames + sha256
 ├── media/
-│   ├── stems/{vocals,accomp}.wav         # Demucs MLX stems + stems.json (pruned by `clean`)
+│   ├── stems/{vocals,accomp}.wav         # Demucs stems (MLX / PyTorch CUDA) + stems.json (pruned by `clean`)
 │   ├── tts_segments/seg_NNNN.wav         # Per-clause 48 kHz dub clips
 │   ├── audio/{dub_voice,premaster}_48k.wav # Intermediate mixes (pruned by `clean`)
 │   ├── master_audio_48k.wav              # Final -14 LUFS 24-bit stereo master (hashed by Stage 3 gate)

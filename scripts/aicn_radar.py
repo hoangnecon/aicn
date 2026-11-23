@@ -19,12 +19,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import aicn_platform as ap  # noqa: E402
+
 SKILL_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SKILL_DIR.parents[1]
 HG_TOOL = SKILL_DIR / "scripts" / "hg_tool.cjs"
 DY_TOOL = SKILL_DIR / "scripts" / "dy_tool.py"
 DD_TOOL = SKILL_DIR / "scripts" / "dd_tool.py"
-DY_PY = PROJECT_ROOT / "tools" / ".venv-dy" / "bin" / "python"
+DY_PY = Path(ap.find_dy_python(PROJECT_ROOT))
+NODE_BIN = ap.find_tool("node")
 HONGGUO_REPO = PROJECT_ROOT / "tools" / "hongguo-drama"
 DOUYIN_REPO = PROJECT_ROOT / "tools" / "Douyin_TikTok_Download_API"
 DEFAULT_DB = PROJECT_ROOT / "data" / "drama_index.db"
@@ -229,7 +235,7 @@ const ids = JSON.parse(process.argv[1]);
 })();
 """
     res = subprocess.run(
-        ["node", "-e", js, json.dumps(series_ids)],
+        [NODE_BIN, "-e", js, json.dumps(series_ids)],
         cwd=str(HONGGUO_REPO),
         capture_output=True,
         text=True,
@@ -259,7 +265,7 @@ def sync_hongguo(conn: sqlite3.Connection, pages: int = 2, enrich_top: int = 15)
     ]
     for cat, fmt in charts:
         proc = subprocess.run(
-            ["node", str(HG_TOOL), "rank", "--category", cat, "--json"],
+            [NODE_BIN, str(HG_TOOL), "rank", "--category", cat, "--json"],
             capture_output=True,
             text=True,
             check=False,
@@ -292,7 +298,7 @@ def sync_hongguo(conn: sqlite3.Connection, pages: int = 2, enrich_top: int = 15)
 
     # 2. Fresh releases
     proc_new = subprocess.run(
-        ["node", str(HG_TOOL), "new", "--pages", str(pages), "--limit", str(pages * 30), "--json"],
+        [NODE_BIN, str(HG_TOOL), "new", "--pages", str(pages), "--limit", str(pages * 30), "--json"],
         capture_output=True,
         text=True,
         check=False,

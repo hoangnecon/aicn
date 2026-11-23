@@ -17,13 +17,20 @@ import subprocess
 import sys
 
 ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-sys.path.insert(0, ORCH_SCRIPTS)
+AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
+for _p in (ORCH_SCRIPTS, AICN_SCRIPTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import require_gate, write_gate_token, sha256_file
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 def probe_json(path: str) -> dict:
     cmd = [
-        "ffprobe", "-v", "error",
+        ap.find_tool("ffprobe") if ap else "ffprobe", "-v", "error",
         "-show_entries", "format=duration,size,bit_rate",
         "-show_entries", "stream=index,codec_name,codec_type,width,height,r_frame_rate,sample_rate,channels",
         "-of", "json", path

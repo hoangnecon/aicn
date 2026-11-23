@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.0 (2026-11-24)
+- **Windows 10/11 + NVIDIA CUDA Support & Cross-Platform Architecture (`scripts/aicn_platform.py`)**:
+  - Added stdlib-only `scripts/aicn_platform.py` centralizing OS/CPU/RAM/GPU detection (Apple Silicon Metal + NVIDIA CUDA), cross-platform file locking (`fcntl.flock` on POSIX, `msvcrt.locking` + `threading.Lock` on Windows), tool/Python discovery (`AICN_PY`, `~/.local/bin`, `/opt/homebrew/bin`, `imageio_ffmpeg` fallback), POSIX path normalization & concat escaping, video encoder backend selection (`videotoolbox` | `nvenc` | `cpu` with functional 1-frame NVENC check and no `-hwaccel cuda` before CPU overlay), and ASR/Demucs backend dispatch (`mlx` | `faster-cuda` | `faster-cpu`; `mlx` | `torch-cuda` | `torch-cpu`).
+  - Updated `scripts/aicn.py`, `scripts/aicn_audio.py`, `scripts/dd_tool.py`, `scripts/dy_tool.py`, `scripts/hg_tool.cjs`, `scripts/aicn_radar.py`, and all `vendor/` scripts (`run_asr_and_scan.py`, `extract_audit_frames.py`, `analyze_voice_waveform.py`, `init_workspace.py`, `cicd_gate.py`, `composite_and_verify.py`, `apply_channel_branding.py`, `render_vertical_9x16.py`, `split_compiled_episodes.py`, `verify_stage_5.py`, `assemble_master_audio.py`) to route hardware/tool/path/lock operations through `aicn_platform.py` while preserving 100% macOS Apple Silicon compatibility.
+  - Added `install.ps1` for Windows directory-junction linking into `%USERPROFILE%\.claude\skills` and `%USERPROFILE%\.gemini\config\skills` plus optional `-InstallTools` portable `ffmpeg`/`ffprobe`, `rubberband`, and `node` installation.
+  - Synced documentation (`README.md`, `SKILL.md`, `references/*`, `vendor/*/SKILL.md`).
+
 ## 2.0.0 (2026-11-24)
 - **Dub + Watermark + Translate Only (`v2.0.0`, `L-012`)**:
   - Removed all burned-in subtitle overlay, Style-B pill plate rendering, GaussianBlur hardsub masking, and default 5fps hardsub bbox scanning across `scripts/aicn.py` and `vendor/` (`init_workspace.py`, `run_asr_and_scan.py`, `analyze_voice_waveform.py`, `verify_stage_1.py`, `validate_bilingual_script.py`, `composite_and_verify.py`, `verify_stage_5.py`).

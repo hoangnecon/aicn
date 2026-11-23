@@ -30,81 +30,6 @@ def probe_video(video_path: str) -> dict:
     return json.loads(res.stdout)
 
 
-def calibrate_strip_y0(video_path: str, width: int, height: int, duration: float) -> tuple[int, int, bool]:
-    """Sample ~12 keyframes across the video to auto-calibrate the hardsub vertical band (strip_y0, strip_h)."""
-    is_portrait = height > width
-    default_y0 = int(round(height * (0.63 if is_portrait else 0.8148)))
-    default_h = int(round(height * 0.22)) if is_portrait else (height - default_y0)
-    if duration <= 1.0 or not os.path.exists(video_path):
-        return default_y0, default_h, False
-    try:
-        import numpy as np
-    except Exception:
-        return default_y0, default_h, False
-
-    band_y0 = int(round(height * 0.52)) if is_portrait else int(round(height * 0.72))
-    band_h = min(height - band_y0, int(round(height * (0.40 if is_portrait else 0.27))))
-    if band_h < 60:
-        return default_y0, default_h, False
-
-    sample_fps = max(0.02, min(1.0, 12.0 / max(1.0, duration)))
-    cmd = [
-        "ffmpeg", "-v", "error", "-i", video_path,
-        "-vf", f"fps={sample_fps:.5f},crop={width}:{band_h}:0:{band_y0}",
-        "-frames:v", "14", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=20)
-        buf = proc.stdout
-    except Exception:
-        return default_y0, default_h, False
-
-    frame_bytes = width * band_h * 3
-    n_frames = len(buf) // frame_bytes
-    if n_frames < 2:
-        return default_y0, default_h, False
-
-    x0 = int(round(width * 0.15))
-    x1 = int(round(width * 0.85))
-    y_spans = []
-    for k in range(n_frames):
-        arr = np.frombuffer(buf[k * frame_bytes:(k + 1) * frame_bytes], dtype=np.uint8).reshape((band_h, width, 3))
-        roi = arr[:, x0:x1, :]
-        luma = (0.299 * roi[:, :, 0] + 0.587 * roi[:, :, 1] + 0.114 * roi[:, :, 2]).astype(np.float32)
-        bright = luma >= 185.0
-        if not np.any(bright):
-            continue
-        # Require dark stroke neighbor in a 5x5 window (approximated via 2-px shifted min)
-        padded = np.pad(luma, 2, mode="edge")
-        dark_nbr = np.minimum(
-            np.minimum(padded[:-4, 2:-2], padded[4:, 2:-2]),
-            np.minimum(padded[2:-2, :-4], padded[2:-2, 4:]),
-        ) < 125.0
-        stroke = bright & dark_nbr
-        row_cnt = stroke.sum(axis=1)
-        active_rows = np.where(row_cnt >= max(8, int(round((x1 - x0) * 0.015))))[0]
-        if len(active_rows) >= 6:
-            # Find largest contiguous vertical cluster (subtitle line(s))
-            diffs = np.diff(active_rows)
-            splits = np.where(diffs > 12)[0]
-            groups = np.split(active_rows, splits + 1)
-            best = max(groups, key=len)
-            h_span = int(best[-1] - best[0] + 1)
-            if 10 <= h_span <= int(round(height * 0.12)):
-                y_spans.append((int(best[0]) + band_y0, int(best[-1]) + band_y0))
-
-    if len(y_spans) < 2:
-        return default_y0, default_h, False
-
-    y_min = int(np.median([s[0] for s in y_spans]))
-    y_max = int(np.median([s[1] for s in y_spans]))
-    pad_top = max(48, int(round(height * 0.03)))
-    pad_bot = max(60, int(round(height * 0.04)))
-    cal_y0 = max(0, y_min - pad_top)
-    cal_h = min(height - cal_y0, max(200, (y_max - cal_y0) + pad_bot))
-    return cal_y0, cal_h, True
-
-
 def parse_fps(fps_str: str) -> float:
     if not fps_str or fps_str == "0/0":
         return 0.0
@@ -333,7 +258,7 @@ def ingest_and_build_episodes_manifest(
     return master_dst, manifest
 
 
-def write_schema_templates(base: str, genre: str, localization_mode: str, overlay_style: str, slug: str, series_slug: str):
+def write_schema_templates(base: str, genre: str, localization_mode: str, slug: str, series_slug: str):
     schemas_dir = os.path.join(base, "config", "schemas")
     os.makedirs(schemas_dir, exist_ok=True)
 
@@ -390,7 +315,6 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, overla
                 "series_slug": series_slug or slug,
                 "genre": genre,
                 "localization_mode": localization_mode,
-                "overlay_style": overlay_style,
                 "characters": [
                     {
                         "speaker_id": "M1",
@@ -448,7 +372,6 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, overla
                 "series_slug": series_slug or slug,
                 "genre": genre,
                 "localization_mode": localization_mode,
-                "overlay_style": overlay_style,
                 "characters": [
                     {
                         "speaker_id": "NARRATOR",
@@ -471,7 +394,7 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, overla
             json.dump(bible_data, f, ensure_ascii=False, indent=2)
 
 
-def provision_series_hub(workspace_root: str, series_slug: str, genre: str, localization_mode: str, overlay_style: str, export_formats: list, unit_slug: str) -> str:
+def provision_series_hub(workspace_root: str, series_slug: str, genre: str, localization_mode: str, export_formats: list, unit_slug: str) -> str:
     """
     Creates or updates a multi-episode Series Hub at `workspace/<series_slug>/`
     with shared `config/series_bible.json`, `source_inbox/`, `units/`, and `deliverables/`.
@@ -495,7 +418,6 @@ def provision_series_hub(workspace_root: str, series_slug: str, genre: str, loca
         "series_slug": series_slug,
         "genre": genre,
         "localization_mode": localization_mode,
-        "overlay_style": overlay_style,
         "export_formats": export_formats,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -510,7 +432,6 @@ def provision_series_hub(workspace_root: str, series_slug: str, genre: str, loca
 - **Series Root:** `{hub_dir}`
 - **Genre:** `{genre}`
 - **Default Localization Mode:** `{localization_mode}`
-- **Default Overlay Style:** `{overlay_style}`
 - **Default Export Formats:** `{', '.join(export_formats)}`
 - **Shared Series Bible:** `config/series_bible.json`
 
@@ -546,12 +467,6 @@ def main():
         default="auto",
         choices=["auto", "voice_dub", "sub_only"],
         help="Localization audio/subtitle mode: 'voice_dub' (VieNeu-TTS + auto-ducked BGM) or 'sub_only' (preserve original native audio + full Vietnamese subtitles)."
-    )
-    parser.add_argument(
-        "--overlay-style",
-        default="auto",
-        choices=["auto", "frosted_glass", "solid_pill"],
-        help="Subtitle panel visual style: 'frosted_glass' (sleek compact translucent glass blur) or 'solid_pill' (opaque dark capsule)."
     )
     parser.add_argument(
         "--export-formats",
@@ -592,11 +507,6 @@ def main():
         localization_mode = existing_profile.get("localization_mode") or ("sub_only" if genre == "short-drama" else "voice_dub")
     else:
         localization_mode = args.mode
-
-    if args.overlay_style == "auto":
-        overlay_style = existing_profile.get("overlay_style") or ("frosted_glass" if genre == "short-drama" else "solid_pill")
-    else:
-        overlay_style = args.overlay_style
 
     if args.export_formats == "auto":
         export_formats = ["16x9"]
@@ -643,7 +553,6 @@ def main():
             series_slug=args.series_slug,
             genre=genre,
             localization_mode=localization_mode,
-            overlay_style=overlay_style,
             export_formats=export_formats,
             unit_slug=slug,
         )
@@ -674,7 +583,6 @@ def main():
     is_vfr = abs(r_fps - avg_fps) > 0.5
 
     aspect_mode = "landscape_16x9" if width >= height else "vertical_9x16"
-    strip_y0, strip_h, strip_calibrated = calibrate_strip_y0(master_source_path, width, height, duration)
 
     profile = {
         "schema_version": "2.0",
@@ -683,7 +591,6 @@ def main():
         "series_slug": args.series_slug or slug,
         "genre": genre,
         "localization_mode": localization_mode,
-        "overlay_style": overlay_style,
         "export_formats": export_formats,
         "total_episodes": episodes_manifest["total_episodes"],
         "source_video": master_source_path,
@@ -694,9 +601,6 @@ def main():
         "avg_fps": round(avg_fps, 3),
         "is_vfr": is_vfr,
         "aspect_mode": aspect_mode,
-        "strip_y0": strip_y0,
-        "strip_h": strip_h,
-        "strip_calibrated": strip_calibrated,
         "audio_codec": a_stream.get("codec_name"),
         "audio_sample_rate": int(a_stream.get("sample_rate", 48000)),
         "audio_channels": int(a_stream.get("channels", 2)),
@@ -717,7 +621,6 @@ def main():
         "series_hub_dir": series_hub_dir,
         "genre": genre,
         "localization_mode": localization_mode,
-        "overlay_style": overlay_style,
         "export_formats": export_formats,
         "split_episodes_on_export": False,
         "watermark": {
@@ -747,7 +650,6 @@ def main():
             "audit_manifest": "data/01_extracted_audit_manifest.json",
             "bilingual_script": "data/02_bilingual_script.json",
             "aligned_subtitles": "data/03_aligned_subtitles.json",
-            "overlay_geometry": "data/04_overlay_geometry_log.json",
             "qa_manifest": "data/04_qa_frames_manifest.json",
             "canonical_srt": "data/subtitles_full.srt",
             "posters_dir": "posters",
@@ -765,7 +667,6 @@ def main():
         base=base,
         genre=genre,
         localization_mode=localization_mode,
-        overlay_style=overlay_style,
         slug=slug,
         series_slug=args.series_slug or slug,
     )
@@ -837,14 +738,12 @@ def main():
 - **Project Topology:** `{topology}` (`total_episodes = {episodes_manifest['total_episodes']}`)
 - **Genre Profile:** `{genre}` (`{aspect_mode}`)
 - **Localization Mode:** `{localization_mode}` (`voice_dub` = VieNeu-TTS + BGM ducking | `sub_only` = Preserve native original audio + full Vietnamese subtitles)
-- **Subtitle Overlay Style:** `{overlay_style}` (`frosted_glass` = compact Gaussian glass blur with stroke suppression | `solid_pill` = opaque dark capsule)
 - **Target Export Formats:** `{', '.join(export_formats)}`
 - **Master Source Video:** `source/master_source.mp4` (`{master_source_path}`)
 - **Workspace Path:** `{base}`
 - **Duration:** `{duration:.2f}s` (`{format_timecode(duration)}`)
 - **Resolution:** `{width}x{height}` @ `{r_fps:.2f} fps` (avg `{avg_fps:.2f} fps`, VFR=`{is_vfr}`)
 - **Audio Track:** `{profile['audio_codec']}`, `{profile['audio_sample_rate']} Hz`, `{profile['audio_channels']} channels`
-- **Hardsub Scan Band:** `y=[{strip_y0}..{strip_y0 + strip_h}]` (strip height `{strip_h}px`)
 
 ## 1. Episode & Timeline Map (`data/00_episodes_manifest.json`)
 | Episode ID | Canonical Source File | Duration | Merged Timeline (s) | Timecode Range |
@@ -854,7 +753,7 @@ def main():
 ## 2. Canonical Storage Contract (`config/project_config.json`)
 - **Immutable Source Inputs:** `source/master_source.mp4`, `source/episodes/epXX.mp4`, `source/concat_list.txt`
 - **Config & Series Bible:** `config/project_config.json`, `config/series_bible.json`, `config/schemas/*.template.json`
-- **Single Source of Truth Data:** `data/00_video_profile.json`, `data/00_episodes_manifest.json`, `data/01_asr_raw_segments.json`, `data/01_zh_bbox_scan.json`, `data/01_waveform_voice_audit.json`, `data/02_bilingual_script.json`, `data/03_aligned_subtitles.json`, `data/04_overlay_geometry_log.json`, `data/subtitles_full.srt`
+- **Single Source of Truth Data:** `data/00_video_profile.json`, `data/00_episodes_manifest.json`, `data/01_asr_raw_segments.json`, `data/01_waveform_voice_audit.json`, `data/02_bilingual_script.json`, `data/03_aligned_subtitles.json`, `data/subtitles_full.srt`
 - **Final Release Deliverables Vault:**
   - Landscape `16:9`: `deliverables/16x9/final_{slug}_vi.mp4`
   - Vertical `9:16`: `deliverables/9x16/final_{slug}_vi_9x16.mp4`
@@ -866,7 +765,7 @@ def main():
 - [ ] **Stage 1:** ASR, 5fps BBox Scan, Waveform Onset & Visual Audit (`01_visual_audit_notes.md`, `.cicd/stage_1_gate.json`)
 - [ ] **Stage 2:** Bilingual Dual-Layer Script & Series Bible Compliance (`02_glossary_and_pronunciation.md`, `.cicd/stage_2_gate.json`)
 - [ ] **Stage 3:** 48kHz Audio Master (`sub_only` native stereo or `voice_dub` VieNeu-TTS) (`03_pacing_and_audio_report.md`, `.cicd/stage_3_gate.json`)
-- [ ] **Stage 4:** Dynamic Frosted-Glass / Pill Alpha Subtitle Overlay (`media/subtitles_overlay_alpha.mov`, `.cicd/stage_4_gate.json`)
+- [ ] **Stage 4:** Dub + Watermark Render (`media/.staging_render.mp4`, `.cicd/stage_4_gate.json`)
 - [ ] **Stage 5:** Final Composite, CV QA Audit & Deliverables Publishing (`04_qa_review_report.md`, `.cicd/stage_5_gate.json`)
 """
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -1008,7 +907,7 @@ def main():
                 "config/schemas/02_bilingual_cue.template.json",
                 "config/schemas/03_aligned_cue.template.json",
             ]),
-            "detail": f"mode={localization_mode}, style={overlay_style}, exports={export_formats}"
+            "detail": f"mode={localization_mode}, exports={export_formats}"
         },
         {
             "id": "workspace_tree_and_deliverables_vault_ready",
@@ -1032,10 +931,10 @@ def main():
         },
         {
             "id": "video_profile_json_saved",
-            "description": "data/00_video_profile.json written with aspect ratio & scan coordinates",
+            "description": "data/00_video_profile.json written with aspect ratio & stream metadata",
             "weight": 15,
             "passed": os.path.exists(profile_path),
-            "detail": f"aspect={aspect_mode}, strip_y0={strip_y0}, strip_h={strip_h}"
+            "detail": f"aspect={aspect_mode}, {width}x{height}@{r_fps:.2f}fps"
         }
     ]
 

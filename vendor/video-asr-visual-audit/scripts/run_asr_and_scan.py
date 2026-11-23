@@ -552,12 +552,13 @@ def run_multipass_whisper_asr(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Stage 1 Multi-Pass ASR and Stroke-Validated hardsub bounding-box scan.")
+    parser = argparse.ArgumentParser(description="Run Stage 1 Multi-Pass Whisper ASR and Acoustic Waveform Audit.")
     parser.add_argument("--video", required=True, help="Source video path.")
     parser.add_argument("--workspace", required=True, help="Workspace directory path (workspace/<slug>).")
-    parser.add_argument("--color-mode", default="white", choices=["white", "yellow", "auto"], help="Hardsub color detection mode.")
+    parser.add_argument("--color-mode", default="white", choices=["white", "yellow", "auto"], help="Optional bbox scan color mode (only used with --with-bbox-scan).")
     parser.add_argument("--source-lang", default=None, help="Source language code for Whisper (e.g. zh, en, auto). Defaults to project_config/series_bible or 'zh'.")
-    parser.add_argument("--skip-scan", action="store_true", help="Skip 5fps bbox scan if 01_zh_bbox_scan.json already exists.")
+    parser.add_argument("--with-bbox-scan", action="store_true", help="Opt-in to legacy 5fps pixel bbox scan (disabled by default in v2.0.0 dub+watermark pipeline).")
+    parser.add_argument("--skip-scan", action="store_true", help="Deprecated no-op (bbox scan is already skipped by default).")
     parser.add_argument("--skip-asr", action="store_true", help="Skip Whisper ASR if 01_asr_raw_segments.json already exists.")
     args = parser.parse_args()
 
@@ -571,7 +572,7 @@ def main():
     bbox_json = os.path.join(data_dir, "01_zh_bbox_scan.json")
     asr_json = os.path.join(data_dir, "01_asr_raw_segments.json")
 
-    if not (args.skip_scan and os.path.exists(bbox_json)):
+    if args.with_bbox_scan and not (args.skip_scan and os.path.exists(bbox_json)):
         scan_hardsub_and_scenes(
             video_path=args.video,
             out_json=bbox_json,
@@ -582,22 +583,10 @@ def main():
             color_mode=args.color_mode,
             height=int(profile.get("height", 1080)),
         )
+    elif os.path.exists(bbox_json):
+        print(f"[SKIP] Using existing bbox scan: {bbox_json}", flush=True)
     else:
-        print(f"[SKIP] BBox scan already exists: {bbox_json}", flush=True)
-        with open(bbox_json, "r", encoding="utf-8") as f:
-            bdata = json.load(f)
-        ivs = find_hardsub_intervals(
-            bdata.get("spans", []),
-            int(bdata.get("fps_scan", 5)),
-            clause_changes=bdata.get("clause_changes"),
-            width=int(bdata.get("width", profile.get("width", 1920))),
-            strip_h=int(bdata.get("strip_h", profile.get("strip_h", 200))),
-            height=int(bdata.get("height", profile.get("height", 1080))),
-        )
-        bdata["hardsub_intervals_count"] = len(ivs)
-        bdata["hardsub_intervals"] = ivs
-        with open(bbox_json, "w", encoding="utf-8") as f:
-            json.dump(bdata, f)
+        print("[SKIP] 5fps hardsub bbox scan skipped (v2.0.0 dub+watermark pipeline uses Whisper ASR + acoustic waveform).", flush=True)
 
     if not (args.skip_asr and os.path.exists(asr_json)):
         stems_voc = os.path.join(args.workspace, "media", "stems", "vocals.wav")

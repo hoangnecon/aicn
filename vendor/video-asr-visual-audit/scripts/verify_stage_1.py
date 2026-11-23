@@ -2,11 +2,10 @@
 """
 Stage 1 CI/CD Gate Validator (verify_stage_1.py).
 Verifies:
-  1. Audio stem readiness (Demucs no_vocals.wav in voice_dub mode, or source audio in sub_only mode) (15 pts)
-  2. Fine-grained Whisper ASR clauses (median duration <= 2.8s, 0 unresolved [GAP_VISUAL_SUB] placeholders) (25 pts)
-  3. 5fps hardsub bounding-box scan coverage >= 97% of video duration (15 pts)
-  4. Hardsub-to-ASR gap coverage >= 95% (ensuring phone calls, whispers, PA broadcasts & screams are captured) (20 pts)
-  5. Visual keyframe audit completion (>= 10 frames extracted, SHA-256 verified, and logged in 01_visual_audit_notes.md) (25 pts)
+  1. Audio stem readiness (Demucs no_vocals.wav / accomp.wav in voice_dub mode, or source audio in sub_only mode) (20 pts)
+  2. Fine-grained Whisper ASR clauses (median duration <= 2.8s, 0 unresolved [GAP_VISUAL_SUB] placeholders) (30 pts)
+  3. Acoustic waveform voice coverage >= 90% with 0 bloated / 0 premature lead-in segments (25 pts)
+  4. Visual keyframe audit completion (>= 10 frames extracted, SHA-256 verified, and logged in 01_visual_audit_notes.md) (25 pts)
 Writes workspace/<slug>/.cicd/stage_1_gate.json only on 100/100 PASS.
 """
 import argparse
@@ -51,7 +50,7 @@ def main():
     checks.append({
         "id": "audio_stem_or_native_source_ready",
         "description": "Separated BGM stem (voice_dub) or native stereo source audio (sub_only) is ready",
-        "weight": 15,
+        "weight": 20,
         "passed": has_bgm,
         "detail": bgm_detail
     })
@@ -84,79 +83,44 @@ def main():
     checks.append({
         "id": "asr_fine_grained_clauses_and_no_placeholders",
         "description": "ASR segments are fine-grained clauses (median <= 2.8s) with 0 unresolved [GAP_VISUAL_SUB] placeholders",
-        "weight": 25,
+        "weight": 30,
         "passed": asr_ok,
         "detail": asr_detail
     })
 
-    # 3. Check 5fps hardsub bounding-box scan & 4. Check Hardsub-to-ASR Gap Coverage (Phone/Whisper/PA completeness)
-    bbox_path = os.path.join(ws, "data", "01_zh_bbox_scan.json")
-    bbox_ok = False
-    bbox_detail = "Missing data/01_zh_bbox_scan.json"
-    gap_cov_ok = False
-    gap_cov_detail = "Missing data/01_zh_bbox_scan.json"
-
-    if os.path.exists(bbox_path):
-        with open(bbox_path, "r", encoding="utf-8") as f:
-            bdata = json.load(f)
-        spans = bdata.get("spans", [])
-        fps_scan = int(bdata.get("fps_scan", 5))
-        scanned_dur = len(spans) / max(1, fps_scan)
-        non_empty = sum(1 for sp in spans if sp is not None)
-        metrics["bbox_scanned_frames"] = len(spans)
-        metrics["bbox_active_frames"] = non_empty
-        bbox_ok = scanned_dur >= vid_dur * 0.97 and len(spans) > 50
-        bbox_detail = f"scanned={scanned_dur:.1f}s/{vid_dur:.1f}s ({len(spans)} frames @ {fps_scan}fps), active_sub_frames={non_empty}"
-
-        # Hardsub-to-ASR gap coverage & Acoustic Waveform Audit check
+    # 3. Acoustic Waveform Voice Coverage (no hardsub bbox scan required in v2.0.0)
+    ac_ok = False
+    ac_detail = "Missing data/01_asr_raw_segments.json"
+    if os.path.exists(asr_path):
         from analyze_voice_waveform import analyze_waveform_and_clauses
         wf_report = analyze_waveform_and_clauses(ws, asr_path)
-        sc_total = wf_report["total_visual_sub_clauses"]
-        sc_cov = wf_report["covered_visual_sub_clauses"]
-        cov_ratio = wf_report["sub_clause_coverage_ratio"]
         bloated_cnt = wf_report["bloated_segments_count"]
         premature_cnt = wf_report.get("premature_lead_segments_count", 0)
-        internal_gap_cnt = wf_report.get("internal_blank_gap_segments_count", 0)
         ac_bursts = wf_report["acoustic_voice_bursts_count"]
         ac_ratio = wf_report["acoustic_speech_coverage_ratio"]
-        missed_ivs = [f"{u['start']:.1f}s-{u['end']:.1f}s" for u in wf_report.get("uncovered_sub_clauses", [])]
 
-        metrics["hardsub_intervals_total"] = sc_total
-        metrics["hardsub_intervals_covered"] = sc_cov
-        metrics["hardsub_coverage_ratio"] = cov_ratio
         metrics["bloated_segments_count"] = bloated_cnt
         metrics["premature_lead_segments_count"] = premature_cnt
-        metrics["internal_blank_gap_segments_count"] = internal_gap_cnt
         metrics["acoustic_voice_bursts_count"] = ac_bursts
         metrics["acoustic_speech_coverage_ratio"] = ac_ratio
 
-        gap_cov_ok = (
-            (cov_ratio >= 0.96)
+        ac_ok = (
+            (ac_ratio >= 0.90)
             and (bloated_cnt == 0)
             and (premature_cnt == 0)
-            and (internal_gap_cnt == 0)
             and (len(unresolved_gaps) == 0)
         )
-        gap_cov_detail = (
-            f"sub_clauses={sc_cov}/{sc_total} ({cov_ratio*100:.1f}%, need >=96.0%), "
-            f"bloated={bloated_cnt} (need 0), premature_lead={premature_cnt} (need 0), "
-            f"internal_blank_gaps={internal_gap_cnt} (need 0), uncovered={missed_ivs[:5]}"
+        ac_detail = (
+            f"acoustic_cov={ac_ratio*100:.1f}% (need >=90.0%), bursts={ac_bursts}, "
+            f"bloated={bloated_cnt} (need 0), premature_lead={premature_cnt} (need 0)"
         )
 
     checks.append({
-        "id": "hardsub_bbox_scan_complete",
-        "description": "5fps bottom-strip pixel scan covers >= 97% of source video duration",
-        "weight": 15,
-        "passed": bbox_ok,
-        "detail": bbox_detail
-    })
-
-    checks.append({
-        "id": "hardsub_gap_coverage_phone_whisper_complete",
-        "description": ">= 95% of visual hardsub intervals (including telephone calls, radio comms, PA & whispers) are covered by ASR/OCR segments",
-        "weight": 20,
-        "passed": gap_cov_ok,
-        "detail": gap_cov_detail
+        "id": "acoustic_waveform_voice_coverage",
+        "description": ">= 90% of acoustic voice bursts are covered by ASR segments with 0 bloated or premature lead-in segments",
+        "weight": 25,
+        "passed": ac_ok,
+        "detail": ac_detail
     })
 
     # 5. Check visual audit frames manifest & 01_visual_audit_notes.md cross-check
@@ -201,13 +165,12 @@ def main():
     write_gate_token(
         workspace=ws,
         stage=1,
-        stage_name="Multi-Pass ASR, Phone/Whisper Gap Recovery & Visual Keyframe Audit",
+        stage_name="Multi-Pass Whisper ASR, Acoustic Waveform Audit & Visual Keyframe Audit",
         checks=checks,
         metrics=metrics,
         artifact_paths=[
             "01_visual_audit_notes.md",
             "data/01_asr_raw_segments.json",
-            "data/01_zh_bbox_scan.json",
             "data/01_extracted_audit_manifest.json",
         ],
     )

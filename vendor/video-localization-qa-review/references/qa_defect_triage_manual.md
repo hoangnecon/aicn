@@ -20,7 +20,7 @@ Randomly picking 3 frames misses 90% of layout bugs. `composite_and_verify.py` e
 | Risk Stratum | How Timestamps Are Selected | What Defect It Catches |
 | :--- | :--- | :--- |
 | **1. Widest Original Hardsubs** | Top widest `[zh_x0..zh_x1]` frames from `01_zh_bbox_scan.json` | Left/right Chinese character edges peeking outside the dark pill. |
-| **2. Tallest / 2-Line Vietnamese Cues** | Longest 2-line `sub_text` cues from `04_overlay_geometry_log.json` | Vietnamese stacked diacritics (`ắ, ể, ợ`) clipping at top/bottom of pill, or 3-line overflow. |
+| **2. Stratified Visual Checkpoints** | Uniformly spaced frames across `frames/qa/` | Dual-corner watermark placement, aspect ratio, and visual sanity across scenes. |
 | **3. Visual Diagram & UI Pointer Scenes** | Keyframes with on-screen tags (`<|user|>`, `<|assistant|>`, `<|end|>`, charts, code) | Audio-visual desynchronization where the subtitle talks about item A while the screen highlights item B. |
 | **4. Speech-to-Pause Transitions** | Silent gap frames (e.g., `t=745s` outro/transition) | Phantom pill boxes stuck on screen when no one is speaking. |
 | **5. Timeline Boundary Checkpoints** | Early (`~15–40s`), Mid (`~300–350s`), Late (`~650–740s`) | Cumulative audio/video drift (`is_vfr` or sample-rate mismatch) toward the end of the video. |

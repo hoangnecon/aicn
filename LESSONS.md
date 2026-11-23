@@ -87,3 +87,12 @@ Structured log of verified production failures, user corrections, and API change
   2. `run_asr_and_scan.py` & `aicn.py`: fixed portrait detection to `height > width` (supporting both `720×1280` and `1080×1920`).
   3. `aicn.py`: added `av_sync_and_frame_integrity` gate in `verify-overlay`, stream-spec + A/V sync verification in `merge-series`, `--units` streaming + overlapped `prep` + cross-process `fcntl.flock` (`gpu/cpu/media`) in `run-series`, and hub-shared `.cache/tts_sent` in `aicn_audio.py`.
   4. Added regression tests in `tests/test_aicn.py` (50/50 tests passing).
+
+## L-012 (2026-11-24) — `v2.0.0` Pipeline Simplification (Dub + Watermark + Translate Only) & ShortMax Relay HLS Fix
+- **Symptom:**
+  1. Style-B subtitle overlay + 5fps hardsub bbox scanning + GaussianBlur masking added heavy per-frame CPU/GPU cost and brittle bbox/geometry failure modes even when full Vietnamese dubbing (`voice_dub`) + external `.srt` already carried the translation.
+  2. `scripts/dd_tool.py` failed on DramaDunyam ShortMax relay HLS streams returning relative `/vr/dr/hls/.../main.m3u8?auth_key=...` URLs because `play_info` lacked the per-series `Referer: https://dramadunyam.com/en/series/<slug>` header, relative URLs were not prefixed with `BASE_URL`, and `ffmpeg -headers` omitted the `dd_bilet` `Cookie` header.
+- **Guardrail Implemented (`v2.0.0`):**
+  1. Removed all burned-in subtitle overlay, Style-B plate rendering, GaussianBlur hardsub masking, and default 5fps hardsub bbox scanning across `scripts/aicn.py` and `vendor/` (`init_workspace.py`, `run_asr_and_scan.py`, `analyze_voice_waveform.py`, `verify_stage_1.py`, `validate_bilingual_script.py`, `composite_and_verify.py`, `verify_stage_5.py`). `cmd_render` now cleanly muxes `source/master_source.mp4` + `media/master_audio_48k.wav` + optional dual-corner watermarks (`--brand-dir`), or stream-copies video (`-c:v copy`) when no watermark is set.
+  2. Updated `scripts/dd_tool.py` (`play_info`, `download_stream`, `cmd_download`) to send per-series `Referer`, prefix relative `/...` URLs with `BASE_URL`, and pass `Cookie: <jar cookies>` in `ffmpeg -headers`.
+  3. Added regression tests in `tests/test_hg_tool.py` and updated `tests/test_aicn.py` for `v2.0.0`.

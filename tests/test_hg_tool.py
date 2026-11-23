@@ -212,6 +212,98 @@ class TestHgToolAndRsi(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
         self.assertEqual(res["url"], "https://cdn.example/ep47.mp4")
 
+    def test_dd_tool_shortmax_relay_hls_referer_cookie_and_prefix(self):
+        import http.cookiejar
+        import json
+        from unittest.mock import patch
+        import dd_tool
+
+        client = dd_tool.DramaDunyamClient()
+        client._initialized = True
+        client.cookies.set_cookie(
+            http.cookiejar.Cookie(
+                version=0,
+                name="dd_bilet",
+                value="guest_tok_123",
+                port=None,
+                port_specified=False,
+                domain="dramadunyam.com",
+                domain_specified=False,
+                domain_initial_dot=False,
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={},
+            )
+        )
+
+        seen_reqs = []
+
+        class _Resp:
+            def __init__(self, body: bytes):
+                self._body = body
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_open(req, timeout=20.0):
+            seen_reqs.append(req)
+            return _Resp(
+                json.dumps(
+                    {"delivery": "hls", "url": "/vr/dr/hls/123/main.m3u8?auth_key=xyz"}
+                ).encode()
+            )
+
+        with patch.object(client.opener, "open", side_effect=fake_open):
+            play = client.play_info("123", 1, slug="my-test-series")
+
+        self.assertEqual(len(seen_reqs), 1)
+        self.assertEqual(
+            seen_reqs[0].get_header("Referer"),
+            "https://dramadunyam.com/en/series/my-test-series",
+        )
+
+        ffmpeg_cmds = []
+
+        class _Proc:
+            returncode = 0
+            stderr = ""
+
+        def fake_run(cmd, capture_output=True, text=True, check=False):
+            ffmpeg_cmds.append(cmd)
+            Path(cmd[-1]).write_bytes(b"fake-mp4")
+            return _Proc()
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "ep01.mp4"
+            with (
+                patch("subprocess.run", side_effect=fake_run),
+                patch.object(
+                    dd_tool,
+                    "ffprobe_summary",
+                    return_value={"duration_sec": 60.0, "width": 720, "height": 1280, "size_mb": 5.0},
+                ),
+            ):
+                client.download_stream(play["url"], dest, delivery="hls", slug="my-test-series")
+
+        self.assertEqual(len(ffmpeg_cmds), 1)
+        cmd = ffmpeg_cmds[0]
+        self.assertIn("https://dramadunyam.com/vr/dr/hls/123/main.m3u8?auth_key=xyz", cmd)
+        hdr_idx = cmd.index("-headers") + 1
+        headers_val = cmd[hdr_idx]
+        self.assertIn("Referer: https://dramadunyam.com/en/series/my-test-series", headers_val)
+        self.assertIn("Cookie: dd_bilet=guest_tok_123", headers_val)
+
 
 if __name__ == "__main__":
     unittest.main()

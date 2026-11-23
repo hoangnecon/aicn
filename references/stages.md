@@ -21,17 +21,17 @@ $A init-series --series-slug <series> --title "<title>" --total-episodes <N> --r
 # put the downloaded episodes in workspace/<series>/source_inbox/<batch>/
 $PY $V/video-localization-orchestrator/scripts/init_workspace.py --topology series_episodic \
     --series-slug <series> --unit-slug <unit> --episodes-dir workspace/<series>/source_inbox/<batch> --genre short-drama
-$A adopt --unit $U                       # CHECKLIST, CHANGELOG, overlay_style.json, .cache/
+$A adopt --unit $U                       # CHECKLIST, CHANGELOG, .cache/
 ```
 
 Check: `data/00_episodes_manifest.json` lists each episode with sha256 and timeline offsets.
 
-## Stage 1: Stems + ASR + hardsub scan + audit (once per source)
+## Stage 1: Stems + ASR + acoustic waveform audit (once per source)
 
 ```bash
 # Separate stems first so Stage 1 ASR gets clean vocals AND Stage 3 stems are already cached
 $PY $SK/scripts/aicn_audio.py separate --unit $U
-$PY $V/video-asr-visual-audit/scripts/run_asr_and_scan.py --video $U/source/master_source.mp4 --workspace $U --color-mode auto
+$PY $V/video-asr-visual-audit/scripts/run_asr_and_scan.py --video $U/source/master_source.mp4 --workspace $U
 $PY $V/video-asr-visual-audit/scripts/analyze_voice_waveform.py --workspace $U --snap-and-split
 $PY $V/video-asr-visual-audit/scripts/extract_audit_frames.py --video $U/source/master_source.mp4 --workspace $U
 # view the audit frames and record findings in 01_visual_audit_notes.md
@@ -44,8 +44,8 @@ $A run-series --hub workspace/<series> --phase prep
 ```
 
 Outputs: `media/stems/{vocals,accomp}.wav`, `01_asr_raw_segments.json` (MLX Whisper on Metal,
-`word_timestamps=False` for 3.3× speedup; `AICN_ASR=faster` forces CPU) and
-`01_zh_bbox_scan.json` (fast 5 fps scan). These are frozen; `$A plan` reports when the source hash changes.
+`word_timestamps=False` for 3.3× speedup; `AICN_ASR=faster` forces CPU), and
+`01_waveform_voice_audit.json`. These are frozen; `$A plan` reports when the source hash changes.
 
 ## Stage 2: bilingual script
 
@@ -72,32 +72,30 @@ Details and tuning: `references/audio_mix.md`.
 
 Requirements: `rubberband` (`brew install rubberband`) and `uvx` (for `demucs-mlx`).
 
-## Stage 4: style-B overlay
+## Stage 4: dub + watermark render (v2.0.0)
 
 ```bash
-$A plan --unit $U [--codec h264|hevc|h264_high] [--quality N] [--mask blur|solid] [--brand-dir <dir>]
-$A render --unit $U [--codec h264|hevc|h264_high] [--quality N] [--mask blur|solid] [--brand-dir <dir>]
-$A verify-overlay --unit $U  # Stage 4 gate
+$A plan --unit $U [--codec h264|hevc|h264_high] [--quality N] [--brand-dir <dir>]
+$A render --unit $U [--codec h264|hevc|h264_high] [--quality N] [--brand-dir <dir>]
+$A verify-render --unit $U  # Stage 4 gate (alias: verify-overlay)
 ```
 
 - `--codec h264` (default): `h264_videotoolbox -q:v 58` (≈ 1.86 GB / 100 min, broad compatibility).
 - `--codec hevc`: `hevc_videotoolbox -q:v 60 -tag:v hvc1` (≈ 1.35 GB / 100 min, fastest & smallest).
 - `--codec h264_high`: legacy `5000k` ABR (≈ 3.65 GB / 100 min).
-- `--brand-dir <dir>` (or `config/project_config.json["watermark"]`): composites dual-corner PNGs (`13_top_left_logo_large.png`, `15_top_right_vietsub_floating.png`) inside the same single FFmpeg pass.
+- `--brand-dir <dir>` (or `config/project_config.json["watermark"]`): composites dual-corner PNGs (`13_top_left_logo_large.png`, `15_top_right_vietsub_floating.png`) inside a single FFmpeg pass. When no watermark is configured, `render` stream-copies video (`-c:v copy -sn`).
 
 ## Stage 5: QA and release
 
 ```bash
-TS=$(python3 -c "import json;g=json.load(open('$U/data/04_overlay_geometry_log.json'));print(','.join(str(round((c['slot_start']+c['slot_end'])/2,2)) for c in g['cues'][::12]))")
 $PY $V/video-localization-qa-review/scripts/composite_and_verify.py --video $U/source/master_source.mp4 \
-    --workspace $U --slug <unit> --import-existing-mp4 $U/media/.staging_render.mp4 --qa-timestamps "$TS"
+    --workspace $U --slug <unit> --import-existing-mp4 $U/media/.staging_render.mp4
 # open every frame in data/04_qa_frames_manifest.json; append one PASS/FAIL row each to 04_qa_review_report.md
 $PY $V/video-localization-qa-review/scripts/verify_stage_5.py --workspace $U
 $A log --unit $U --kind release --message "Stage 5 PASS -> media/final_<unit>_vi.mp4"
 ```
 
-This takes every 12th cue midpoint (about 15 frames per unit). After an edit, append the
-midpoints of the edited cues to `TS`.
+This extracts 12 stratified QA frames across the batch for watermark/visual sanity inspection.
 
 ## Stage 6: Full-Series Pipeline & Release (mandatory — 1 published video = 1 FULL series)
 

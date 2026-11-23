@@ -19,7 +19,7 @@ Stage 5 (final release gate) of the video localization pipeline. Enforces a **St
 Prevents premature completion claims. `composite_and_verify.py` deletes any stale `media/final_<slug>_vi.mp4` before encoding and writes exclusively to `media/.staging_final.mp4`. Only `verify_stage_5.py` promotes the staging file to `media/final_<slug>_vi.mp4` upon scoring `100/100`.
 
 ### Sub-Skill 6.2: Stream Sanitization & Zero-Duplicate-Subtitle Enforcement (`-sn`)
-**STRICT PROHIBITION:** Never embed a soft-subtitle stream (`mov_text` or `ass`) inside the final MP4. Passing `-sn` guarantees media players never render a second subtitle layer over the burned-in dark pill. Encodes video with `h264_videotoolbox -b:v 4800k -pix_fmt yuv420p` and audio with `aac -b:a 192k -ar 48000 -movflags +faststart`.
+**STRICT PROHIBITION:** Never embed a soft-subtitle stream (`mov_text` or `ass`) inside the final MP4. Passing `-sn` guarantees clean video + audio streams (with optional dual-corner watermarks). Encodes video with `h264_videotoolbox` (or stream-copy when no watermark is set) and audio with `aac -b:a 192k -ar 48000 -movflags +faststart`.
 
 ### Sub-Skill 6.3: Flushed Real-Time Encoding Telemetry
 Parses `ffmpeg -progress pipe:1` and prints flushed progress every 10 seconds (`Encoded Xs / Ys (Z%) | speed=... | elapsed=...`).

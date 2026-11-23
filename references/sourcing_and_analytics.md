@@ -72,7 +72,7 @@ Pure-Python stdlib client modeled on MIT `umairjihan/dramadunyam-stremio` patter
 - **Browse AI dramas (`ai-short-dramas`) or popular:** `python3 <skill>/scripts/dd_tool.py list --tag ai-short-dramas --lang en`
 - **Search / Detail:** `python3 <skill>/scripts/dd_tool.py search "<title>"` / `dd_tool.py detail <slug>`
 - **Download direct 720p MP4s + `.jpg` cover:** `python3 <skill>/scripts/dd_tool.py download <slug> --episodes all --out <inbox_raw_dir> --cover-out <posters/cover.jpg>`
-- *Note:* When creating a series hub from an English source, pass `--source-lang en` to `aicn.py init-series` so Stage 1 Whisper transcribes English cleanly and portrait `720x1280` Style-B subtitles/watermarks auto-scale.
+- *Note:* When creating a series hub from an English source, pass `--source-lang en` to `aicn.py init-series` so Stage 1 Whisper transcribes English cleanly and portrait `720x1280` watermarks auto-scale.
 
 #### Unified Analytics & Search Index — `scripts/aicn_radar.py`
 Stores Hongguo (`new` + `rank` + `first_visible_time` + `likes/favorites`), Douyin (`detail` + 2-hop `related_posts` BFS + `hot`), Bilibili (`yt-dlp bilisearch --user-agent`), and DramaDunyam English (`sync-dramadunyam`) into `data/drama_index.db` (SQLite + FTS5) scored by recency-weighted engagement velocity (`heat_score`):

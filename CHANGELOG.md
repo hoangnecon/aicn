@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.0.0 (2026-11-24)
+- **Dub + Watermark + Translate Only (`v2.0.0`, `L-012`)**:
+  - Removed all burned-in subtitle overlay, Style-B pill plate rendering, GaussianBlur hardsub masking, and default 5fps hardsub bbox scanning across `scripts/aicn.py` and `vendor/` (`init_workspace.py`, `run_asr_and_scan.py`, `analyze_voice_waveform.py`, `verify_stage_1.py`, `validate_bilingual_script.py`, `composite_and_verify.py`, `verify_stage_5.py`).
+  - `aicn.py render` now cleanly muxes `source/master_source.mp4` + `media/master_audio_48k.wav` + optional dual-corner watermarks (`--brand-dir`, scaled cleanly for portrait/landscape) via hardware `h264_videotoolbox` / `hevc_videotoolbox`, or stream-copies video (`-c:v copy -sn`) when no watermark is set.
+  - `aicn.py verify-render` (with backward-compatible alias `verify-overlay`) checks staging MP4 existence, codec/audio compliance (`h264`/`hevc`, `aac 48kHz stereo`, `0` subtitle streams), and `av_sync_and_frame_integrity`.
+- **ShortMax Relay HLS Fix (`scripts/dd_tool.py`, `tests/test_hg_tool.py`)**:
+  - `play_info(series_id, ep, slug=...)` and `cmd_download` send per-series `Referer: https://dramadunyam.com/en/series/<slug>`.
+  - Relative `/...` stream URLs (e.g. `/vr/dr/hls/.../main.m3u8?auth_key=...`) are prefixed with `BASE_URL`.
+  - `download_stream` includes `Cookie: <jar cookies>` and per-series `Referer` in `ffmpeg -headers` for HLS relay downloads.
+- **Docs & Tests**: Updated `SKILL.md`, `references/*`, `templates/*`, `LESSONS.md`, `tests/test_aicn.py`, and `tests/test_hg_tool.py`.
+
 ## 1.6.0 (2026-11-21)
 - **Full-Series RSI Audit & ~45m Streaming Pipeline Optimization (`L-011`)**:
   - **Audio/Scene Sync & Frame Integrity (`init_workspace.py`, `aicn.py`)**: Added `r_fps`/`avg_fps` to `init_workspace.py` `specs` with mode-fps + `setpts=PTS-STARTPTS`/`-avoid_negative_ts make_zero` normalization; added `av_sync_and_frame_integrity` hard gate in `aicn.py verify-overlay` and uniform stream-spec + post-concat A/V sync checks in `merge-series`.

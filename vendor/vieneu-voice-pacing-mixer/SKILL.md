@@ -75,4 +75,4 @@ Enforces 4 weighted deterministic checks (`100/100` required to sign `.cicd/stag
 /Users/Shared/Tools/VieNeu-TTS/.venv/bin/python .agents/skills/vieneu-voice-pacing-mixer/scripts/verify_stage_3.py \
   --workspace "workspace/bilibili-anthropic-distill"
 ```
-Do NOT proceed to `dynamic-subtitle-overlay` until `.cicd/stage_3_gate.json` reports `Status: PASS | Score: 100.0/100`.
+Do NOT proceed to Stage 4 render until `.cicd/stage_3_gate.json` reports `Status: PASS | Score: 100.0/100`.

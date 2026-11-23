@@ -22,8 +22,8 @@ workspace/<series-slug>/
 ├── 00_series_manifest.md                 # Episode-to-batch registry (created by init_workspace.py)
 ├── config/
 │   ├── rights.json                       # License basis & proof (required != "unknown")
-│   ├── series_bible.json                 # Shared character roster, pronoun matrix (xưng hô), glossary, voices, overlay_style
-│   └── series_config.json                # Default genre, mode (voice_dub), overlay_style, export_formats
+│   ├── series_bible.json                 # Shared character roster, pronoun matrix (xưng hô), glossary, voices
+│   └── series_config.json                # Default genre, mode (voice_dub), export_formats
 ├── source_inbox/
 │   ├── raw/                              # Raw downloads (ep01.mp4..epNN.mp4), immutable
 │   └── batch_01_ep01_10/ .. batch_08_*/  # 10-ep hardlinked input batches (ep01.mp4..ep10.mp4)
@@ -57,7 +57,6 @@ units/<batch>/
 ├── 04_qa_review_report.md                # Stage 5: mandatory visual inspection table (1 PASS/FAIL row per QA frame)
 ├── config/
 │   ├── project_config.json               # Batch settings, series_hub_dir, optional watermark paths/coords
-│   ├── overlay_style.json                # Style B typography, mask_mode (blur|solid), codec (h264|hevc)
 │   ├── audio_mix.json                    # Optional overrides for aicn_audio.py DEFAULTS
 │   ├── series_bible.json                 # Linked/synced copy of hub series_bible.json
 │   └── schemas/*.template.json           # Canonical JSON schemas for Stages 1..3
@@ -68,8 +67,7 @@ units/<batch>/
 ├── data/
 │   ├── 00_video_profile.json             # Width, height, fps, duration, localization_mode
 │   ├── 00_episodes_manifest.json         # Per-episode sha256 & timeline offsets
-│   ├── 01_zh_bbox_scan.json              # 5 fps hardsub intervals & bboxes
-│   ├── 01_asr_raw_segments.json          # Multi-pass MLX Whisper Chinese segments
+│   ├── 01_asr_raw_segments.json          # Multi-pass MLX Whisper segments
 │   ├── 01_waveform_voice_audit.json      # 50 ms acoustic voice mask & onset/coverage audit
 │   ├── 01_extracted_audit_manifest.json  # Stage 1 audit frames + sha256
 │   ├── 02_bilingual_script.json          # Translated clauses (`zh_text`, `sub_text`, `tts_text`, `speaker`)
@@ -78,8 +76,7 @@ units/<batch>/
 │   ├── 03_mix_stats.json                 # Measured dub gain, SNR, vocal/BGM attenuation
 │   ├── 03_mix_report.json                # Audio gate checks & params
 │   ├── subtitles_full.srt                # Batch Vietnamese SRT
-│   ├── 04_overlay_geometry_log.json      # Style-B plate boxes, line counts & renderer version
-│   └── 04_qa_frames_manifest.json        # Stage 5 QA frames + CV check + sha256
+│   └── 04_qa_frames_manifest.json        # Stage 5 QA frames + sha256
 ├── media/
 │   ├── stems/{vocals,accomp}.wav         # Demucs MLX stems + stems.json (pruned by `clean`)
 │   ├── tts_segments/seg_NNNN.wav         # Per-clause 48 kHz dub clips
@@ -96,8 +93,7 @@ units/<batch>/
 └── .cache/
     ├── stat_hash.json                    # (size, mtime_ns) → sha256 fast cache
     ├── build_state.json                  # Render keys, per-part hashes & last render stats
-    ├── tts_sent/<sha>.wav                # Content-addressed sentence TTS cache
-    └── timeline/<key>/                   # Ephemeral mask/plate PNGs & ffconcat (pruned by `clean`)
+    └── tts_sent/<sha>.wav                # Content-addressed sentence TTS cache
 ```
 
 ---
@@ -110,10 +106,10 @@ units/<batch>/
 | `CHANGELOG.md` | Hub & Batch | `init-series` / `adopt` (`templates/CHANGELOG.md`, `UNIT_CHANGELOG.md`) | Append via `aicn.py log --unit U --kind <kind> --message "..."`. Never rewrite past lines. | `- YYYY-MM-DD HH:MM [kind] what (why) -> rerun` (`kind`: `init\|stage\|edit\|fix\|render\|release\|note`) |
 | `CHECKLIST.md` | Batch | `adopt` (`templates/CHECKLIST.md`) | Tick `[x]` **only after** the stage gate prints `PASS`. | Markdown checkboxes grouped by Stage 0..6 |
 | `00_project_manifest.md` | Batch | `init_workspace.py` | Filled automatically at Stage 0. | Video profile + episode table |
-| `01_visual_audit_notes.md` | Batch | `init_workspace.py` | **Stage 1 (mandatory before `verify_stage_1.py`)**: inspect every JPG in `01_extracted_audit_manifest.json` via `read_file` and log each filename/timestamp + Chinese OCR/homophone fixes. | One bullet/table row per `frame_NNNNs.jpg` listing exact filename or `<t>s` and observed hardsub text |
+| `01_visual_audit_notes.md` | Batch | `init_workspace.py` | **Stage 1 (mandatory before `verify_stage_1.py`)**: inspect every JPG in `01_extracted_audit_manifest.json` via `read_file` and log each filename/timestamp + character/proper-noun/homophone notes. | One bullet/table row per `frame_NNNNs.jpg` listing exact filename or `<t>s` and visual notes |
 | `02_glossary_and_pronunciation.md` | Batch | `init_workspace.py` | **Stage 2**: list character names, `xưng hô` pairs, domain terms, and `<en>...</en>` tokens matching `series_bible.json`. | Markdown table (`ZH \| VI \| TTS / Pronunciation \| Notes`) |
 | `03_pacing_and_audio_report.md` | Batch | `aicn_audio.py verify` | Auto-generated before `verify_stage_3.py` hashes it. | Engine version, target LUFS/TP, `[PASS]/[FAIL]` list of all audio gate checks |
-| `04_qa_review_report.md` | Batch | `init_workspace.py` | **Stage 5 (mandatory before `verify_stage_5.py`)**: inspect every JPG in `04_qa_frames_manifest.json` via `read_file` and append 1 row per frame. **No `_TBD_` and no `\| FAIL` allowed.** | Table: `\| frame_NNNs.jpg \| <t>s \| <sub text> \| No Chinese leakage, clean pill, dual watermark \| PASS \|` |
+| `04_qa_review_report.md` | Batch | `init_workspace.py` | **Stage 5 (mandatory before `verify_stage_5.py`)**: inspect every JPG in `04_qa_frames_manifest.json` via `read_file` and append 1 row per frame. **No `_TBD_` and no `\| FAIL` allowed.** | Table: `\| frame_NNNs.jpg \| <t>s \| <visual sanity / dual watermark> \| PASS \|` |
 
 ---
 

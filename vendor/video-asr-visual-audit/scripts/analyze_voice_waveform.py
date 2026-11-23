@@ -265,17 +265,21 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
     n_hops = len(voice_mask)
 
     bbox_path = os.path.join(data_dir, "01_zh_bbox_scan.json")
-    with open(bbox_path, "r", encoding="utf-8") as f:
-        bdata = json.load(f)
-    from run_asr_and_scan import find_hardsub_intervals
-    spans = bdata.get("spans", [])
-    sub_clauses = bdata.get("hardsub_intervals")
-    if not sub_clauses:
-        sub_clauses = find_hardsub_intervals(
-            spans,
-            int(bdata.get("fps_scan", 5)),
-            clause_changes=bdata.get("clause_changes"),
-        )
+    if os.path.exists(bbox_path):
+        with open(bbox_path, "r", encoding="utf-8") as f:
+            bdata = json.load(f)
+        from run_asr_and_scan import find_hardsub_intervals
+        spans = bdata.get("spans", [])
+        sub_clauses = bdata.get("hardsub_intervals")
+        if sub_clauses is None:
+            sub_clauses = find_hardsub_intervals(
+                spans,
+                int(bdata.get("fps_scan", 5)),
+                clause_changes=bdata.get("clause_changes"),
+            )
+    else:
+        spans = []
+        sub_clauses = []
 
     if target_segments_path is None:
         s2_path = os.path.join(data_dir, "02_bilingual_script.json")
@@ -403,8 +407,8 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
             if (ov / max(0.2, bdur)) >= 0.40 or not has_sub_clause:
                 speech_bursts_covered += 1
 
-    sc_ratio = covered_cnt / max(1, len(sub_clauses))
-    ac_ratio = speech_bursts_covered / max(1, speech_bursts_total)
+    sc_ratio = (covered_cnt / len(sub_clauses)) if sub_clauses else 1.0
+    ac_ratio = (speech_bursts_covered / speech_bursts_total) if speech_bursts_total else 1.0
 
     report = {
         "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

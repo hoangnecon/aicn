@@ -49,8 +49,7 @@ workspace/<slug>/
 │   ├── 01_extracted_audit_manifest.json     # SHA-256 manifest of Stage 1 visual audit frames
 │   ├── 02_bilingual_script.json             # Dual-layer Vietnamese script (sub_text + tts_text + speaker + ep_id)
 │   ├── 03_aligned_subtitles.json            # Final locked slot_start/slot_end & tempo ratios
-│   ├── 04_overlay_geometry_log.json         # Per-cue frosted-glass/pill bounding boxes [x0, y0, x1, y1]
-│   ├── 04_qa_frames_manifest.json           # Stratified QA frames + automated CV inspection results
+│   ├── 04_qa_frames_manifest.json           # Stratified QA frames + SHA-256 hashes
 │   └── subtitles_full.srt                   # Canonical Vietnamese SRT subtitle file
 ├── frames/                                  # [VISUAL EVIDENCE] Extracted keyframes for OCR & QA
 │   ├── audit/                               # Stage 1 keyframes for homophone & visual context verification
@@ -61,7 +60,6 @@ workspace/<slug>/
 │   ├── demucs/                              # htdemucs stems (vocals.wav, no_vocals.wav)
 │   ├── tts_segments/                        # 48kHz VieNeu-TTS segment WAVs (seg_0000.wav .. seg_NNNN.wav)
 │   ├── master_audio_48k.wav                 # 48kHz stereo master audio track (TTS+BGM or native stereo)
-│   ├── subtitles_overlay_alpha.mov          # ProRes 4444 (yuva444p10le) dynamic subtitle overlay strip
 │   ├── .staging_final.mp4                   # Locked staging composite prior to Stage 5 gate approval
 │   ├── final_<slug>_vi.mp4                  # Verified 16:9 master MP4
 │   └── final_<slug>_vi_9x16.mp4             # Verified 9:16 vertical master MP4
@@ -94,7 +92,7 @@ When localizing a multi-episode series across multiple sessions or batches (e.g.
 workspace/<series-slug>/                         # SERIES HUB ROOT (e.g., workspace/drama-quy-khu/)
 ├── 00_series_manifest.md                        # Series-wide episode status table & release tracker
 ├── config/
-│   ├── series_config.json                       # Default genre, localization_mode, overlay_style, export_formats
+│   ├── series_config.json                       # Default genre, localization_mode, export_formats
 │   └── series_bible.json                        # MASTER Character Roster, Pronoun Matrix & World Glossary
 ├── source_inbox/                                # Raw downloaded episodes waiting to be assigned to a unit
 │   ├── ep01.mp4
@@ -220,8 +218,7 @@ If a workspace was created with an older layout, run `init_workspace.py --sync-e
   "title_zh": "诡区",
   "title_vi": "Quỷ Khu",
   "genre": "short-drama",
-  "localization_mode": "sub_only",
-  "overlay_style": "frosted_glass",
+  "localization_mode": "voice_dub",
   "characters": [
     {
       "speaker_id": "M1",

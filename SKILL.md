@@ -8,13 +8,13 @@ description: Use when starting, resuming, or editing a Chinese short-drama / AI-
 ## Overview
 
 One entry point for every series. It drives five stage skills (vendored in `vendor/`:
-orchestrator, ASR + visual audit, zh→vi script adapter, VieNeu voice + pacing mixer,
+orchestrator, ASR + visual audit, zh/en→vi script adapter, VieNeu voice + pacing mixer,
 QA review) and adds root discovery, a fixed folder and log contract, content-hash
-caching, hardware-overlapped full-series execution, and one-pass Style-B rendering.
+caching, hardware-overlapped full-series execution, and one-pass dub + dual-corner watermark rendering (v2.0.0 — no burned-in subtitle overlay or hardsub blurring).
 
 > **Release rule (mandatory): 1 published video = 1 FULL series.**
 > Every publishable release is ALWAYS the complete series with **full Vietnamese dubbing +
-> full Vietnamese subtitles + branding** at `deliverables/final_<series>_full_vi.mp4` (and
+> dual-corner branding watermark + external `.srt` subtitles** at `deliverables/final_<series>_full_vi.mp4` (and
 > `deliverables/subtitles/final_<series>_full_vi.srt`). Working batches under `units/`
 > exist **strictly as internal work slices** (for caching, incremental edits, QA, and
 > GPU/CPU/Media-Engine pipelining) — **never** as separate uploads.
@@ -105,11 +105,11 @@ Exact commands per stage: `references/stages.md`.
 
 | Stage | Does | Gate | Cached by |
 |---|---|---|---|
-| 0 Init | series hub + internal working batches (`units/*`), auto-calibrated `strip_y0`, fps/PTS-normalized `master_source.mp4` | stage_0 (decoupled from `series_bible.json`) | `source/master_source.mp4` |
-| 1 Prep (Stems + ASR + 5 fps scan + audit) | `run-series --phase prep` (Metal `separate+ASR` overlapped with CPU `waveform+audit`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
+| 0 Init | series hub + internal working batches (`units/*`), fps/PTS-normalized `master_source.mp4` | stage_0 (decoupled from `series_bible.json`) | `source/master_source.mp4` |
+| 1 Prep (Stems + ASR + audit) | `run-series --phase prep` (Metal `separate+ASR` overlapped with CPU `waveform+audit`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
 | 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) + living `series_bible.json` | `validate_bilingual_script.py` | stream each unit immediately on Stage 1 PASS |
 | 3 Audio (full dub) | `aicn_audio.py all`: stems (cached) → CPU VieNeu TTS (2×4 threads) + parallel rubberband → cached-Z mix → fast 48 kHz master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: hub-shared `<hub>/.cache/tts_sent/<sha>.wav` |
-| 4 Overlay (style B) | `render` (one ffmpeg pass: hwdec + VBR `--codec h264\|hevc\|h264_high`, optional `--brand-dir` dual-corner watermark) | `aicn.py verify-overlay` (A/V sync + frame count) | whole batch: sha256(source, display cues, hardsub intervals, style, font, watermark, audio, encoder, renderer version); unchanged → skipped |
+| 4 Render (Dub + Watermark) | `render` (one ffmpeg pass: `h264_videotoolbox`/`hevc_videotoolbox` with `--brand-dir` dual-corner watermark, or instant video stream-copy when no watermark is set) | `aicn.py verify-render` / `verify-overlay` (codec/audio + A/V sync + frame count) | whole batch: sha256(source, audio, watermark, encoder, renderer version); unchanged → skipped |
 | 5 Batch QA | hardlink staging MP4, 4-worker QA frame extraction, **view every frame**, verify batch (`run-series --phase produce --units ...` streams S3→S5 with 3-engine locks) | `verify_stage_5.py` | hardlink (0 extra bytes) |
 | 6 Full-Series Release | **`aicn.py merge-series --hub <hub>`** once **ALL** working batches PASS Stage 5 (verifies uniform stream specs & A/V sync) → single full-series MP4 + SRT | all batches `P` at Stage 5 | stream copy (seconds) |
 
@@ -123,27 +123,22 @@ The old `assemble_master_audio.py` path is retired: it replaced a missing Demucs
 silence and dropped the original voice entirely. Do not use it.
 (`aicn.py tts-sync` is legacy for the old per-chunk flow; Stage 3 uses `aicn_audio.py`.)
 
-## 4. Edit loop (≈ 2–3 min per edit)
+## 4. Edit loop (≈ 1–2 min per edit)
 
-1. Edit the smallest thing: one item in `02_bilingual_script.json` (and the same id in `03_aligned_subtitles.json` for sub_only), or `config/overlay_style.json`.
-2. Re-run the validator of the stage you edited.
+1. Edit the smallest thing: one item in `02_bilingual_script.json`.
+2. Re-run `validate_bilingual_script.py`.
 3. `voice_dub`, if `tts_text` changed: `aicn_audio.py dub`, `mix`, `master`, `verify` (only the edited sentence is re-synthesized). For a mix-only change (`config/audio_mix.json`): `mix`, `master`, `verify`.
-4. `aicn.py plan --unit U` (pass the same `--codec`/`--quality`/`--mask`/`--brand-dir` flags as `render`) says `render=current` or `stale: <parts>`; anything other than the part you edited means an unintended change. Then `aicn.py render --unit U`: one ffmpeg pass over the unit (≈ 1.7–1.8 min per 10 min of video). It is skipped when nothing it reads changed.
-5. `aicn.py verify-overlay`, Stage 5 import with `--qa-timestamps` at cue midpoints (always including edited cues), view the QA frames of changed chunks, `verify_stage_5.py`.
-6. `aicn.py log --unit U --kind fix --message "<what> (<why>) -> rerun: <stages/chunks>"`.
+4. `aicn.py plan --unit U` (pass the same `--codec`/`--quality`/`--brand-dir` flags as `render`) says `render=current` or `stale: <parts>`; anything other than the part you edited means an unintended change. Then `aicn.py render --unit U`: one ffmpeg pass over the unit (watermarked encode or instant stream-copy when no watermark is set). It is skipped when nothing it reads changed.
+5. `aicn.py verify-render --unit U`, Stage 5 import with `--qa-timestamps` at cue midpoints, view the QA frames for watermark/visual sanity, `verify_stage_5.py`.
+6. `aicn.py log --unit U --kind fix --message "<what> (<why>) -> rerun: <stages>"`.
 
-Undo is free: the old text restores the old key, and the chunk comes back from cache.
+Undo is free: the old text restores the old key, and the cached TTS segment is restored.
 
-## 5. Style B (default overlay)
+## 5. Dub + Watermark + Translate Only (v2.0.0)
 
-Translucent black plate hugging each line: Avenir Next Demi Bold 48 px, white text,
-plate `rgba(0,0,0,135)`, radius 10, padding 20/10/12, line gap 12, ≤ 2 balanced lines,
-≤ 1500 px per line, block centred on the unit's median hardsub centre (no jumping).
-The Chinese hardsub is hidden **per Chinese interval from `01_zh_bbox_scan.json`, not per
-Vietnamese cue**, with a feathered mask grown by 1.5 × feather. `mask_mode` in
-`config/overlay_style.json`: `blur` (default, σ 22, ×0.82) or `solid` (black box).
-The ffmpeg engine does not re-measure lines on the real frame; if a QA frame shows a
-clipped stroke, raise `box_pad_x` or use `render --engine python` (re-measures, ≈ 3× slower).
+`aicn v2.0.0` produces clean dubbed + watermarked video with an external `.srt` track — **no burned-in subtitle overlay, no Style-B pill plates, and no GaussianBlur hardsub masking**.
+- When `--brand-dir` (or `project_config.json["watermark"]`) is set, `render` composites the dual-corner PNGs (`13_top_left_logo_large.png` + `15_top_right_vietsub_floating.png`, scaled proportionally on portrait widths `< 1200`) via hardware `h264_videotoolbox` / `hevc_videotoolbox` with `-fps_mode passthrough -sn`.
+- When no watermark is configured, `render` stream-copies video (`-c:v copy -sn`) and muxes `master_audio_48k.wav` in seconds.
 
 ## 6. Audio: dub over the film, never instead of it
 
@@ -158,12 +153,11 @@ Full design, parameters and tuning: `references/audio_mix.md`.
 
 ## 7. Correctness rules (never traded for speed)
 
-- Timeline truth is Whisper + the 5 fps scan. Never retime by eye; use `analyze_voice_waveform.py --snap-and-split`, then re-validate.
-- Display follows the Chinese line; audio does not move. `show_a/show_b` hold a cue to its line end (overlap ≥ 0.25 s) and snap a late first cue (≤ 1.0 s) to the line start. `slot_start/slot_end` never change.
-- `verify-overlay` fails on **blank**: a Chinese line blurred with no Vietnamese for > 0.30 s. Fix the script or Stage 1 data; do not raise the tolerance.
+- Timeline truth is Whisper + acoustic waveform (`analyze_voice_waveform.py --snap-and-split`), then re-validate.
+- `verify-render` / `verify-overlay` checks staging MP4 presence, `h264`/`hevc` + `aac 48000Hz stereo` + `0` subtitle streams (`-sn`), and `av_sync_and_frame_integrity` (duration & frame count match source).
 - The render keeps every source frame with its own timestamp (`-fps_mode passthrough`), so the output has the source frame count and audio cannot drift. Check the frame count after a render.
-- Changed renderer code → bump `FF_RENDERER_VERSION` (or `RENDERER_VERSION` for `--engine python`) in `aicn.py`.
-- The automated Stage 5 CV check has passed frames with visible Chinese strokes. Viewing each QA frame is mandatory.
+- Changed renderer code → bump `FF_RENDERER_VERSION` in `aicn.py`.
+- Viewing each extracted QA frame (`frames/qa/*.jpg`) for watermark placement and visual sanity is mandatory.
 
 ## 8. How long a video takes
 
@@ -187,9 +181,7 @@ Whenever an upstream API breaks, a QA gate fails, the user corrects an output/wo
 | Dub sounds slurred or robotic on some lines | `atempo` speed-up, or a 2–4 syllable clause read alone | `aicn_audio.py dub` (sentences + rubberband) |
 | `OVERFLOW` in `dub` | sentence too long even at 1.25× | shorten `tts_text` of those ids in Stage 2 |
 | Hiss between dubbed words | TTS noise floor raised by the level match | keep the expander (`expander_*` in `audio_mix.json`) |
-| Stage 5 CV check fails on style B | QA timestamp in a gap between cues | timestamps inside cues (`04_overlay_geometry_log.json`) |
-| Chinese strokes or ghosts visible though CV passed | old renderer (< styleB-1.4) | re-render; re-view the frame |
-| `frames/qa/` has frames in another font | leftovers from an older render | only `data/04_qa_frames_manifest.json` counts |
+| `frames/qa/` has stale frames | leftovers from an older render | only `data/04_qa_frames_manifest.json` counts |
 | `discover` shows `x` | gate signed, media deleted | restore media (verify sha256 against `00_episodes_manifest.json`), re-run that stage |
 | A gate blocks after editing a JSON | gates hash their artifacts | re-run that stage's validator; never edit `.cicd/` |
 

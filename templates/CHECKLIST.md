@@ -6,11 +6,11 @@ A box is ticked only after the command in its row prints PASS. The gate tokens i
 ## Stage 0 — init
 - [ ] `config/rights.json` on the hub has a basis other than `unknown`
 - [ ] `init_workspace.py` → `.cicd/stage_0_gate.json` PASS
-- [ ] `aicn.py adopt` → CHECKLIST, CHANGELOG, `config/overlay_style.json`, `.cache/`
+- [ ] `aicn.py adopt` → CHECKLIST, CHANGELOG, `.cache/`
 
-## Stage 1 — Stems + ASR + hardsub scan (runs ONCE per source)
+## Stage 1 — Stems + ASR + audit (runs ONCE per source)
 - [ ] `aicn_audio.py separate` (Demucs MLX stems → `media/stems/`)
-- [ ] `run_asr_and_scan.py` (MLX Whisper + fast 5 fps bbox)
+- [ ] `run_asr_and_scan.py` (MLX Whisper ASR + acoustic waveform audit)
 - [ ] `analyze_voice_waveform.py --snap-and-split`
 - [ ] `extract_audit_frames.py` and every frame logged in `01_visual_audit_notes.md`
 - [ ] `verify_stage_1.py` PASS
@@ -23,10 +23,10 @@ A box is ticked only after the command in its row prints PASS. The gate tokens i
 - [ ] `aicn_audio.py all --unit .` (stems cached → CPU VieNeu dub + parallel rubberband → cached-Z mix → fast 48 kHz master → audio gate + `verify_stage_3.py` PASS)
 - [ ] Spot-listened to at least one dubbed passage and one undubbed passage
 
-## Stage 4 — overlay (style B, one-pass FFmpeg)
+## Stage 4 — dub + watermark render (one-pass FFmpeg)
 - [ ] `aicn.py plan` reviewed (expected dirty parts only)
 - [ ] `aicn.py render [--codec h264|hevc] [--brand-dir <dir>]`
-- [ ] `aicn.py verify-overlay` PASS (blank ≤ 0.30 s, ≤ 2 lines, duration exact)
+- [ ] `aicn.py verify-render` PASS (codec/audio compliance, A/V sync, frame count exact)
 
 ## Stage 5 — batch QA (hardlinked, 0 duplicate disk copy)
 - [ ] `composite_and_verify.py --import-existing-mp4 media/.staging_render.mp4 --qa-timestamps ...`

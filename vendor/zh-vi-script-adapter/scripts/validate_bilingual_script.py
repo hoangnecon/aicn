@@ -114,7 +114,7 @@ def main():
         with open(script_path, "w", encoding="utf-8") as f:
             json.dump(segments, f, ensure_ascii=False, indent=2)
 
-    # Check 2: Timeline & Fine-Grained Visual Sub-Clause + Acoustic Waveform Coverage
+    # Check 2: Timeline & Acoustic Waveform Voice Coverage (no visual hardsub bbox requirement)
     first_asr_start = float(raw_asr[0]["start"]) if raw_asr else 0.0
     last_asr_end = float(raw_asr[-1]["end"]) if raw_asr else 0.0
     first_seg_start = float(segments[0]["start"]) if segments else 999.0
@@ -125,19 +125,17 @@ def main():
         sys.path.insert(0, AUDIT_SCRIPTS)
     from analyze_voice_waveform import analyze_waveform_and_clauses
     wf_report = analyze_waveform_and_clauses(ws, script_path)
-    sc_cov_ratio = wf_report["sub_clause_coverage_ratio"]
+    ac_cov_ratio = wf_report["acoustic_speech_coverage_ratio"]
     bloated_cnt = wf_report["bloated_segments_count"]
     premature_cnt = wf_report.get("premature_lead_segments_count", 0)
-    internal_gap_cnt = wf_report.get("internal_blank_gap_segments_count", 0)
 
     coverage_ok = (
         (abs(first_seg_start - first_asr_start) <= 1.5)
         and (abs(last_seg_end - last_asr_end) <= 1.5)
         and (len(segments) >= len(raw_asr) * 0.55)
-        and (sc_cov_ratio >= 0.96)
+        and (ac_cov_ratio >= 0.90)
         and (bloated_cnt == 0)
         and (premature_cnt == 0)
-        and (internal_gap_cnt == 0)
     )
 
     # Check 6: Live sea-g2p IPA compilation
@@ -164,13 +162,13 @@ def main():
             "detail": f"segments={len(segments)}, mode={loc_mode}, errors={schema_errors[:3]}"
         },
         {
-            "id": "timeline_and_clause_granularity",
-            "description": "Script covers >=96% of fine-grained visual sub-clauses with 0 bloated, 0 premature lead-in, and 0 internal blank gap segments",
+            "id": "timeline_and_acoustic_coverage",
+            "description": "Script covers >=90% of acoustic voice bursts with 0 bloated and 0 premature lead-in segments",
             "weight": 15,
             "passed": coverage_ok,
             "detail": (
-                f"span=[{first_seg_start:.2f}s..{last_seg_end:.2f}s], sub_clauses={wf_report['covered_visual_sub_clauses']}/{wf_report['total_visual_sub_clauses']} "
-                f"({sc_cov_ratio*100:.1f}%), bloated={bloated_cnt}, premature_lead={premature_cnt}, internal_blank_gaps={internal_gap_cnt}"
+                f"span=[{first_seg_start:.2f}s..{last_seg_end:.2f}s], acoustic_cov={ac_cov_ratio*100:.1f}%, "
+                f"bloated={bloated_cnt}, premature_lead={premature_cnt}"
             )
         },
         {

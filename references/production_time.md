@@ -12,7 +12,7 @@ Reference measurement batch: `unit_07_ep61_70` (10 episodes, 609.54 s, 1080p30, 
 |---|---|---|---|
 | Stage 0 init + adopt | < 30 s | < 30 s | |
 | Stage 1 Demucs stems (`demucs-mlx`, Metal) | 74 s | 74 s | cached for Stage 3 |
-| Stage 1 5 fps hardsub scan | 38.9 s | **29.7 s** (-23%) | bit-exact 211/211 intervals |
+| Stage 1 5 fps hardsub scan | 38.9 s | **0 s (skipped in v2.0.0)** | dub + watermark + translate only |
 | Stage 1 MLX Whisper ASR (Metal) | ~80 s | **~22–28 s** (3.3×) | `word_timestamps=False` (72.0s → 21.6s on 120s warm slice) |
 | Stage 3 VieNeu CPU (`fp32`) + parallel rubberband | ~240 s | **~185–195 s** (+23%) | `tts_workers=2, tts_threads=4` (`gen_RTF` 0.317 → 0.258) |
 | Stage 3 frequency-aware `mix` | 78.8 s (56.5 s compute) | **~21.5 s** (20.5 s compute) | cached-Z `complex64` STFT + piped `lufs()` (2.8–3.7×) |
@@ -47,10 +47,10 @@ Measured on a 60 s real slice of `unit_07_ep61_70` (original HEVC source `1.01 M
 
 | Change | Time | | Work |
 |---|---|---|---|
-| Reword one subtitle (`sub_text`) | ≈ 1.8 min | M | validate, one ffmpeg pass on affected batch + `merge-series` |
+| Reword external `.srt` (`sub_text`) | ≈ 0.1 min | M | validate, regenerate SRT (no video re-render needed in v2.0.0) |
 | Change one dubbed line (`tts_text`) | ≈ 2.2 min | M/E | 1 sentence TTS + `mix` (21 s) + `master` (4 s) + one ffmpeg pass + `merge-series` |
 | Change mix parameters only | ≈ 30 s + render | M | `mix` (21 s) + `master` (4 s) + gate |
-| Style, codec, watermark, or renderer change | ≈ 1.8 min/batch | M | one ffmpeg pass |
+| Codec or watermark change | ≈ 1.8 min/batch | M | one ffmpeg pass (or instant stream-copy with no watermark) |
 
 ## Formula (per internal working batch, `v1.3.0`)
 

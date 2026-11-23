@@ -72,7 +72,7 @@ digraph cicd_localization_pipeline {
     s1 [label="Stage 1: ASR, Hardsub Scan & Visual Audit\nSub-Skill: video-asr-visual-audit\n(verify_stage_1.py -> .cicd/stage_1_gate.json)"];
     s2 [label="Stage 2: Dual-Layer Script Adaptation\nSub-Skill: zh-vi-script-adapter\n(validate_bilingual_script.py -> .cicd/stage_2_gate.json)"];
     s3 [label="Stage 3: VieNeu-TTS 48kHz, Pacing & BGM Mix\nSub-Skill: vieneu-voice-pacing-mixer\n(verify_stage_3.py -> .cicd/stage_3_gate.json)"];
-    s4 [label="Stage 4: Dynamic Alpha Pill Overlay\nSub-Skill: dynamic-subtitle-overlay\n(verify_stage_4.py -> .cicd/stage_4_gate.json)"];
+    s4 [label="Stage 4: Dub & Watermark Render\n(aicn.py render + verify-render -> .cicd/stage_4_gate.json)"];
     s5 [label="Stage 5: Staging Composite, CV Audit & Release\nSub-Skill: video-localization-qa-review\n(verify_stage_5.py -> final_<slug>_vi.mp4)"];
     s0 -> s1 -> s2 -> s3 -> s4 -> s5;
 }
@@ -82,7 +82,7 @@ digraph cicd_localization_pipeline {
 2. **Stage 1 (ASR & Visual Audit):** **REQUIRED SUB-SKILL:** Use `video-asr-visual-audit`
 3. **Stage 2 (Script & Dual-Layer Adaptation):** **REQUIRED SUB-SKILL:** Use `zh-vi-script-adapter`
 4. **Stage 3 (Voice Synthesis, Pacing & BGM Mix):** **REQUIRED SUB-SKILL:** Use `vieneu-voice-pacing-mixer`
-5. **Stage 4 (Dynamic Subtitle Overlay):** **REQUIRED SUB-SKILL:** Use `dynamic-subtitle-overlay`
+5. **Stage 4 (Dub & Watermark Render):** `aicn.py render` + `aicn.py verify-render` (no burned-in subtitle overlay).
 6. **Stage 5 (Final Composite & Visual/Audio QA):** **REQUIRED SUB-SKILL:** Use `video-localization-qa-review`
 
 ---
@@ -117,8 +117,7 @@ workspace/<slug>/
 │   ├── 01_extracted_audit_manifest.json   # List & SHA-256 hashes of keyframes extracted for Stage 1 audit
 │   ├── 02_bilingual_script.json           # Dual-layer script (id, ep_id, speaker, raw_ids, start, end, zh_text, sub_text, tts_text)
 │   ├── 03_aligned_subtitles.json          # Final locked timing & tempo per segment
-│   ├── 04_overlay_geometry_log.json       # Per-cue frosted-glass/pill coordinates [x0, y0, x1, y1]
-│   ├── 04_qa_frames_manifest.json         # Stratified QA frames + automated CV edge-leakage scores
+│   ├── 04_qa_frames_manifest.json         # Stratified QA frames + SHA-256 hashes
 │   └── subtitles_full.srt                 # Canonical exported SRT subtitle file
 ├── frames/
 │   ├── audit/                             # Keyframes extracted in Stage 1 to inspect visual context
@@ -129,7 +128,6 @@ workspace/<slug>/
 │   ├── demucs/                            # vocals.wav & no_vocals.wav from htdemucs
 │   ├── tts_segments/                      # seg_0000.wav .. seg_NNNN.wav (48kHz VieNeu-TTS)
 │   ├── master_audio_48k.wav               # 48kHz stereo master audio track (TTS+BGM or native stereo)
-│   ├── subtitles_overlay_alpha.mov        # ProRes 4444 alpha overlay strip (yuva444p10le)
 │   ├── .staging_final.mp4                 # Locked staging encode prior to Stage 5 QA gate approval
 │   ├── final_<slug>_vi.mp4                # Verified 16:9 master MP4
 │   └── final_<slug>_vi_9x16.mp4           # Verified 9:16 vertical master MP4
@@ -218,7 +216,7 @@ Creates/updates `workspace/<series-slug>/` (holding the shared `config/series_bi
 | **Stage 1** | `verify_stage_1.py` | `no_vocals.wav` exists & valid; `01_asr_raw_segments.json` has fine-grained clauses (`median duration <= 2.8s`); `01_zh_bbox_scan.json` covers `100%` of video duration at `5 fps`; `frames/audit/*.jpg` extracted (`>= 10` frames) AND every extracted frame filename is documented with visual observations in `01_visual_audit_notes.md`. |
 | **Stage 2** | `validate_bilingual_script.py` | Requires Stage 1 Gate PASS. Verifies `02_bilingual_script.json`: `100%` coverage of `raw_ids`, strictly monotonic timestamps, `0` CJK/Korean chars in `sub_text`/`tts_text`, `0` unwrapped alphanumeric tokens (`3FS`, `R1`) outside `<en>` tags, `sub_text <= 92 chars`, syllable rate `<= 6.5 syl/s`, and `100%` live compilation via `sea-g2p` (`phonemize_text_with_emotions`). |
 | **Stage 3** | `verify_stage_3.py` | Requires Stage 2 Gate PASS. Verifies all `seg_0000..NNNN.wav` exist at `48000 Hz`, `0` corrupted/empty WAVs, `100%` of segments in `03_aligned_subtitles.json` have `tempo <= 1.26x` and hard-locked `slot_start` (zero cumulative drift), `master_audio_48k.wav` is `48000 Hz` stereo with peak in `[0.25, 0.98]`, and `03_pacing_and_audio_report.md` is populated. |
-| **Stage 4** | `verify_stage_4.py` | Requires Stage 3 Gate PASS. Runs **in-memory pixel-leakage simulation** across all 5fps bounding boxes in `01_zh_bbox_scan.json` against rendered pills (`0` uncovered Chinese hardsub pixels), verifies `max_lines <= 2`, verifies `subtitles_overlay_alpha.mov` is `yuva444p10le` matching video duration. |
+| **Stage 4** | `aicn.py verify-render` | Requires Stage 3 Gate PASS. Verifies `.staging_render.mp4` presence, `h264`/`hevc` + `48kHz` stereo AAC + `0` subtitle streams, and `av_sync_and_frame_integrity`. |
 | **Stage 5** | `verify_stage_5.py` | Requires Stage 4 Gate PASS. Verifies `media/.staging_final.mp4` has `0` subtitle streams (`-sn`), `48000 Hz` stereo AAC, duration within `±0.15s` of source; runs **computer-vision perimeter scan** on `12+` stratified frames in `frames/qa/` (`0` bright border leaks); verifies every frame in `04_qa_frames_manifest.json` is logged with `PASS` in `04_qa_review_report.md`; **promotes `.staging_final.mp4` -> `media/final_<slug>_vi.mp4`**. |
 
 ---

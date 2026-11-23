@@ -45,7 +45,7 @@ def select_smart_timestamps(workspace: str, explicit_ts: str = "") -> list:
         candidates.extend(bdata.get("top_wide_timestamps", [])[:6])
         candidates.extend(bdata.get("scene_cuts_sample", [])[:6])
 
-    for frac in [0.03, 0.15, 0.30, 0.50, 0.72, 0.90]:
+    for frac in [0.03, 0.10, 0.18, 0.26, 0.34, 0.42, 0.50, 0.58, 0.66, 0.74, 0.82, 0.90]:
         candidates.append(round(dur * frac, 1))
 
     selected = []
@@ -54,9 +54,10 @@ def select_smart_timestamps(workspace: str, explicit_ts: str = "") -> list:
         if 0.5 <= ts <= dur - 0.5 and all(abs(ts - s) >= 2.0 for s in selected):
             selected.append(round(ts, 1))
 
-    # Fill up to at least 12 frames with stratified candidates spaced >= 12.0s apart
+    # Fill up to at least 12 frames with stratified candidates
+    min_spacing = min(12.0, max(1.0, dur * 0.05))
     for ts in sorted(candidates):
-        if 1.0 <= ts <= dur - 1.0 and all(abs(ts - s) >= 12.0 for s in selected):
+        if 0.5 <= ts <= dur - 0.5 and all(abs(ts - s) >= min_spacing for s in selected):
             selected.append(round(ts, 1))
         if len(selected) >= max(12, len(gap_timestamps)):
             break

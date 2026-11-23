@@ -161,6 +161,7 @@ class DramaDunyamClient:
         params: dict[str, Any] | None = None,
         _cookie_retried: bool = False,
         _attempts: int = 4,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         self.init_session(force=False)
         url = f"{self.base_url}{path}"
@@ -169,14 +170,20 @@ class DramaDunyamClient:
             if clean:
                 url = f"{url}?{urllib.parse.urlencode(clean)}"
         for attempt in range(_attempts):
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url, headers=headers or {})
             try:
                 with self.opener.open(req, timeout=self.timeout) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 if exc.code == 412 and not _cookie_retried:
                     self.init_session(force=True)
-                    return self._get_json(path, params=params, _cookie_retried=True, _attempts=_attempts)
+                    return self._get_json(
+                        path,
+                        params=params,
+                        _cookie_retried=True,
+                        _attempts=_attempts,
+                        headers=headers,
+                    )
                 if exc.code == 402:
                     raise PaywallLockedError(f"Episode locked behind HTTP 402 paywall: {path}") from exc
                 body = exc.read().decode("utf-8", errors="ignore")[:240]
@@ -234,8 +241,13 @@ class DramaDunyamClient:
     def detail(self, slug_or_id: str, lang: str = "en") -> dict[str, Any]:
         return self._get_json(f"/api/series/{urllib.parse.quote(slug_or_id)}", {"lang": lang})
 
-    def play_info(self, series_id: str, ep: int) -> dict[str, Any]:
-        return self._get_json(f"/play/{urllib.parse.quote(str(series_id))}/{ep}")
+    def play_info(self, series_id: str, ep: int, slug: str | None = None) -> dict[str, Any]:
+        headers = (
+            {"Referer": f"{self.base_url}/en/series/{urllib.parse.quote(slug)}"}
+            if slug
+            else None
+        )
+        return self._get_json(f"/play/{urllib.parse.quote(str(series_id))}/{ep}", headers=headers)
 
     def download_cover(self, detail: dict[str, Any], dest: Path) -> Path | None:
         variants = detail.get("cover_variants") or {}
@@ -261,17 +273,30 @@ class DramaDunyamClient:
             tmp.replace(dest)
         return dest
 
-    def download_stream(self, url: str, dest: Path, delivery: str = "direct") -> dict[str, Any]:
+    def download_stream(
+        self,
+        url: str,
+        dest: Path,
+        delivery: str = "direct",
+        slug: str | None = None,
+    ) -> dict[str, Any]:
+        if url.startswith("/"):
+            url = f"{self.base_url}{url}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(".part.mp4")
         if delivery == "hls" or ".m3u8" in url:
+            referer = f"{self.base_url}/en/series/{urllib.parse.quote(slug)}" if slug else f"{self.base_url}/"
+            hdr_lines = [f"Referer: {referer}", f"User-Agent: {UA}"]
+            cookie_str = "; ".join(f"{c.name}={c.value}" for c in self.cookies)
+            if cookie_str:
+                hdr_lines.append(f"Cookie: {cookie_str}")
             cmd = [
                 FFMPEG,
                 "-y",
                 "-v",
                 "error",
                 "-headers",
-                f"Referer: {self.base_url}/\r\nUser-Agent: {UA}\r\n",
+                "\r\n".join(hdr_lines) + "\r\n",
                 "-i",
                 url,
                 "-c",
@@ -381,6 +406,7 @@ def cmd_download(client: DramaDunyamClient, args: argparse.Namespace) -> None:
         f"[dd] Downloading {det.get('title')} (id={series_id}, {len(episodes)}/{max_ep} eps) -> {out_dir}",
         flush=True,
     )
+    slug = str(det.get("slug") or args.slug)
     for idx, ep in enumerate(episodes, 1):
         dest = out_dir / f"ep{ep:02d}.mp4"
         if dest.exists() and dest.stat().st_size > 10_000 and not args.force:
@@ -399,7 +425,7 @@ def cmd_download(client: DramaDunyamClient, args: argparse.Namespace) -> None:
                 pass
 
         try:
-            play = client.play_info(series_id, ep)
+            play = client.play_info(series_id, ep, slug=slug)
         except PaywallLockedError as exc:
             locked_eps.append(ep)
             print(f"[dd] [{idx}/{len(episodes)}] ep{ep:02d} LOCKED (HTTP 402): {exc}", flush=True)
@@ -412,8 +438,10 @@ def cmd_download(client: DramaDunyamClient, args: argparse.Namespace) -> None:
         if not stream_url:
             stream_url = f"{client.base_url}/hls/{series_id}/{ep}/playlist.m3u8"
             delivery = "hls"
+        elif stream_url.startswith("/"):
+            stream_url = f"{client.base_url}{stream_url}"
 
-        probe = client.download_stream(stream_url, dest, delivery=delivery)
+        probe = client.download_stream(stream_url, dest, delivery=delivery, slug=slug)
         manifest.append({"ep": ep, "file": str(dest), "status": "downloaded", "delivery": delivery, **probe})
         print(
             f"[dd] [{idx}/{len(episodes)}] ep{ep:02d}.mp4 ok "

@@ -1,16 +1,20 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-Link aicn (and vendored stage skills that are not installed yet) into the Windows agent skill folders.
-Never overwrites an existing folder or junction. Optionally installs portable ffmpeg/ffprobe, rubberband, and node.
+Install aicn and all 5 vendored stage skills into Windows Antigravity and Claude Code skill folders.
+Uses real directory copies (not NTFS Junctions) so Antigravity on Windows discovers all 6/6 skills for
+both the main agent and sub-agents. Safely upgrades old aicn junctions and refreshes managed copies on
+re-run without overwriting unrelated user folders unless -Force is passed.
+Optionally installs portable ffmpeg/ffprobe, rubberband, and node with -InstallTools.
 #>
 [CmdletBinding()]
 param(
-    [switch]$InstallTools
+    [switch]$InstallTools,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
-$SK = Split-Path -Parent $MyInvocation.MyCommand.Path
+$SK = [System.IO.Path]::GetFullPath((Split-Path -Parent $MyInvocation.MyCommand.Path)).TrimEnd('\')
 $localBin = Join-Path $env:USERPROFILE ".local\bin"
 $localNode = Join-Path $env:USERPROFILE ".local\node"
 
@@ -56,9 +60,60 @@ if ($InstallTools) {
             if ($parts -notcontains $d) { $parts += $d }
         }
         [Environment]::SetEnvironmentVariable("PATH", ($parts -join ';'), "User")
+        $env:PATH = "$localBin;$localNode;" + $env:PATH
     } finally {
         if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
     }
+}
+
+function Copy-CleanTree([string]$Src, [string]$Dst) {
+    New-Item -ItemType Directory -Force -Path $Dst | Out-Null
+    $excludeDirs = @('.git', '__pycache__', '.cache')
+    Get-ChildItem -LiteralPath $Src -Force | ForEach-Object {
+        if ($_.PSIsContainer) {
+            if ($excludeDirs -contains $_.Name) { return }
+            Copy-CleanTree $_.FullName (Join-Path $Dst $_.Name)
+        } else {
+            if ($_.Extension -eq '.pyc' -or $_.Name -eq '.aicn-managed') { return }
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Dst $_.Name) -Force
+        }
+    }
+}
+
+function Sync-SkillDir([string]$Src, [string]$Dst) {
+    $srcNorm = [System.IO.Path]::GetFullPath($Src).TrimEnd('\')
+    $dstNorm = [System.IO.Path]::GetFullPath($Dst).TrimEnd('\')
+    if ($srcNorm -ieq $dstNorm) {
+        Write-Host "self   $dstNorm"
+        return
+    }
+
+    $marker = Join-Path $dstNorm ".aicn-managed"
+    if (Test-Path -LiteralPath $dstNorm) {
+        $item = Get-Item -LiteralPath $dstNorm -Force
+        $isReparse = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        if ($isReparse) {
+            # Safely unlink junction/symlink without recursing into its target.
+            [System.IO.Directory]::Delete($dstNorm, $false)
+            Copy-CleanTree $srcNorm $dstNorm
+            Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
+            Write-Host "upgrade $dstNorm (junction -> real dir)"
+            return
+        }
+        if ((Test-Path -LiteralPath $marker) -or $Force) {
+            Remove-Item -LiteralPath $dstNorm -Recurse -Force
+            Copy-CleanTree $srcNorm $dstNorm
+            Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
+            Write-Host "sync   $dstNorm"
+            return
+        }
+        Write-Host "keep   $dstNorm (existing unmanaged folder; pass -Force to overwrite)"
+        return
+    }
+
+    Copy-CleanTree $srcNorm $dstNorm
+    Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
+    Write-Host "copy   $dstNorm"
 }
 
 $dests = @(
@@ -68,21 +123,9 @@ $dests = @(
 
 foreach ($dest in $dests) {
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    $aicnLink = Join-Path $dest "aicn"
-    if (Test-Path $aicnLink) {
-        Write-Host "keep   $aicnLink"
-    } else {
-        New-Item -ItemType Junction -Path $aicnLink -Target $SK | Out-Null
-        Write-Host "link   $aicnLink"
-    }
+    Sync-SkillDir $SK (Join-Path $dest "aicn")
     Get-ChildItem (Join-Path $SK "vendor") -Directory | ForEach-Object {
-        $vLink = Join-Path $dest $_.Name
-        if (Test-Path $vLink) {
-            Write-Host "keep   $vLink"
-        } else {
-            New-Item -ItemType Junction -Path $vLink -Target $_.FullName | Out-Null
-            Write-Host "link   $vLink"
-        }
+        Sync-SkillDir $_.FullName (Join-Path $dest $_.Name)
     }
 }
 
@@ -98,13 +141,23 @@ function Find-AicnTool([string]$Name) {
 
 $py = $env:AICN_PY
 if (-not $py) { $py = [Environment]::GetEnvironmentVariable("AICN_PY", "User") }
+$autoDetectedVenv = $false
 if (-not $py -or -not (Test-Path $py)) {
     foreach ($c in @(
         "C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe",
         (Join-Path $env:USERPROFILE "Tools\VieNeu-TTS\.venv\Scripts\python.exe")
     )) {
-        if (Test-Path $c) { $py = $c; break }
+        if (Test-Path $c) {
+            $py = $c
+            $autoDetectedVenv = $true
+            break
+        }
     }
+}
+if ($autoDetectedVenv) {
+    [Environment]::SetEnvironmentVariable("AICN_PY", $py, "User")
+    $env:AICN_PY = $py
+    Write-Host "env    AICN_PY -> $py"
 }
 if (-not $py) {
     $cmdPy = Get-Command python -ErrorAction SilentlyContinue
@@ -126,8 +179,24 @@ if ($missingTools.Count -gt 0) {
     Write-Host "hint   run '.\install.ps1 -InstallTools' to install portable ffmpeg/ffprobe, rubberband, and node into $localBin"
 }
 
+# Verify Antigravity skill discovery: all 6 skills must be real directories with SKILL.md
+$agyRoot = Join-Path $env:USERPROFILE ".gemini\config\skills"
+$expectedSkills = @("aicn") + @(Get-ChildItem (Join-Path $SK "vendor") -Directory | ForEach-Object { $_.Name })
+$okSkills = 0
+foreach ($s in $expectedSkills) {
+    $sDir = Join-Path $agyRoot $s
+    $sMd = Join-Path $sDir "SKILL.md"
+    $isReparse = (Test-Path -LiteralPath $sDir) -and (((Get-Item -LiteralPath $sDir -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    if ((Test-Path -LiteralPath $sMd) -and (-not $isReparse)) {
+        $okSkills++
+    } else {
+        throw "AGY skill check failed for '$s' at $sDir (missing SKILL.md or still a reparse point)"
+    }
+}
+Write-Host "ok     AGY skills ready ($okSkills/$($expectedSkills.Count) real dirs in $agyRoot)"
+
 if ($py -and (Test-Path $py)) {
-    $null = & $py (Join-Path $SK "scripts\aicn.py") --help
+    $null = & $py (Join-Path $agyRoot "aicn\scripts\aicn.py") --help
     if ($LASTEXITCODE -eq 0) {
         Write-Host "ok     aicn.py runs"
     } else {

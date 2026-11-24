@@ -35,8 +35,8 @@ bash ~/Work/AICN/skills/aicn/install.sh
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -InstallTools
 ```
 
-`install.sh` / `install.ps1` link the skill (and any vendored stage skill not already installed) into
-`~/.claude/skills/` and `~/.gemini/config/skills/` (using symlinks on POSIX and directory junctions on Windows). Existing folders are never overwritten.
+`install.sh` links the skill (and vendored stage skills) on macOS/Linux via symlinks.
+`install.ps1` installs **real directory copies** (not NTFS Junctions) into `~/.gemini/config/skills/` and `~/.claude/skills/` so Antigravity on Windows discovers all 6/6 skills (for both the main agent and sub-agents), upgrades any legacy junctions automatically, refreshes managed copies on re-run after `git pull`, and auto-configures `AICN_PY` when VieNeu-TTS is detected. Unmanaged existing folders are never overwritten unless `-Force` is passed.
 
 ## Requirements
 

@@ -16,10 +16,15 @@ import time
 import numpy as np
 import soundfile as sf
 
-ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
-for _p in (ORCH_SCRIPTS, AICN_SCRIPTS, os.path.dirname(os.path.abspath(__file__))):
-    if _p not in sys.path:
+_HERE = os.path.dirname(os.path.abspath(__file__))
+ORCH_SCRIPTS = os.path.abspath(os.path.join(_HERE, "..", "..", "video-localization-orchestrator", "scripts"))
+for _p in (
+    ORCH_SCRIPTS,
+    os.path.abspath(os.path.join(_HERE, "..", "..", "..", "scripts")),
+    os.path.abspath(os.path.join(_HERE, "..", "..", "aicn", "scripts")),
+    _HERE,
+):
+    if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 from cicd_gate import require_gate
 from verify_stage_3 import run_stage_3_verification

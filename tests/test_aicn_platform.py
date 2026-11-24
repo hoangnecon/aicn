@@ -114,6 +114,49 @@ class PlatformBackends(unittest.TestCase):
                 self.assertEqual(res["engine"], exp_eng)
                 self.assertEqual(res["device"], exp_dev)
 
+    def test_vendor_scripts_support_sibling_aicn_import(self):
+        """Copied standalone vendor skills (e.g. ~/.gemini/config/skills/<stage>/) must still import aicn_platform."""
+        import shutil
+        import subprocess
+        import tempfile
+
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        vendor_root = os.path.join(root, "vendor")
+        checked = 0
+        for skill in os.listdir(vendor_root):
+            sdir = os.path.join(vendor_root, skill, "scripts")
+            if not os.path.isdir(sdir):
+                continue
+            for fn in os.listdir(sdir):
+                if not fn.endswith(".py"):
+                    continue
+                p = os.path.join(sdir, fn)
+                with open(p, encoding="utf-8") as fh:
+                    src = fh.read()
+                if "import aicn_platform" in src:
+                    checked += 1
+                    self.assertIn('"aicn", "scripts"', src, f"{p} missing sibling aicn/scripts fallback")
+        self.assertGreaterEqual(checked, 10)
+
+        with tempfile.TemporaryDirectory() as td:
+            shutil.copytree(os.path.join(root, "scripts"), os.path.join(td, "aicn", "scripts"))
+            shutil.copytree(
+                os.path.join(vendor_root, "video-localization-orchestrator"),
+                os.path.join(td, "video-localization-orchestrator"),
+            )
+            script = os.path.join(td, "video-localization-orchestrator", "scripts", "init_workspace.py")
+            res = subprocess.run(
+                [
+                    sys.executable, "-c",
+                    f"import importlib.util; spec = importlib.util.spec_from_file_location('iw', r'{script}'); "
+                    "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); "
+                    "assert m.ap is not None, 'ap was None'; print('OK', m.ap.__file__)",
+                ],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("OK", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

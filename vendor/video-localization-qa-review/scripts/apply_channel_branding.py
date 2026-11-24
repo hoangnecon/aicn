@@ -17,9 +17,13 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from scipy import ndimage
 
-AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
-if AICN_SCRIPTS not in sys.path:
-    sys.path.insert(0, AICN_SCRIPTS)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (
+    os.path.abspath(os.path.join(_HERE, "..", "..", "..", "scripts")),
+    os.path.abspath(os.path.join(_HERE, "..", "..", "aicn", "scripts")),
+):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 try:
     import aicn_platform as ap
 except ImportError:

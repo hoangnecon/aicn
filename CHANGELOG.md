@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.1 (2026-11-24)
+- **Windows Antigravity (AGY) 6/6 Skill Discovery & Standalone Vendor Imports**:
+  - Updated `install.ps1` to install **real directory copies** (replacing NTFS Junctions) into `%USERPROFILE%\.gemini\config\skills\` and `%USERPROFILE%\.claude\skills\` so Antigravity on Windows natively discovers all 6/6 skills (`aicn` + all 5 vendored stage skills) for both the main agent and sub-agents.
+  - Added `.aicn-managed` sync tracking so re-running `.\install.ps1` after `git pull` refreshes managed copies safely (never overwriting unrelated user folders unless `-Force` is passed), auto-persists `AICN_PY` when VieNeu-TTS is detected, and verifies all 6 AGY real-dir skills on exit.
+  - Updated all 10 `vendor/*/scripts/*.py` modules to resolve `aicn_platform.py` from both `../../../scripts` (in-repo) and `../../aicn/scripts` (standalone sibling install under `~/.gemini/config/skills/`).
+  - Added regression test in `tests/test_aicn_platform.py` verifying standalone sibling vendor imports.
+
 ## 2.1.0 (2026-11-24)
 - **Windows 10/11 + NVIDIA CUDA Support & Cross-Platform Architecture (`scripts/aicn_platform.py`)**:
   - Added stdlib-only `scripts/aicn_platform.py` centralizing OS/CPU/RAM/GPU detection (Apple Silicon Metal + NVIDIA CUDA), cross-platform file locking (`fcntl.flock` on POSIX, `msvcrt.locking` + `threading.Lock` on Windows), tool/Python discovery (`AICN_PY`, `~/.local/bin`, `/opt/homebrew/bin`, `imageio_ffmpeg` fallback), POSIX path normalization & concat escaping, video encoder backend selection (`videotoolbox` | `nvenc` | `cpu` with functional 1-frame NVENC check and no `-hwaccel cuda` before CPU overlay), and ASR/Demucs backend dispatch (`mlx` | `faster-cuda` | `faster-cpu`; `mlx` | `torch-cuda` | `torch-cpu`).

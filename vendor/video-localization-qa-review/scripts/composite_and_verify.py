@@ -15,10 +15,14 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-AICN_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"))
-for _p in (ORCH_SCRIPTS, AICN_SCRIPTS):
-    if _p not in sys.path:
+_HERE = os.path.dirname(os.path.abspath(__file__))
+ORCH_SCRIPTS = os.path.abspath(os.path.join(_HERE, "..", "..", "video-localization-orchestrator", "scripts"))
+for _p in (
+    ORCH_SCRIPTS,
+    os.path.abspath(os.path.join(_HERE, "..", "..", "..", "scripts")),
+    os.path.abspath(os.path.join(_HERE, "..", "..", "aicn", "scripts")),
+):
+    if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 from cicd_gate import require_gate, sha256_file
 try:

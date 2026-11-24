@@ -16,9 +16,12 @@ import sys
 from datetime import datetime
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-AICN_SCRIPTS = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "scripts"))
-for _p in (_HERE, AICN_SCRIPTS):
-    if _p not in sys.path:
+for _p in (
+    _HERE,
+    os.path.abspath(os.path.join(_HERE, "..", "..", "..", "scripts")),
+    os.path.abspath(os.path.join(_HERE, "..", "..", "aicn", "scripts")),
+):
+    if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 from cicd_gate import write_gate_token, sha256_file
 try:

@@ -243,6 +243,71 @@ class Signal(unittest.TestCase):
             res = run_stage_3_verification(d)
             self.assertEqual(res["status"], "PASS")
 
+    def test_apply_hp_lp_and_hangover_hold(self):
+        t = np.arange(self.sr) / self.sr
+        sub = (0.4 * np.sin(2 * np.pi * 40 * t)).astype(np.float32)
+        mid = (0.4 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+        hi = (0.4 * np.sin(2 * np.pi * 17000 * t)).astype(np.float32)
+        y_sub = self.m.apply_hp_lp(sub, hp_hz=120.0, lp_hz=12000.0)
+        y_mid = self.m.apply_hp_lp(mid, hp_hz=120.0, lp_hz=12000.0)
+        y_hi = self.m.apply_hp_lp(hi, hp_hz=120.0, lp_hz=12000.0)
+        self.assertLess(np.sqrt(np.mean(y_sub[4000:] ** 2)), 0.08)
+        self.assertGreater(np.sqrt(np.mean(y_mid[4000:] ** 2)), 0.25)
+        self.assertLess(np.sqrt(np.mean(y_hi[4000:] ** 2)), 0.12)
+
+        # Hangover hold bridges short 20-frame (0.2s) gap, leaves 80-frame (0.8s) gap open
+        m = np.zeros(160, dtype=bool)
+        m[10:30] = True
+        m[50:70] = True
+        m[145:155] = True
+        held = self.m.hangover_hold(m, fps=100.0, hold_s=0.35)
+        self.assertTrue(held[30:50].all())
+        self.assertFalse(held[70:145].any())
+
+    def test_analyze_writes_spectral_json_and_adapts_cutoffs(self):
+        sys.path.insert(0, SCRIPTS)
+        import aicn
+        with tempfile.TemporaryDirectory() as d:
+            for sub in ("data", "media/stems", "media/audio"):
+                os.makedirs(os.path.join(d, sub), exist_ok=True)
+            t = np.arange(self.sr * 2) / self.sr
+            rumble_voc = (0.35 * np.sin(2 * np.pi * 60 * t) + 0.15 * np.sin(2 * np.pi * 900 * t)).astype(np.float32)
+            soundfile.write(os.path.join(d, "media/stems/vocals.wav"), np.stack([rumble_voc, rumble_voc], axis=1), self.sr)
+            acc = (0.2 * np.sin(2 * np.pi * 400 * t)).astype(np.float32)
+            soundfile.write(os.path.join(d, "media/stems/accomp.wav"), np.stack([acc, acc], axis=1), self.sr)
+            soundfile.write(os.path.join(d, "media/audio/dub_voice_48k.wav"), self.tone(2.0), self.sr)
+            aicn.jdump(os.path.join(d, "data/00_video_profile.json"), {"duration": 2.0, "localization_mode": "voice_dub"})
+            self.m.cmd_analyze(d, dict(self.m.DEFAULTS), aicn.FastHash(d))
+            spec = aicn.jload(os.path.join(d, "data/03_spectral_analysis.json"))
+            self.assertIn("vocals", spec["stems"])
+            self.assertIn("accomp", spec["stems"])
+            self.assertIn("dub", spec["stems"])
+            self.assertGreaterEqual(spec["filter_plan"]["vocal_hp_hz"], 130.0)
+
+    def test_stage1_detects_whisper_and_telephony_phone_call_bursts(self):
+        v1_dir = os.path.join(HERE, "..", "vendor", "video-asr-visual-audit", "scripts")
+        sys.path.insert(0, v1_dir)
+        import analyze_voice_waveform as avw
+        sr16 = 16000
+        t1 = np.arange(sr16 * 1) / sr16
+        rng = np.random.default_rng(42)
+        # 1) 0..1s silence, 1..2s soft breathy whisper in vocals, 2..3s silence, 3..4s pure phone call (vocals=0, raw_tel=phone speech)
+        sil = np.zeros(sr16, dtype=np.float32)
+        whisper = (0.008 * np.sin(2 * np.pi * 1400 * t1) + 0.005 * rng.standard_normal(sr16)).astype(np.float32)
+        phone_tone = (0.04 * np.sin(2 * np.pi * 1200 * t1) + 0.03 * np.sin(2 * np.pi * 2100 * t1)).astype(np.float32)
+
+        voc = np.concatenate([sil, whisper, sil, sil])
+        raw = np.concatenate([sil, whisper, sil, phone_tone])
+        raw_tel = raw.copy()
+        tel_norm = np.concatenate([sil, whisper * 20.0, sil, phone_tone * 6.0])
+        _, bursts = avw.compute_voice_mask_and_bursts(voc, tel_norm, raw_tel_arr=raw_tel, raw_arr=raw, sr=sr16)
+        kinds = [b["kind"] for b in bursts]
+        self.assertIn("whisper", kinds, bursts)
+        self.assertIn("phone_call", kinds, bursts)
+        prof = avw.compute_audio_spectral_profile(raw, sr=sr16)
+        self.assertIn("recommended_hp_hz", prof)
+        self.assertGreater(prof["frequency_bands_pct"]["speech_300_3400hz"], 50.0)
+
 
 if __name__ == "__main__":
     unittest.main()

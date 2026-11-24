@@ -25,7 +25,7 @@ import aicn  # noqa: E402  (jload, jdump, h_obj, FastHash, cicd)
 import aicn_platform as ap  # noqa: E402
 
 SR = 48000
-AUDIO_VERSION = "aicn-audio-1.1"
+AUDIO_VERSION = "aicn-audio-1.2"
 STEMS_VERSION = "aicn-audio-1.0"  # unchanged Demucs separation; keep cache-compatible with v1.2.x stems
 DEFAULTS = {
     "voice": "Trúc Ly",
@@ -36,11 +36,14 @@ DEFAULTS = {
     "max_tempo": 1.25,                          # rubberband R3, formant preserved
     "lead_gap_s": 0.10,                         # keep this much silence before the next sentence
     "expander_thresh_db": -50.0, "expander_depth_db": -15.0,   # removes the TTS hiss floor between words
-    "dub_over_vocal_lu": 1.0,                   # dub loudness relative to the original vocal stem
-    "snr_vocal_db": 10.0, "snr_bgm_db": 6.0,    # wanted dub-to-original ratio per band while the dub talks
-    "floor_vocal_db": -18.0, "floor_bgm_db": -9.0,   # the original is never turned down further than this
-    "base_vocal_db": -4.0,                      # broadband dip of the original voice while the dub talks
-    "attack_s": 0.02, "release_s": 0.25,
+    "dub_over_vocal_lu": 1.5,                   # dub loudness relative to the original vocal stem
+    "snr_vocal_db": 12.0, "snr_bgm_db": 6.0,    # wanted dub-to-original ratio per band while the dub talks
+    "floor_vocal_db": -20.0, "floor_bgm_db": -9.0,   # the original is never turned down further than this
+    "base_vocal_db": -6.5,                      # gentler broadband dip of original voice while keeping SFX natural
+    "attack_s": 0.02, "hold_s": 0.35, "release_s": 0.42,   # hold + slower release eliminate inter-clause pumping
+    "dub_hp_hz": 90.0, "dub_lp_hz": 16000.0,    # pre-mix HP/LP conditioning for dubbed voice
+    "vocal_hp_hz": 120.0, "vocal_lp_hz": 12000.0,   # carve chest thump & harsh sibilants from original vocal stem
+    "bgm_hp_hz": 35.0, "bgm_lp_hz": 18500.0,    # keep SFX/foley/music warm & full-bodied, strip subsonic DC only
     "target_lufs": -14.0, "true_peak_db": -1.0, "lra": 11.0,
     "master_mode": "fast",                      # fast (ebur128+alimiter, ~4s, 28x faster) | loudnorm (legacy 192kHz 2-pass, ~115s)
     "demucs_model": "htdemucs",
@@ -354,10 +357,164 @@ BAND_W = np.array([0.3, 0.5, 0.8, 1, 1, 1, 1, 1, 1, 0.8, 0.5, 0.3])   # speech b
 SPEECH = slice(3, 9)   # 500 Hz - 5 kHz
 
 
-def voice_chain(x):
+SPEC_BANDS = [
+    ("sub_rumble", 0, 80),
+    ("bass_warmth", 80, 150),
+    ("low_body", 150, 300),
+    ("box_mud", 300, 500),
+    ("vocal_fund", 500, 2000),
+    ("presence", 2000, 5000),
+    ("sibilance", 5000, 8000),
+    ("air", 8000, 16000),
+    ("ultrasonic", 16000, 24001),
+]
+
+
+def apply_hp_lp(x, hp_hz=0.0, lp_hz=0.0, order=2):
+    """Apply clean Butterworth high-pass and/or low-pass conditioning along time axis 0."""
     from scipy.signal import butter, sosfilt
-    x = np.asarray(x, dtype=np.float32)
-    x = sosfilt(butter(2, 90, "hp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
+    y = np.asarray(x, dtype=np.float32)
+    nyq = 0.5 * SR
+    if hp_hz and 1.0 < float(hp_hz) < nyq * 0.95:
+        sos_hp = butter(order, float(hp_hz), "hp", fs=SR, output="sos").astype(np.float32)
+        y = sosfilt(sos_hp, y, axis=0).astype(np.float32)
+    if lp_hz and 10.0 < float(lp_hz) < nyq * 0.98:
+        sos_lp = butter(order, float(lp_hz), "lp", fs=SR, output="sos").astype(np.float32)
+        y = sosfilt(sos_lp, y, axis=0).astype(np.float32)
+    return y
+
+
+def hangover_hold(mask, fps, hold_s):
+    """Bridge brief inactive gaps shorter than hold_s so ducking envelopes do not pump between clauses."""
+    m = np.asarray(mask, dtype=bool)
+    hold_frames = int(round(max(0.0, float(hold_s)) * fps))
+    if hold_frames <= 1 or m.size == 0:
+        return m
+    out = m.copy()
+    if out.ndim == 1:
+        idx = np.flatnonzero(m)
+        for a, b in zip(idx[:-1], idx[1:]):
+            if (b - a - 1) <= hold_frames:
+                out[a:b] = True
+        return out
+    for r in range(out.shape[0]):
+        idx = np.flatnonzero(m[r])
+        for a, b in zip(idx[:-1], idx[1:]):
+            if (b - a - 1) <= hold_frames:
+                out[r, a:b] = True
+    return out
+
+
+def spectral_profile(x, sr=SR):
+    """Measure multi-band spectral share, centroid, RMS/Peak dBFS, and crest factor."""
+    from scipy.signal import stft
+    arr = np.asarray(x, dtype=np.float32)
+    mono = arr if arr.ndim == 1 else arr.mean(axis=1)
+    if len(mono) < NFFT:
+        mono = np.pad(mono, (0, NFFT - len(mono)))
+    rms = float(np.sqrt(np.mean(mono ** 2) + 1e-12))
+    peak = float(np.max(np.abs(mono)) + 1e-12)
+    rms_db = round(20.0 * np.log10(rms), 2)
+    peak_db = round(20.0 * np.log10(peak), 2)
+    crest_db = round(peak_db - rms_db, 2)
+    f, _, Z = stft(mono, sr, nperseg=NFFT, noverlap=NFFT - HOP)
+    mag2 = (Z.real * Z.real + Z.imag * Z.imag).mean(axis=1)
+    tot = float(mag2.sum() + 1e-15)
+    bands_pct = {}
+    bands_db = {}
+    for name, lo, hi in SPEC_BANDS:
+        sel = (f >= lo) & (f < hi)
+        p = float(mag2[sel].sum()) if sel.any() else 0.0
+        bands_pct[name] = round(100.0 * p / tot, 2)
+        bands_db[name] = round(10.0 * np.log10(p / tot + 1e-12), 2)
+    centroid_hz = round(float((f * mag2).sum() / tot), 1)
+    return {
+        "rms_dbfs": rms_db,
+        "peak_dbfs": peak_db,
+        "crest_factor_db": crest_db,
+        "spectral_centroid_hz": centroid_hz,
+        "bands_pct": bands_pct,
+        "bands_rel_db": bands_db,
+    }
+
+
+def resolve_spectral_plan(stems_profiles, c):
+    """Derive adaptive HP/LP cutoffs and subtle mud trim from spectral analysis + user overrides."""
+    dub_p = stems_profiles.get("dub", {})
+    voc_p = stems_profiles.get("vocals", {})
+    acc_p = stems_profiles.get("accomp", {})
+
+    dub_hp = float(c.get("dub_hp_hz", DEFAULTS["dub_hp_hz"]))
+    if dub_p.get("bands_pct", {}).get("sub_rumble", 0.0) > 1.5 and dub_hp == DEFAULTS["dub_hp_hz"]:
+        dub_hp = max(dub_hp, 100.0)
+    dub_lp = float(c.get("dub_lp_hz", DEFAULTS["dub_lp_hz"]))
+    mud_pct = dub_p.get("bands_pct", {}).get("box_mud", 0.0)
+    dub_mud_cut_db = -1.5 if mud_pct > 28.0 else 0.0
+
+    voc_hp = float(c.get("vocal_hp_hz", DEFAULTS["vocal_hp_hz"]))
+    if voc_p.get("bands_pct", {}).get("sub_rumble", 0.0) + voc_p.get("bands_pct", {}).get("bass_warmth", 0.0) > 8.0:
+        voc_hp = max(voc_hp, 130.0)
+    voc_lp = float(c.get("vocal_lp_hz", DEFAULTS["vocal_lp_hz"]))
+    if voc_p.get("bands_pct", {}).get("sibilance", 0.0) + voc_p.get("bands_pct", {}).get("air", 0.0) > 14.0:
+        voc_lp = min(voc_lp, 11000.0)
+
+    bgm_hp = float(c.get("bgm_hp_hz", DEFAULTS["bgm_hp_hz"]))
+    bgm_lp = float(c.get("bgm_lp_hz", DEFAULTS["bgm_lp_hz"]))
+    return {
+        "dub_hp_hz": round(dub_hp, 1),
+        "dub_lp_hz": round(dub_lp, 1),
+        "dub_mud_cut_db": dub_mud_cut_db,
+        "vocal_hp_hz": round(voc_hp, 1),
+        "vocal_lp_hz": round(voc_lp, 1),
+        "bgm_hp_hz": round(bgm_hp, 1),
+        "bgm_lp_hz": round(bgm_lp, 1),
+        "bgm_sub_rumble_pct": acc_p.get("bands_pct", {}).get("sub_rumble", 0.0),
+    }
+
+
+def analyze_stems_and_dub(ws, c, V=None, B=None, T=None):
+    """Run frequency analysis on stems + dub and save data/03_spectral_analysis.json."""
+    stems_dir = os.path.join(ws, "media", "stems")
+    profiles = {}
+    if V is None and os.path.exists(os.path.join(stems_dir, "vocals.wav")):
+        V = sf.read(os.path.join(stems_dir, "vocals.wav"), dtype="float32", always_2d=True)[0]
+    if B is None and os.path.exists(os.path.join(stems_dir, "accomp.wav")):
+        B = sf.read(os.path.join(stems_dir, "accomp.wav"), dtype="float32", always_2d=True)[0]
+    dub_p = os.path.join(ws, "media", "audio", "dub_voice_48k.wav")
+    if T is None and os.path.exists(dub_p):
+        T = sf.read(dub_p, dtype="float32")[0]
+    if V is not None and len(V):
+        profiles["vocals"] = spectral_profile(V)
+    if B is not None and len(B):
+        profiles["accomp"] = spectral_profile(B)
+    if T is not None and len(T):
+        profiles["dub"] = spectral_profile(T)
+    if not profiles and os.path.exists(source_path(ws) or ""):
+        profiles["source"] = spectral_profile(load(source_path(ws)))
+    plan = resolve_spectral_plan(profiles, c)
+    report = {
+        "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": AUDIO_VERSION,
+        "stems": profiles,
+        "filter_plan": plan,
+    }
+    aicn.jdump(os.path.join(ws, "data", "03_spectral_analysis.json"), report)
+    return report
+
+
+def cmd_analyze(ws, c, fh):
+    rep = analyze_stems_and_dub(ws, c)
+    fp = rep["filter_plan"]
+    print(f"[analyze] saved data/03_spectral_analysis.json | dub HP/LP={fp['dub_hp_hz']}/{fp['dub_lp_hz']} Hz, "
+          f"vocal HP/LP={fp['vocal_hp_hz']}/{fp['vocal_lp_hz']} Hz, bgm HP/LP={fp['bgm_hp_hz']}/{fp['bgm_lp_hz']} Hz")
+
+
+def voice_chain(x, hp_hz=90.0, lp_hz=16000.0, mud_cut_db=0.0):
+    from scipy.signal import butter, sosfilt
+    x = apply_hp_lp(x, hp_hz=hp_hz, lp_hz=lp_hz, order=2)
+    if mud_cut_db < -0.1:
+        mud = sosfilt(butter(2, [300, 500], "bp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
+        x = x - np.float32(1.0 - 10.0 ** (mud_cut_db / 20.0)) * mud
     pres = sosfilt(butter(2, [2200, 4500], "bp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
     hi = sosfilt(butter(2, 8000, "hp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
     x = x + np.float32(0.33) * pres - np.float32(0.2) * hi
@@ -432,15 +589,23 @@ def cmd_mix(ws, c, fh):
     T = sf.read(os.path.join(ws, "media", "audio", "dub_voice_48k.wav"), dtype="float32")[0]
     T = np.pad(T, (0, max(0, n - len(T))))[:n]
     t0 = time.time()
-    T = voice_chain(T)
+    spec_rep = analyze_stems_and_dub(ws, c, V=V, B=B, T=T)
+    fp = spec_rep["filter_plan"]
+    V = apply_hp_lp(V, hp_hz=fp["vocal_hp_hz"], lp_hz=fp["vocal_lp_hz"], order=2)
+    B = apply_hp_lp(B, hp_hz=fp["bgm_hp_hz"], lp_hz=fp["bgm_lp_hz"], order=2)
+    T = voice_chain(T, hp_hz=fp["dub_hp_hz"], lp_hz=fp["dub_lp_hz"], mud_cut_db=fp["dub_mud_cut_db"])
     lv = lufs(V); gain = lv + c["dub_over_vocal_lu"] - lufs(T[:, None]); T = T * np.float32(10 ** (gain / 20))
     idx, band_of_bin = _band_indices()
     PT, _, _ = stft_and_power(T, idx)
     PV, ZV, _ = stft_and_power(V, idx)
     PB, ZB, _ = stft_and_power(B, idx)
     fps = SR / HOP; W = BAND_W[:, None]
-    active = PT > PT.max(1, keepdims=True) * 10 ** (-45 / 10)
-    tot = PT.sum(0); talk = follow((tot > tot.max() * 1e-4).astype(float)[None], fps, c["attack_s"], 0.3)[0]
+    hold_s = float(c.get("hold_s", 0.35))
+    raw_active = PT > PT.max(1, keepdims=True) * 10 ** (-45 / 10)
+    active = hangover_hold(raw_active, fps, hold_s * 0.6)
+    tot = PT.sum(0)
+    talk_mask = hangover_hold(tot > tot.max() * 1e-4, fps, hold_s)
+    talk = follow(talk_mask.astype(float)[None], fps, c["attack_s"], max(c["release_s"], 0.40))[0]
 
     def need(Pc, snr, floor):
         g = np.sqrt(np.clip(PT / (Pc * 10 ** (snr / 10) + 1e-12), 10 ** (floor / 10), 1.0))
@@ -461,7 +626,8 @@ def cmd_mix(ws, c, fh):
              "orig_vocal_atten_db_median_during_dub": round(float(np.median(20 * np.log10(gV[SPEECH][:, on].mean(0)))), 2) if on.any() else 0,
              "orig_vocal_atten_db_min": round(float(20 * np.log10(gV.min())), 2),
              "bgm_atten_db_median_during_dub": round(float(np.median(20 * np.log10(gB[SPEECH][:, on].mean(0)))), 2) if on.any() else 0,
-             "bgm_atten_db_min": round(float(20 * np.log10(gB.min())), 2), "seconds": round(time.time() - t0, 1)}
+             "bgm_atten_db_min": round(float(20 * np.log10(gB.min())), 2),
+             "filter_plan": fp, "seconds": round(time.time() - t0, 1)}
     aicn.jdump(os.path.join(ws, "data", "03_mix_stats.json"), stats)
     print("[mix] " + json.dumps(stats))
 
@@ -491,11 +657,34 @@ def write_sub_only_alignment(ws):
 
 def write_stage3_report(ws, mode, checks, c):
     """Write 03_pacing_and_audio_report.md so verify_stage_3.py always hashes an up-to-date report."""
+    spec = aicn.jload(os.path.join(ws, "data", "03_spectral_analysis.json"), {}) or {}
+    fp = spec.get("filter_plan", {})
+    stems = spec.get("stems", {})
     lines = [
         f"# Stage 3 Pacing & Audio Report ({mode})",
         "",
         f"- Engine: `{AUDIO_VERSION}`",
         f"- Target loudness: `{c['target_lufs']} LUFS`, peak `<= {c['true_peak_db']} dBFS`",
+    ]
+    if fp:
+        lines += [
+            "",
+            "## Frequency Analysis & Pre-Mix HP/LP Conditioning (`data/03_spectral_analysis.json`)",
+            f"- Dub HP/LP: `{fp.get('dub_hp_hz')} Hz` / `{fp.get('dub_lp_hz')} Hz` (mud trim `{fp.get('dub_mud_cut_db', 0.0)} dB`)",
+            f"- Original Vocal HP/LP: `{fp.get('vocal_hp_hz')} Hz` / `{fp.get('vocal_lp_hz')} Hz`, base dip `{c.get('base_vocal_db')} dB`",
+            f"- SFX/Music HP/LP: `{fp.get('bgm_hp_hz')} Hz` / `{fp.get('bgm_lp_hz')} Hz`, envelope hold `{c.get('hold_s', 0.35)}s`, release `{c.get('release_s')}s`",
+        ]
+        for sname in ("vocals", "accomp", "dub"):
+            sp = stems.get(sname)
+            if sp:
+                bp = sp.get("bands_pct", {})
+                lines.append(
+                    f"- Stem `{sname}`: RMS `{sp.get('rms_dbfs')} dBFS`, centroid `{sp.get('spectral_centroid_hz')} Hz`, "
+                    f"sub<150Hz `{bp.get('sub_rumble', 0) + bp.get('bass_warmth', 0):.1f}%`, "
+                    f"speech500-5k `{bp.get('vocal_fund', 0) + bp.get('presence', 0):.1f}%`, "
+                    f"high>5k `{bp.get('sibilance', 0) + bp.get('air', 0):.1f}%`"
+                )
+    lines += [
         "",
         "## Audio Gate Checks",
         "",
@@ -618,12 +807,12 @@ def cmd_verify(ws, c, fh):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["separate", "dub", "mix", "master", "verify", "all"])
+    ap.add_argument("cmd", choices=["separate", "dub", "analyze", "mix", "master", "verify", "all"])
     ap.add_argument("--unit", required=True)
     a = ap.parse_args()
     ws = os.path.abspath(a.unit); c = cfg(ws); fh = aicn.FastHash(ws)
     mode = profile(ws).get("localization_mode", "voice_dub")
-    steps = {"separate": [cmd_separate], "dub": [cmd_dub], "mix": [cmd_mix], "master": [cmd_master], "verify": [cmd_verify],
+    steps = {"separate": [cmd_separate], "dub": [cmd_dub], "analyze": [cmd_analyze], "mix": [cmd_mix], "master": [cmd_master], "verify": [cmd_verify],
              "all": ([cmd_master, cmd_verify] if mode == "sub_only" else [cmd_separate, cmd_dub, cmd_mix, cmd_master, cmd_verify])}
     for f in steps[a.cmd]:
         f(ws, c, fh)

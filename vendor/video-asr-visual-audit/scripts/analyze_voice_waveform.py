@@ -46,15 +46,81 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def compute_voice_mask_and_bursts(voc_arr: np.ndarray, tel_arr: np.ndarray, sr: int = 16000):
+def compute_audio_spectral_profile(audio_arr: np.ndarray, sr: int = 16000) -> dict:
+    """Compute 5-band frequency share, spectral centroid, waveform RMS/Peak/Crest, and HP/LP hints."""
+    x = np.asarray(audio_arr, dtype=np.float32)
+    if x.size == 0:
+        return {}
+    rms = float(np.sqrt(np.mean(x ** 2) + 1e-12))
+    peak = float(np.max(np.abs(x)) + 1e-12)
+    rms_db = round(20.0 * np.log10(rms), 2)
+    peak_db = round(20.0 * np.log10(peak), 2)
+    crest_db = round(peak_db - rms_db, 2)
+
+    win = min(len(x), 4096)
+    n_blocks = max(1, len(x) // win)
+    blk = x[: n_blocks * win].reshape(n_blocks, win)
+    hann = np.hanning(win).astype(np.float32)[None, :]
+    spec = np.fft.rfft(blk * hann, axis=1)
+    mag2 = (spec.real ** 2 + spec.imag ** 2).mean(axis=0)
+    freqs = np.fft.rfftfreq(win, 1.0 / sr)
+    tot = float(mag2.sum() + 1e-15)
+
+    def band_pct(lo, hi):
+        m = (freqs >= lo) & (freqs < hi)
+        return round(100.0 * float(mag2[m].sum()) / tot, 2) if m.any() else 0.0
+
+    sub_pct = band_pct(0, 120)
+    low_pct = band_pct(120, 300)
+    speech_pct = band_pct(300, 3400)
+    pres_pct = band_pct(3400, 6500)
+    air_pct = band_pct(6500, sr / 2.0 + 1)
+    centroid_hz = round(float((freqs * mag2).sum() / tot), 1)
+    rec_hp = 110 if sub_pct > 18.0 else (95 if sub_pct > 10.0 else 85)
+    rec_lp = 11500 if air_pct > 12.0 else 14500
+
+    return {
+        "waveform": {
+            "rms_dbfs": rms_db,
+            "peak_dbfs": peak_db,
+            "crest_factor_db": crest_db,
+        },
+        "frequency_bands_pct": {
+            "sub_lt120hz": sub_pct,
+            "low_mid_120_300hz": low_pct,
+            "speech_300_3400hz": speech_pct,
+            "presence_3400_6500hz": pres_pct,
+            "air_gt6500hz": air_pct,
+        },
+        "spectral_centroid_hz": centroid_hz,
+        "recommended_hp_hz": rec_hp,
+        "recommended_lp_hz": rec_lp,
+    }
+
+
+def compute_voice_mask_and_bursts(
+    voc_arr: np.ndarray,
+    tel_arr: np.ndarray,
+    raw_tel_arr: np.ndarray = None,
+    raw_arr: np.ndarray = None,
+    sr: int = 16000,
+):
     hop = int(0.05 * sr)
-    n_hops = min(len(voc_arr), len(tel_arr)) // hop
+    lens = [len(voc_arr), len(tel_arr)]
+    if raw_tel_arr is not None:
+        lens.append(len(raw_tel_arr))
+    if raw_arr is not None:
+        lens.append(len(raw_arr))
+    n_hops = min(lens) // hop
     voice_mask = np.zeros(n_hops, dtype=bool)
     raw_bursts = []
     in_burst = False
     b_st = 0.0
     b_peak_voc = 0.0
     b_peak_tel = 0.0
+    b_phone_hits = 0
+    b_whisper_hits = 0
+    b_normal_hits = 0
 
     for i in range(n_hops):
         t = i * 0.05
@@ -63,37 +129,82 @@ def compute_voice_mask_and_bursts(voc_arr: np.ndarray, tel_arr: np.ndarray, sr: 
         v_rms = float(np.sqrt(np.mean(vc ** 2)))
         t_rms = float(np.sqrt(np.mean(tc ** 2)))
         zcr = float(np.mean(np.abs(np.diff(np.sign(vc)))) / 2.0)
-        is_voice = (v_rms > 0.018 and 0.02 <= zcr <= 0.30) or (t_rms > 0.12 and v_rms > 0.008 and 0.02 <= zcr <= 0.32)
+
+        rt_rms = float(np.sqrt(np.mean(raw_tel_arr[i * hop:(i + 1) * hop] ** 2))) if raw_tel_arr is not None else 0.0
+        r_rms = float(np.sqrt(np.mean(raw_arr[i * hop:(i + 1) * hop] ** 2))) if raw_arr is not None else max(v_rms, 1e-6)
+        tel_ratio = rt_rms / (r_rms + 1e-6)
+        t_zcr = float(np.mean(np.abs(np.diff(np.sign(tc)))) / 2.0)
+
+        is_normal = (v_rms > 0.018 and 0.02 <= zcr <= 0.32)
+        is_whisper = (0.0055 <= v_rms <= 0.018 and 0.02 <= zcr <= 0.45)
+        if raw_tel_arr is not None:
+            is_phone = (tel_ratio > 0.55 and rt_rms > 0.004 and rt_rms > v_rms * 1.35 and 0.02 <= t_zcr <= 0.36)
+        else:
+            is_phone = (t_rms > 0.12 and v_rms > 0.006 and 0.02 <= zcr <= 0.35)
+        is_voice = is_normal or is_whisper or is_phone
         voice_mask[i] = is_voice
 
-        is_strong_burst = (v_rms > 0.022 and 0.02 <= zcr <= 0.28) or (t_rms > 0.14 and v_rms > 0.010 and 0.02 <= zcr <= 0.30)
+        is_strong_burst = (
+            (v_rms > 0.020 and 0.02 <= zcr <= 0.30)
+            or is_whisper
+            or is_phone
+        )
         if is_strong_burst:
             if not in_burst:
                 in_burst = True
                 b_st = t
                 b_peak_voc = v_rms
                 b_peak_tel = t_rms
+                b_phone_hits = 1 if is_phone else 0
+                b_whisper_hits = 1 if (is_whisper and not is_normal) else 0
+                b_normal_hits = 1 if is_normal else 0
             else:
                 b_peak_voc = max(b_peak_voc, v_rms)
                 b_peak_tel = max(b_peak_tel, t_rms)
+                if is_phone:
+                    b_phone_hits += 1
+                if is_whisper and not is_normal:
+                    b_whisper_hits += 1
+                if is_normal:
+                    b_normal_hits += 1
         else:
             if in_burst:
                 b_et = t
-                if (b_et - b_st) >= 0.45:
+                if (b_et - b_st) >= 0.35:
+                    kind = "phone_call" if (b_phone_hits > b_normal_hits and b_phone_hits >= 3) else (
+                        "whisper" if (b_whisper_hits >= 3 and b_normal_hits == 0) else "normal"
+                    )
                     raw_bursts.append({
                         "start": round(b_st, 2),
                         "end": round(b_et, 2),
                         "peak_voc_rms": round(b_peak_voc, 4),
                         "peak_tel_rms": round(b_peak_tel, 4),
+                        "kind": kind,
                     })
                 in_burst = False
 
+    if in_burst:
+        b_et = round(n_hops * 0.05, 2)
+        if (b_et - b_st) >= 0.35:
+            kind = "phone_call" if (b_phone_hits > b_normal_hits and b_phone_hits >= 3) else (
+                "whisper" if (b_whisper_hits >= 3 and b_normal_hits == 0) else "normal"
+            )
+            raw_bursts.append({
+                "start": round(b_st, 2),
+                "end": round(b_et, 2),
+                "peak_voc_rms": round(b_peak_voc, 4),
+                "peak_tel_rms": round(b_peak_tel, 4),
+                "kind": kind,
+            })
+
     merged_bursts = []
     for b in raw_bursts:
-        if merged_bursts and (b["start"] - merged_bursts[-1]["end"]) <= 0.20:
+        if merged_bursts and (b["start"] - merged_bursts[-1]["end"]) <= 0.22:
             merged_bursts[-1]["end"] = b["end"]
             merged_bursts[-1]["peak_voc_rms"] = max(merged_bursts[-1]["peak_voc_rms"], b["peak_voc_rms"])
             merged_bursts[-1]["peak_tel_rms"] = max(merged_bursts[-1]["peak_tel_rms"], b["peak_tel_rms"])
+            if merged_bursts[-1].get("kind") == "normal" and b.get("kind") != "normal":
+                merged_bursts[-1]["kind"] = b["kind"]
         else:
             merged_bursts.append(dict(b))
 
@@ -345,12 +456,18 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         audio_src,
         af_filter="highpass=f=280,lowpass=f=3600,dynaudnorm=f=75:g=15:p=0.92:m=12.0",
     )
+    raw_arr = decode_audio_16k(audio_src)
+    raw_tel_arr = decode_audio_16k(audio_src, af_filter="highpass=f=300,lowpass=f=3400")
     if os.path.exists(vocals_path):
         voc_arr = decode_audio_16k(vocals_path)
     else:
-        voc_arr = decode_audio_16k(audio_src)
+        voc_arr = raw_arr
 
-    voice_mask, merged_bursts = compute_voice_mask_and_bursts(voc_arr, tel_arr, sr=16000)
+    voice_mask, merged_bursts = compute_voice_mask_and_bursts(
+        voc_arr, tel_arr, raw_tel_arr=raw_tel_arr, raw_arr=raw_arr, sr=16000
+    )
+    spectral_summary = compute_audio_spectral_profile(raw_arr, sr=16000)
+    vocal_spectral_summary = compute_audio_spectral_profile(voc_arr, sr=16000) if os.path.exists(vocals_path) else {}
     n_hops = len(voice_mask)
 
     bbox_path = os.path.join(data_dir, "01_zh_bbox_scan.json")
@@ -483,26 +600,42 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
                         })
                         break
 
-    # 3. Check acoustic voice bursts overlapping visual sub-clauses
+    # 3. Check acoustic voice bursts overlapping visual sub-clauses + quiet/whisper/phone bursts
     speech_bursts_covered = 0
     speech_bursts_total = 0
+    uncovered_acoustic_bursts = []
+    whisper_bursts_count = sum(1 for b in merged_bursts if b.get("kind") == "whisper")
+    phone_call_bursts_count = sum(1 for b in merged_bursts if b.get("kind") == "phone_call")
     for b in merged_bursts:
         bst, bet = b["start"], b["end"]
         bdur = bet - bst
         has_sub_clause = any(max(0.0, min(bet, sc["end"]) - max(bst, sc["start"])) >= 0.25 for sc in sub_clauses)
-        if has_sub_clause or b["peak_voc_rms"] >= 0.035:
+        ov = sum(max(0.0, min(bet, float(s["end"])) - max(bst, float(s["start"]))) for s in segs)
+        ov_ratio = ov / max(0.2, bdur)
+        if has_sub_clause or b["peak_voc_rms"] >= 0.035 or b.get("kind") in ("whisper", "phone_call"):
             speech_bursts_total += 1
-            ov = sum(max(0.0, min(bet, float(s["end"])) - max(bst, float(s["start"]))) for s in segs)
-            if (ov / max(0.2, bdur)) >= 0.40 or not has_sub_clause:
+            if ov_ratio >= 0.40 or (not has_sub_clause and b.get("kind") == "normal"):
                 speech_bursts_covered += 1
+            else:
+                uncovered_acoustic_bursts.append({**b, "coverage_ratio": round(ov_ratio, 3)})
 
     sc_ratio = (covered_cnt / len(sub_clauses)) if sub_clauses else 1.0
     ac_ratio = (speech_bursts_covered / speech_bursts_total) if speech_bursts_total else 1.0
+    seg_durs = [max(0.0, float(s["end"]) - float(s["start"])) for s in segs]
+    total_dur_min = max(0.01, float(profile.get("duration", n_hops * 0.05)) / 60.0)
+    active_voice_pct = round(100.0 * float(voice_mask.mean()), 2) if n_hops else 0.0
 
     report = {
         "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "target_segments_file": os.path.basename(target_segments_path),
         "total_segments_checked": len(segs),
+        "clause_cadence": {
+            "total_clauses": len(segs),
+            "clauses_per_min": round(len(segs) / total_dur_min, 2),
+            "median_clause_dur_s": round(float(np.median(seg_durs)), 2) if seg_durs else 0.0,
+            "p90_clause_dur_s": round(float(np.percentile(seg_durs, 90)), 2) if seg_durs else 0.0,
+            "short_clauses_lt1s": sum(1 for d in seg_durs if d < 1.0),
+        },
         "total_visual_sub_clauses": len(sub_clauses),
         "covered_visual_sub_clauses": covered_cnt,
         "sub_clause_coverage_ratio": round(sc_ratio, 4),
@@ -515,7 +648,14 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         "internal_blank_gap_segments_count": len(internal_blank_gap_segments),
         "internal_blank_gap_segments": internal_blank_gap_segments[:20],
         "acoustic_voice_bursts_count": len(merged_bursts),
+        "whisper_bursts_count": whisper_bursts_count,
+        "phone_call_bursts_count": phone_call_bursts_count,
+        "active_voice_pct": active_voice_pct,
         "acoustic_speech_coverage_ratio": round(ac_ratio, 4),
+        "uncovered_acoustic_bursts_count": len(uncovered_acoustic_bursts),
+        "uncovered_acoustic_bursts": uncovered_acoustic_bursts[:25],
+        "source_spectral_profile": spectral_summary,
+        "vocals_spectral_profile": vocal_spectral_summary,
     }
 
     out_audit = os.path.join(data_dir, "01_waveform_voice_audit.json")
@@ -523,7 +663,10 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         json.dump(report, f, ensure_ascii=False, indent=2)
 
     print(
-        f"[DONE] Waveform & Onset Audit: sub_clauses={covered_cnt}/{len(sub_clauses)} ({sc_ratio*100:.1f}%), "
+        f"[DONE] Waveform & Spectral Audit: clauses={len(segs)} ({report['clause_cadence']['clauses_per_min']}/min), "
+        f"sub_clauses={covered_cnt}/{len(sub_clauses)} ({sc_ratio*100:.1f}%), "
+        f"whispers={whisper_bursts_count}, phone_calls={phone_call_bursts_count}, uncovered_acoustic={len(uncovered_acoustic_bursts)}, "
+        f"HP/LP_hint={spectral_summary.get('recommended_hp_hz')}/{spectral_summary.get('recommended_lp_hz')}Hz, "
         f"bloated={len(bloated_segments)}, premature_lead={len(premature_lead_segments)}, "
         f"internal_blank_gaps={len(internal_blank_gap_segments)} -> {out_audit} in {time.time()-t0:.2f}s",
         flush=True,

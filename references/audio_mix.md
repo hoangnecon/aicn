@@ -1,14 +1,18 @@
 # Stage 3 audio: dub, mix, master
 
 Engine: `$AICN_PY <skill>/scripts/aicn_audio.py <step> --unit U` where `<step>` is
-`separate | dub | mix | master | verify | all`. Parameters live in `config/audio_mix.json`;
+`separate | dub | analyze | mix | master | verify | all`. Parameters live in `config/audio_mix.json`;
 anything missing falls back to `DEFAULTS` in the script.
 
 ## Goal
 
 The dub sits on top of the original film. The original voice, music and effects stay in
-the mix all the time. They are turned down only in the frequency bands the dub needs, only
-while the dub is speaking, and only as far as needed for the dub to be clearly heard.
+the mix all the time. Before mixing, `analyze` measures the 9-band spectral balance and
+RMS/crest profile of every stem (`data/03_spectral_analysis.json`) and sets clean
+High-Pass / Low-Pass conditioning so sub-rumble, chest thump, and harsh vocal sibilants
+never collide while foley/SFX (`accomp.wav`) stays full-bodied and natural. During mixing,
+the original voice stem is tucked smoothly (`base_vocal_db` `-6.5` dB, `12` dB SNR) with
+hangover hold (`0.35` s) and slower release (`0.42` s) to prevent inter-clause volume pumping.
 
 ## Steps
 
@@ -16,7 +20,8 @@ while the dub is speaking, and only as far as needed for the dub to be clearly h
 |---|---|---|---|
 | separate | Demucs `htdemucs` (`demucs-mlx` on macOS Metal, PyTorch `demucs` CUDA/CPU on Windows/Linux) splits the source into vocals and accompaniment (drums + bass + other) | `media/stems/{vocals,accomp}.wav`, `stems.json` | source sha256 + model |
 | dub | groups comma-chained clauses of one speaker into sentences, CPU `fp32` VieNeu TTS (default `tts_workers=2`, `tts_threads=4` for `>=8` jobs), cleans the hiss floor, time-stretches in parallel with rubberband R3 (formant preserved), places each sentence at its first clause, cuts it back into clauses | `media/audio/dub_voice_48k.wav`, `media/tts_segments/seg_NNNN.wav`, `data/03_aligned_subtitles.json`, `data/03_dub_sentences.json`, SRT | `.cache/tts_sent/<sha(text, voice, engine, temperature, top_k)>.wav` |
-| mix | voice chain on the dub, piped zero-disk LUFS level match, cached-Z `complex64` STFT/iSTFT per-band per-frame ducking of the original stems | `media/audio/premaster_48k.wav`, `data/03_mix_stats.json` | none (≈ 20.5 s compute per 10 min batch) |
+| analyze | 9-band spectral energy, centroid, crest factor & adaptive HP/LP cutoffs across `vocals.wav`, `accomp.wav`, and `dub_voice_48k.wav` (auto-runs inside `mix`) | `data/03_spectral_analysis.json` | none |
+| mix | HP/LP conditioning + voice chain on dub, piped zero-disk LUFS match, hangover-smoothed 12-band STFT/iSTFT ducking | `media/audio/premaster_48k.wav`, `data/03_mix_stats.json`, `data/03_spectral_analysis.json` | none |
 | master | glue compressor 2:1 + native 48 kHz EBU R128 linear gain + lookahead limiter (`master_mode="fast"`, ≈ 4.1 s vs 115 s legacy 192 kHz `loudnorm`) | `media/master_audio_48k.wav` (48 kHz, 24-bit) | none |
 | verify | audio gate + writes `03_pacing_and_audio_report.md`, then `verify_stage_3.py` signs Stage 3 | `data/03_mix_report.json`, `03_pacing_and_audio_report.md`, `.cicd/stage_3_gate.json` | n/a |
 
@@ -49,12 +54,16 @@ is below -50 dBFS.
 
 ## Mix algorithm
 
+- Spectral pre-pass (`analyze`): measures 9 frequency bands (`0–80`, `80–150`, `150–300`, `300–500`, `500–2k`, `2k–5k`, `5k–8k`, `8k–16k`, `16k–24k` Hz), spectral centroid, and crest factor; computes adaptive High-Pass / Low-Pass cutoffs:
+  - Dub (`dub_hp_hz = 90` Hz, `dub_lp_hz = 16000` Hz),
+  - Original vocal stem (`vocal_hp_hz = 120` Hz, `vocal_lp_hz = 12000` Hz — clears chest thump & harsh sibilants while leaving foley/SFX air in `accomp.wav`),
+  - Original SFX/Music stem (`bgm_hp_hz = 35` Hz, `bgm_lp_hz = 18500` Hz — subsonic DC safety only, keeps impacts & ambience intact).
 - STFT: 2048 points, hop 512 (about 10.7 ms), 12 bands with edges at 150, 300, 500, 800, 1.2k, 1.8k, 2.6k, 3.6k, 5k, 7k and 10 kHz.
-- Dub chain: high-pass at 90 Hz, +2.5 dB presence at 2.2–4.5 kHz, -2 dB above 8 kHz, 3:1 compression above -20 dBFS. The dub level is then matched to the original vocal stem LUFS + `dub_over_vocal_lu`.
-- For each band and frame where the dub is active, each original stem gets the gain that puts the dub `snr_*` dB above it. The gain is clipped to `floor_*`, so the original is never muted.
-- The original voice also gets a broadband dip of `base_vocal_db` while the dub talks.
-- Speech bands (500 Hz–5 kHz) get the full gain. Low and very high bands are relaxed (weight 0.3–0.8), which keeps the body of the original and the air in the room.
-- Gains follow an envelope: 20 ms down, 250 ms back up, so the original returns smoothly between sentences.
+- Dub chain: HP/LP, optional 300–500 Hz `-1.5 dB` mud trim if elevated, +2.5 dB presence at 2.2–4.5 kHz, -2 dB above 8 kHz, 3:1 compression above -20 dBFS, then LUFS matched to original vocal stem + `dub_over_vocal_lu` (`+1.5` LU).
+- For each band and frame where the dub is active, each original stem gets the gain that puts the dub `snr_*` dB above it (`snr_vocal_db = 12`, `snr_bgm_db = 6`), clipped to `floor_*` (`floor_vocal_db = -20`, `floor_bgm_db = -9`), so original sound effects are never muted.
+- The original voice also gets a broadband dip of `base_vocal_db` (`-6.5` dB) while the dub talks.
+- Speech bands (500 Hz–5 kHz) get full treatment; low and very high bands keep weight `0.3–0.8`.
+- **Anti-pumping hangover (`hold_s = 0.35` s) + envelope:** bridges micro-silences shorter than `0.35` s inside active speech, then follows `attack 20 ms` / `release 420 ms` so levels stay steady and never jump wildly between clauses.
 
 ## Gate (`verify`)
 

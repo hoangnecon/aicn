@@ -22,12 +22,13 @@ Separates the source audio into `media/demucs/vocals.wav` (clean speech for Whis
 Standard single-pass ASR on Demucs `vocals.wav` fails on **telephone calls, radio comms, PA broadcasts, whispers, and distant screams** because:
 1. `htdemucs` strips bandpass-filtered telephone/radio frequencies (`300–3400 Hz`) and heavy-SFX screams into `no_vocals.wav`.
 2. Default Silero VAD (`threshold=0.50`) drops low-energy whispers and muffled speech.
-- **Mandatory 2-Pass Solution (`run_asr_and_scan.py`):**
-  - **Pass 1 (Blended Acoustic Pass):** Blends `65%` clean `vocals.wav` + `35%` raw full-mix audio and runs `faster-whisper` with sensitive VAD (`threshold=0.28, min_speech_duration_ms=120, speech_pad_ms=220`).
-  - **Pass 2 (Hardsub-Guided Telephone/Whisper Gap Recovery):** Automatically extracts all contiguous visual hardsub intervals (`hardsub_intervals`, `dur >= 0.4s`, `height <= 60px`) from `01_zh_bbox_scan.json` and cross-checks them against Pass 1 ASR segments. For every visual hardsub interval missed by Pass 1:
-    1. Slices the raw source audio `[st-0.25s, et+0.25s]` and applies a **Telephone/Whisper Bandpass & Dynamic Gain Boost** (`highpass=f=200,lowpass=f=4000,dynaudnorm=f=75:g=15:p=0.92`).
+- **Mandatory Multi-Pass Solution (`run_asr_and_scan.py`):**
+  - **Pass 1 (Blended Acoustic Pass):** Blends `70%` clean `vocals.wav` + `30%` raw full-mix audio and runs `faster-whisper` with sensitive VAD (`threshold=0.25, min_speech_duration_ms=80, speech_pad_ms=180`).
+  - **Pass 2A (Hardsub-Guided Gap Recovery):** Automatically extracts all contiguous visual hardsub intervals (`hardsub_intervals`, `dur >= 0.4s`, `height <= 62px`) from `01_zh_bbox_scan.json` and cross-checks them against Pass 1 ASR segments. For every missed visual interval:
+    1. Slices raw source audio `[st-0.25s, et+0.25s]` with Telephone/Whisper Bandpass & Dynamic Gain Boost (`highpass=f=250,lowpass=f=3800,dynaudnorm=f=75:g=15:p=0.92:m=12.0`).
     2. Re-runs `faster-whisper` with `vad_filter=False`.
-    3. If audio is still masked by loud explosions/roars, inserts a mandatory `[GAP_VISUAL_SUB @ Xs]` entry with `"needs_visual_ocr": true` so `extract_audit_frames.py` automatically extracts its midpoint keyframe (`frames/audit/frame_XXXXs.jpg`) and `verify_stage_1.py` blocks Stage 1 until the agent visually reads the burned-in Chinese text (`read_file`) and fills the exact line!
+    3. If still masked by explosions/roars, inserts `[GAP_VISUAL_SUB @ Xs]` with `"needs_visual_ocr": true`.
+  - **Pass 2B (Acoustic-Only Quiet/Whisper/Telephone Recovery — Independent of Hardsub):** Scans `vocals.wav` + un-normalized `300–3400 Hz` telephony ratio (`tel_band_ratio > 0.55`) + breathy whisper RMS/ZCR (`0.0055 <= v_rms <= 0.018, ZCR <= 0.45`) for any uncovered `phone_call` (`dur >= 0.40s`), `whisper` (`dur >= 0.45s`), or loud burst even when no burned-in hardsub exists on screen, recovering spoken lines into `01_asr_raw_segments.json` (`cue_type: whisper | phone_call | normal`).
 - **Prohibition:** Never pre-merge ASR clauses into 5–8s paragraphs during Stage 1. Fine-grained clause timestamps (`median duration <= 2.8s`) are mandatory.
 
 ### Sub-Skill 2.3: Stroke-Aware Multi-Color Hardsub Bounding-Box Scanner (`5 fps`)

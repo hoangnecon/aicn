@@ -440,13 +440,13 @@ def run_multipass_whisper_asr(
         voc_audio = decode_audio_16k(vocals_path)
         min_len = min(len(raw_audio), len(voc_audio))
         pass1_audio = np.zeros_like(raw_audio)
-        pass1_audio[:min_len] = 0.90 * voc_audio[:min_len] + 0.10 * raw_audio[:min_len]
+        pass1_audio[:min_len] = 0.70 * voc_audio[:min_len] + 0.30 * raw_audio[:min_len]
     else:
         voc_audio = raw_audio
         pass1_audio = raw_audio
 
     model = load_whisper(model_size)
-    vad_params = dict(threshold=0.35, min_speech_duration_ms=100, min_silence_duration_ms=250, speech_pad_ms=150)
+    vad_params = dict(threshold=0.25, min_speech_duration_ms=80, min_silence_duration_ms=220, speech_pad_ms=180)
     segments_gen, _ = model.transcribe(
         pass1_audio,
         language=whisper_lang,
@@ -597,69 +597,85 @@ def run_multipass_whisper_asr(
                 f"{visual_ocr_cnt} visual-only sub-clause gaps for mandatory keyframe OCR.",
                 flush=True,
             )
-    elif os.path.exists(vocals_path):
-        # Pass 2 (v2.0.0 acoustic burst recovery): catch loud vocal dialogue bursts missed by Pass 1
-        from analyze_voice_waveform import compute_voice_mask_and_bursts
-        tel_voc = decode_audio_16k(
-            vocals_path,
-            af_filter="highpass=f=300,lowpass=f=3400,dynaudnorm=f=50:g=15:p=0.92:m=15.0",
+    # Pass 2B: Acoustic Quiet-Whisper, Telephone/Radio & Uncovered Vocal Burst Recovery (independent of hardsub presence)
+    boosted_ac = None
+    from analyze_voice_waveform import compute_voice_mask_and_bursts
+    tel_src = decode_audio_16k(
+        video_path,
+        af_filter="highpass=f=280,lowpass=f=3600,dynaudnorm=f=50:g=16:p=0.92:m=15.0",
+    )
+    raw_tel = decode_audio_16k(video_path, af_filter="highpass=f=300,lowpass=f=3400")
+    _, merged_bursts = compute_voice_mask_and_bursts(
+        voc_audio, tel_src, raw_tel_arr=raw_tel, raw_arr=raw_audio, sr=16000
+    )
+    sr = 16000
+    uncovered_bursts = []
+    for b in merged_bursts:
+        bst, bet = float(b["start"]), float(b["end"])
+        bdur = bet - bst
+        kind = b.get("kind", "normal")
+        is_candidate = (
+            (kind == "phone_call" and bdur >= 0.40)
+            or (kind == "whisper" and bdur >= 0.45)
+            or (bdur >= 0.35 and float(b.get("peak_voc_rms", 0.0)) >= 0.08)
         )
-        _, merged_bursts = compute_voice_mask_and_bursts(voc_audio, tel_voc)
-        sr = 16000
-        uncovered_bursts = []
-        for b in merged_bursts:
-            bst, bet = float(b["start"]), float(b["end"])
-            bdur = bet - bst
-            if bdur < 0.35 or float(b.get("peak_voc_rms", 0.0)) < 0.09:
+        if not is_candidate:
+            continue
+        ov = sum(max(0.0, min(bet, s["end"]) - max(bst, s["start"])) for s in results)
+        if (ov / max(0.2, bdur)) < 0.35:
+            uncovered_bursts.append(b)
+    if uncovered_bursts:
+        print(
+            f"[PASS 2B ACOUSTIC RECOVERY] Probing {len(uncovered_bursts)} uncovered whisper/phone/vocal bursts...",
+            flush=True,
+        )
+        boosted_ac = tel_src
+        rec_cnt = 0
+        for b in uncovered_bursts:
+            kind = b.get("kind", "normal")
+            pad_s = max(0.0, float(b["start"]) - 0.22)
+            pad_e = min(len(boosted_ac) / sr, float(b["end"]) + 0.22)
+            s_idx, e_idx = int(round(pad_s * sr)), int(round(pad_e * sr))
+            src_wave = boosted_ac if kind in ("phone_call", "whisper") else voc_audio
+            clip = src_wave[s_idx:min(len(src_wave), e_idx)]
+            if len(clip) < int(0.35 * sr):
                 continue
-            ov = sum(max(0.0, min(bet, s["end"]) - max(bst, s["start"])) for s in results)
-            if (ov / max(0.2, bdur)) < 0.35:
-                uncovered_bursts.append(b)
-        if uncovered_bursts:
-            print(
-                f"[PASS 2 ACOUSTIC RECOVERY] Probing {len(uncovered_bursts)} uncovered loud vocal bursts...",
-                flush=True,
+            mx = float(np.max(np.abs(clip)))
+            if mx > 0.003:
+                clip = clip / mx * 0.85
+            sub_gen, _ = model.transcribe(
+                clip,
+                language=whisper_lang,
+                beam_size=5,
+                word_timestamps=True,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                temperature=0.0,
             )
-            rec_cnt = 0
-            for b in uncovered_bursts:
-                pad_s = max(0.0, float(b["start"]) - 0.20)
-                pad_e = min(len(voc_audio) / sr, float(b["end"]) + 0.20)
-                clip = voc_audio[int(round(pad_s * sr)):int(round(pad_e * sr))]
-                if len(clip) < int(0.3 * sr):
-                    continue
-                mx = float(np.max(np.abs(clip)))
-                if mx > 0.005:
-                    clip = clip / mx * 0.85
-                sub_gen, _ = model.transcribe(
-                    clip,
-                    language=whisper_lang,
-                    beam_size=5,
-                    word_timestamps=True,
-                    vad_filter=False,
-                    condition_on_previous_text=False,
-                    temperature=0.0,
-                )
-                sub_list = list(sub_gen)
-                texts = [sg.text.strip() for sg in sub_list if sg.text.strip() and "索兰娅" not in sg.text]
-                if texts:
-                    rec_text = " ".join(texts)
-                    rec_prob = round(float(getattr(sub_list[0], "avg_logprob", -0.6)), 3)
-                    n_cjk = len([c for c in rec_text if "\u4e00" <= c <= "\u9fff"])
-                    if rec_prob > -0.85 and n_cjk >= 2:
-                        rec_cnt += 1
-                        results.append({
-                            "id": -1,
-                            "start": round(float(b["start"]), 3),
-                            "end": round(float(b["end"]), 3),
-                            "text": rec_text,
-                            "avg_logprob": rec_prob,
-                            "source": "pass2_acoustic_burst_recovery",
-                        })
-            if rec_cnt:
-                results.sort(key=lambda x: (x["start"], x["end"]))
-                for idx, item in enumerate(results):
-                    item["id"] = idx
-            print(f"[PASS 2 DONE] Recovered {rec_cnt} spoken bursts via Pass 2 acoustic recovery.", flush=True)
+            sub_list = list(sub_gen)
+            texts = [sg.text.strip() for sg in sub_list if sg.text.strip() and "索兰娅" not in sg.text]
+            if texts:
+                rec_text = " ".join(texts)
+                rec_prob = round(float(getattr(sub_list[0], "avg_logprob", -0.6)), 3)
+                no_sp = float(getattr(sub_list[0], "no_speech_prob", 0.0))
+                n_cjk = len([c for c in rec_text if "\u4e00" <= c <= "\u9fff"])
+                has_words = (n_cjk >= 2) if (source_lang == "zh") else (len(rec_text.strip()) >= 3)
+                if rec_prob > -0.95 and no_sp < 0.65 and has_words:
+                    rec_cnt += 1
+                    results.append({
+                        "id": -1,
+                        "start": round(float(b["start"]), 3),
+                        "end": round(float(b["end"]), 3),
+                        "text": rec_text,
+                        "avg_logprob": rec_prob,
+                        "cue_type": kind,
+                        "source": f"pass2_acoustic_{kind}_recovery",
+                    })
+        if rec_cnt:
+            results.sort(key=lambda x: (x["start"], x["end"]))
+            for idx, item in enumerate(results):
+                item["id"] = idx
+        print(f"[PASS 2B DONE] Recovered {rec_cnt} quiet/whisper/phone/vocal bursts via acoustic recovery.", flush=True)
 
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

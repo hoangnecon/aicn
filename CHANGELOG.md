@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.2 (2026-11-24)
+- **Cross-Platform Hongguo SDK v5 Playback (`scripts/hg_sdk_helper.py`, `scripts/hg_tool.cjs`, `L-013`)**:
+  - Added `scripts/hg_sdk_helper.py` using `aicn_platform.file_lock` and `hongguo-drama/scripts/sdk-playback/vendor/phone_account` (`pycryptodome` + `unicorn`), bypassing the upstream `darwin`/`electronApp()`/`fcntl` restrictions so Windows, macOS, and Linux CLIs resolve full 1080p episodes cleanly (~1s/ep in `--serve` mode) even when legacy Hongguo App endpoints return `200 / 0 bytes`.
+  - Updated `scripts/hg_tool.cjs` (`SdkSessionClient`, `selectSdkVariant`) to use `hg_sdk_helper.py --serve` first with automatic `fetchAppPlayUrl` fallback.
+
 ## 2.1.1 (2026-11-24)
 - **Windows Antigravity (AGY) 6/6 Skill Discovery & Standalone Vendor Imports**:
   - Updated `install.ps1` to install **real directory copies** (replacing NTFS Junctions) into `%USERPROFILE%\.gemini\config\skills\` and `%USERPROFILE%\.claude\skills\` so Antigravity on Windows natively discovers all 6/6 skills (`aicn` + all 5 vendored stage skills) for both the main agent and sub-agents.

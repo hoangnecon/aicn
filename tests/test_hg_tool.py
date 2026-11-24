@@ -308,6 +308,21 @@ class TestHgToolAndRsi(unittest.TestCase):
         self.assertIn("Referer: https://dramadunyam.com/en/series/my-test-series", headers_val)
         self.assertIn("Cookie: dd_bilet=guest_tok_123", headers_val)
 
+    def test_hg_sdk_helper_exists_and_uses_platform_lock(self):
+        helper = SKILL_DIR / "scripts" / "hg_sdk_helper.py"
+        self.assertTrue(helper.exists(), f"Missing {helper}")
+        src = helper.read_text(encoding="utf-8")
+        self.assertIn("aicn_platform", src)
+        self.assertNotIn("import fcntl", src)
+        res = subprocess.run(
+            [sys.executable, str(helper), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("--serve", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

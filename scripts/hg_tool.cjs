@@ -10,7 +10,8 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const readline = require('readline');
+const { execFileSync, spawn } = require('child_process');
 
 function resolveRepoDir() {
   const candidates = [
@@ -224,6 +225,130 @@ async function cmdEpisodes(positional, flags) {
   }
 }
 
+function resolvePythonBin() {
+  const candidates = [
+    process.env.AICN_PY,
+    process.platform === 'win32'
+      ? 'C:\\Work\\Tools\\VieNeu-TTS\\.venv\\Scripts\\python.exe'
+      : '/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python',
+    'python',
+    'python3',
+  ].filter(Boolean);
+  for (const cand of candidates) {
+    if (cand.includes(path.sep) && !fs.existsSync(cand)) continue;
+    return cand;
+  }
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
+function selectSdkVariant(model, quality = '1080p') {
+  const rawList = model?.video_list;
+  const rows = (Array.isArray(rawList) ? rawList : Object.values(rawList || {})).map(item => {
+    const meta = item?.video_meta || {};
+    const codec = String(item?.codec_type || meta.codec_type || '').toLowerCase();
+    const codecRank = ['h264', 'avc', 'avc1'].includes(codec)
+      ? 0
+      : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].includes(codec)
+        ? 1
+        : codec === 'bytevc2'
+          ? 2
+          : 3;
+    const width = Number(item?.vwidth || item?.width || meta.vwidth || meta.width || 0) || 0;
+    const height = Number(item?.vheight || item?.height || meta.vheight || meta.height || 0) || 0;
+    const defStr = String(item?.quality_desc || item?.definition || meta.definition || '');
+    const pixels = width && height ? Math.min(width, height) : Number(defStr.match(/\d+/)?.[0] || 0);
+    const url = item?.main_url || item?.backup_url || item?.backup_url_list?.[0] || '';
+    const spadeA = item?.spade_a || item?.encrypt_info?.spade_a || '';
+    return { item, codec, codecRank, width, height, pixels, defStr, url, spadeA };
+  }).filter(r => r.url && r.codecRank < 2);
+
+  if (!rows.length) return null;
+  const targetP = quality === 'auto' ? 0 : parseInt(String(quality).match(/\d+/)?.[0] || '0', 10);
+  rows.sort((a, b) => {
+    if (targetP > 0) {
+      const aOk = a.pixels >= targetP ? 1 : 0;
+      const bOk = b.pixels >= targetP ? 1 : 0;
+      if (aOk !== bOk) return bOk - aOk;
+      if (aOk && bOk && a.pixels !== b.pixels) return a.pixels - b.pixels;
+    }
+    if (a.pixels !== b.pixels) return b.pixels - a.pixels;
+    return a.codecRank - b.codecRank;
+  });
+  const chosen = rows[0];
+  return {
+    url: String(chosen.url).replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'),
+    spadeA: chosen.spadeA || null,
+    codec: chosen.codec === 'bytevc1' ? 'hevc' : chosen.codec,
+    quality: chosen.pixels ? `${chosen.pixels}p` : (chosen.defStr || quality),
+  };
+}
+
+class SdkSessionClient {
+  constructor(repoDir) {
+    this.repoDir = repoDir;
+    this.helperScript = path.join(__dirname, 'hg_sdk_helper.py');
+    this.proc = null;
+    this.rl = null;
+    this.pending = [];
+    this.broken = false;
+  }
+  isSupported() {
+    const hasPa = fs.existsSync(path.join(this.repoDir, 'scripts', 'sdk-playback', 'vendor', 'phone_account', 'phone_sdk_core_v5.py'));
+    return hasPa && fs.existsSync(this.helperScript);
+  }
+  _start() {
+    if (this.proc || this.broken) return;
+    const py = resolvePythonBin();
+    this.proc = spawn(py, [this.helperScript, '--repo', this.repoDir, '--serve'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    this.rl = readline.createInterface({ input: this.proc.stdout });
+    this.rl.on('line', line => {
+      const waiter = this.pending.shift();
+      if (!waiter) return;
+      try {
+        waiter.resolve(JSON.parse(line));
+      } catch (e) {
+        waiter.reject(new Error(`Invalid SDK helper output: ${line.slice(0, 120)}`));
+      }
+    });
+    const failAll = err => {
+      this.broken = true;
+      this.proc = null;
+      while (this.pending.length) this.pending.shift().reject(err);
+    };
+    this.proc.on('error', failAll);
+    this.proc.on('close', code => {
+      if (this.pending.length) failAll(new Error(`SDK helper exited (${code})`));
+      this.proc = null;
+    });
+  }
+  resolve(vid, quality = '1080p') {
+    if (!this.isSupported() || this.broken) return Promise.resolve(null);
+    this._start();
+    if (!this.proc || this.broken) return Promise.resolve(null);
+    return new Promise((resolve, reject) => {
+      this.pending.push({
+        resolve: res => {
+          if (!res?.ok || !res.model) return resolve(null);
+          const picked = selectSdkVariant(res.model, quality);
+          if (!picked) return resolve(null);
+          resolve({ ...picked, userAgent: res.userAgent, source: 'sdk' });
+        },
+        reject,
+      });
+      this.proc.stdin.write(JSON.stringify({ vid: String(vid) }) + '\n');
+    });
+  }
+  close() {
+    try { this.rl?.close(); } catch {}
+    try { this.proc?.stdin?.end(); } catch {}
+    try { this.proc?.kill(); } catch {}
+    this.proc = null;
+  }
+}
+
 async function cmdDownload(positional, flags) {
   const seriesId = positional[0];
   const outDir = flags.out || flags.dir;
@@ -233,6 +358,7 @@ async function cmdDownload(positional, flags) {
   const { fetchEpisodeList, deriveKey, fetchAppPlayUrl } = loadHongguo();
   const quality = flags.quality || '1080p';
   const delayMs = parseInt(flags['delay-ms'] || '1500', 10);
+  const sdkClient = new SdkSessionClient(resolveRepoDir());
 
   fs.mkdirSync(outDir, { recursive: true });
   console.log(`[hg_tool] Resolving episode list for series_id=${seriesId}...`);
@@ -247,70 +373,84 @@ async function cmdDownload(positional, flags) {
   let skipped = 0;
   const failed = [];
 
-  for (let i = 0; i < wanted.length; i++) {
-    const epNum = wanted[i];
-    const ep = eps[epNum - 1];
-    const vid = String(ep.vid || ep.video_id || ep.id || '');
-    const outFile = path.join(outDir, `ep_${String(epNum).padStart(3, '0')}.mp4`);
+  try {
+    for (let i = 0; i < wanted.length; i++) {
+      const epNum = wanted[i];
+      const ep = eps[epNum - 1];
+      const vid = String(ep.vid || ep.video_id || ep.id || '');
+      const outFile = path.join(outDir, `ep_${String(epNum).padStart(3, '0')}.mp4`);
 
-    if (fs.existsSync(outFile) && probeDuration(outFile) > 5) {
-      console.log(`[${i + 1}/${wanted.length}] SKIP ep_${String(epNum).padStart(3, '0')}.mp4 (already valid)`);
-      skipped++;
-      continue;
-    }
-
-    try {
-      const t0 = Date.now();
-      const play = await fetchAppPlayUrl(vid, { quality, allowLowerQuality: true });
-      const url = play.url || play.mainUrl || play.variants?.[0]?.url;
-      if (!url) throw new Error('No playable stream URL in response');
-
-      const spade = play.spadeA || play.spade_a || play.keyMaterial || play.variants?.[0]?.spadeA;
-      let keyHex = play.contentKey || play.keyHex || play.key || '';
-      if (!keyHex && spade) {
-        const keyBuf = deriveKey(spade);
-        if (keyBuf) keyHex = Buffer.isBuffer(keyBuf) ? keyBuf.toString('hex') : String(keyBuf);
+      if (fs.existsSync(outFile) && probeDuration(outFile) > 5) {
+        console.log(`[${i + 1}/${wanted.length}] SKIP ep_${String(epNum).padStart(3, '0')}.mp4 (already valid)`);
+        skipped++;
+        continue;
       }
 
-      const resp = await fetch(url, {
-        headers: {
-          'User-Agent': 'com.phoenix.read/73932 (Linux; U; Android 12; zh_CN; PGT-AN10; Build/HONORPGT-AN10)',
-        },
-      });
-      if (!resp.ok) throw new Error(`CDN HTTP ${resp.status}`);
-      const buf = Buffer.from(await resp.arrayBuffer());
-      const tmpRaw = `${outFile}.raw.tmp`;
-      const tmpOut = `${outFile}.dec.tmp.mp4`;
-      fs.writeFileSync(tmpRaw, buf);
+      try {
+        const t0 = Date.now();
+        let play = null;
+        if (sdkClient.isSupported() && /^\d+$/.test(vid)) {
+          try {
+            play = await sdkClient.resolve(vid, quality);
+          } catch (_) {
+            play = null;
+          }
+        }
+        if (!play) {
+          play = await fetchAppPlayUrl(vid, { quality, allowLowerQuality: true });
+        }
+        const url = play.url || play.mainUrl || play.variants?.[0]?.url;
+        if (!url) throw new Error('No playable stream URL in response');
 
-      if (keyHex) {
-        execFileSync(FFMPEG, [
-          '-y', '-loglevel', 'error',
-          '-decryption_key', keyHex,
-          '-i', tmpRaw,
-          '-c', 'copy',
-          tmpOut,
-        ]);
-        fs.unlinkSync(tmpRaw);
-        fs.renameSync(tmpOut, outFile);
-      } else {
-        fs.renameSync(tmpRaw, outFile);
+        const spade = play.spadeA || play.spade_a || play.keyMaterial || play.variants?.[0]?.spadeA;
+        let keyHex = play.contentKey || play.keyHex || play.key || '';
+        if (!keyHex && spade) {
+          const keyBuf = deriveKey(spade);
+          if (keyBuf) keyHex = Buffer.isBuffer(keyBuf) ? keyBuf.toString('hex') : String(keyBuf);
+        }
+
+        const resp = await fetch(url, {
+          headers: {
+            'User-Agent': play.userAgent || 'com.phoenix.read/73932 (Linux; U; Android 12; zh_CN; PGT-AN10; Build/HONORPGT-AN10)',
+          },
+        });
+        if (!resp.ok) throw new Error(`CDN HTTP ${resp.status}`);
+        const buf = Buffer.from(await resp.arrayBuffer());
+        const tmpRaw = `${outFile}.raw.tmp`;
+        const tmpOut = `${outFile}.dec.tmp.mp4`;
+        fs.writeFileSync(tmpRaw, buf);
+
+        if (keyHex) {
+          execFileSync(FFMPEG, [
+            '-y', '-loglevel', 'error',
+            '-decryption_key', keyHex,
+            '-i', tmpRaw,
+            '-c', 'copy',
+            tmpOut,
+          ]);
+          fs.unlinkSync(tmpRaw);
+          fs.renameSync(tmpOut, outFile);
+        } else {
+          fs.renameSync(tmpRaw, outFile);
+        }
+
+        const dur = probeDuration(outFile);
+        if (dur <= 1) throw new Error('ffprobe validation failed after decrypt');
+        const mb = (fs.statSync(outFile).size / 1024 / 1024).toFixed(2);
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+        console.log(`[${i + 1}/${wanted.length}] OK ep_${String(epNum).padStart(3, '0')}.mp4 | ${mb} MB | ${dur.toFixed(1)}s | ${play.quality || quality} (${play.source || 'app'}) | ${elapsed}s`);
+        downloaded++;
+      } catch (err) {
+        console.error(`[${i + 1}/${wanted.length}] FAIL ep_${String(epNum).padStart(3, '0')} (vid=${vid}): ${err.message}`);
+        failed.push({ epNum, vid, error: err.message });
       }
 
-      const dur = probeDuration(outFile);
-      if (dur <= 1) throw new Error('ffprobe validation failed after decrypt');
-      const mb = (fs.statSync(outFile).size / 1024 / 1024).toFixed(2);
-      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      console.log(`[${i + 1}/${wanted.length}] OK ep_${String(epNum).padStart(3, '0')}.mp4 | ${mb} MB | ${dur.toFixed(1)}s | ${play.quality || quality} | ${elapsed}s`);
-      downloaded++;
-    } catch (err) {
-      console.error(`[${i + 1}/${wanted.length}] FAIL ep_${String(epNum).padStart(3, '0')} (vid=${vid}): ${err.message}`);
-      failed.push({ epNum, vid, error: err.message });
+      if (i < wanted.length - 1 && delayMs > 0) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
     }
-
-    if (i < wanted.length - 1 && delayMs > 0) {
-      await new Promise(r => setTimeout(r, delayMs));
-    }
+  } finally {
+    sdkClient.close();
   }
 
   console.log(`[hg_tool] Summary: downloaded=${downloaded}, skipped=${skipped}, failed=${failed.length}, out=${outDir}`);

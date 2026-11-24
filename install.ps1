@@ -196,6 +196,22 @@ foreach ($s in $expectedSkills) {
 Write-Host "ok     AGY skills ready ($okSkills/$($expectedSkills.Count) real dirs in $agyRoot)"
 
 if ($py -and (Test-Path $py)) {
+    & $py -c "import Crypto, unicorn, requests" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        if ($InstallTools) {
+            $uvCmd = Find-AicnTool "uv"
+            if ($uvCmd) {
+                Write-Host "install pycryptodome unicorn requests -> $py"
+                & $uvCmd pip install --python $py pycryptodome unicorn requests
+            } else {
+                & $py -m pip install pycryptodome unicorn requests
+            }
+        } else {
+            Write-Host "hint   missing SDK playback deps (pycryptodome/unicorn); run '.\install.ps1 -InstallTools'"
+        }
+    } else {
+        Write-Host "ok     hg_sdk     pycryptodome + unicorn + requests"
+    }
     $null = & $py (Join-Path $agyRoot "aicn\scripts\aicn.py") --help
     if ($LASTEXITCODE -eq 0) {
         Write-Host "ok     aicn.py runs"

@@ -25,11 +25,11 @@ import aicn  # noqa: E402  (jload, jdump, h_obj, FastHash, cicd)
 import aicn_platform as ap  # noqa: E402
 
 SR = 48000
-AUDIO_VERSION = "aicn-audio-1.2"
+AUDIO_VERSION = "aicn-audio-1.3"
 STEMS_VERSION = "aicn-audio-1.0"  # unchanged Demucs separation; keep cache-compatible with v1.2.x stems
 DEFAULTS = {
     "voice": "Trúc Ly",
-    "tts_workers": 2, "tts_threads": 4,         # CPU fp32 ONNX: 2 workers x 4 threads measured +23% faster on 8-core M1 (only for >=8 jobs)
+    "tts_workers": 0, "tts_threads": 0,         # 0=auto-scale CPU fp32 ONNX workers (2x4 on 8-core M1, up to 4x4 on 16+ core desktop)
     "temperature": 0.8, "top_k": 25,            # VieNeu v3 Turbo defaults (same as its app)
     "group_max_gap_s": 0.6,                     # clauses of one speaker closer than this are read as one sentence
     "base_tempo": 1.10,                         # model reads ~5.2 syl/s; 1.10 brings it to ~5.7
@@ -40,9 +40,10 @@ DEFAULTS = {
     "snr_vocal_db": 12.0, "snr_bgm_db": 6.0,    # wanted dub-to-original ratio per band while the dub talks
     "floor_vocal_db": -20.0, "floor_bgm_db": -9.0,   # the original is never turned down further than this
     "base_vocal_db": -6.5,                      # gentler broadband dip of original voice while keeping SFX natural
-    "attack_s": 0.02, "hold_s": 0.35, "release_s": 0.42,   # hold + slower release eliminate inter-clause pumping
+    "vocal_high_dip_db": -3.5,                  # dynamic >5 kHz vocal sibilance softening ONLY while dub speaks
+    "attack_s": 0.02, "hold_s": 0.35, "release_s": 0.42,   # attack-hold-release eliminates inter-clause pumping
     "dub_hp_hz": 90.0, "dub_lp_hz": 16000.0,    # pre-mix HP/LP conditioning for dubbed voice
-    "vocal_hp_hz": 120.0, "vocal_lp_hz": 12000.0,   # carve chest thump & harsh sibilants from original vocal stem
+    "vocal_hp_hz": 95.0, "vocal_lp_hz": 0.0,    # gentle vocal sub-rumble HP; LP=0 preserves air when dub is silent
     "bgm_hp_hz": 35.0, "bgm_lp_hz": 18500.0,    # keep SFX/foley/music warm & full-bodied, strip subsonic DC only
     "target_lufs": -14.0, "true_peak_db": -1.0, "lra": 11.0,
     "master_mode": "fast",                      # fast (ebur128+alimiter, ~4s, 28x faster) | loudnorm (legacy 192kHz 2-pass, ~115s)
@@ -108,6 +109,30 @@ def follow(g, fps, att, rel):
     for t in range(g.shape[1]):
         tgt = g[:, t]; a = np.where(tgt < cur, a_att, a_rel)
         cur = a * cur + (1 - a) * tgt; out[:, t] = cur
+    return out
+
+
+def follow_hold(g, fps, att, hold_s, rel):
+    """Attack-hold-release gain follower over the last axis: fast attack down, flat hold during micro-pauses, smooth release up."""
+    a_att = np.exp(-1.0 / max(1e-6, att * fps))
+    a_rel = np.exp(-1.0 / max(1e-6, rel * fps))
+    hold_frames = max(0, int(round(max(0.0, float(hold_s)) * fps)))
+    g = np.atleast_2d(np.asarray(g, dtype=np.float64))
+    out = np.empty_like(g)
+    cur = np.ones(g.shape[0], dtype=np.float64)
+    rem = np.zeros(g.shape[0], dtype=np.int32)
+    for t in range(g.shape[1]):
+        tgt = g[:, t]
+        attacking = tgt < cur
+        holding = (~attacking) & (rem > 0)
+        releasing = (~attacking) & (~holding)
+        cur = np.where(
+            attacking,
+            a_att * cur + (1.0 - a_att) * tgt,
+            np.where(releasing, a_rel * cur + (1.0 - a_rel) * tgt, cur),
+        )
+        rem = np.where(attacking, hold_frames, np.maximum(0, rem - 1))
+        out[:, t] = cur
     return out
 
 
@@ -242,8 +267,7 @@ def presynth(jobs, workers, threads=0):
 
 
 def _tts_cache_dir(ws):
-    pc = aicn.jload(os.path.join(ws, "config", "project_config.json"), {}) or {}
-    hub = pc.get("series_hub_dir", "")
+    hub = aicn.resolve_unit_hub(ws)
     if hub and os.path.isdir(hub):
         d = os.path.join(hub, ".cache", "tts_sent")
     else:
@@ -252,13 +276,54 @@ def _tts_cache_dir(ws):
     return d
 
 
+def _resolve_tts_parallelism(c):
+    cores = os.cpu_count() or 8
+    w = int(c.get("tts_workers", 0) or 0)
+    th = int(c.get("tts_threads", 0) or 0)
+    if w <= 0:
+        w = min(4, max(2, cores // 4))
+    if th <= 0:
+        th = max(2, cores // w)
+    return w, th
+
+
+def _audio_state_load(ws):
+    return aicn.jload(os.path.join(ws, ".cache", "audio_state.json"), {}) or {}
+
+
+def _audio_state_save(ws, st):
+    aicn.jdump(os.path.join(ws, ".cache", "audio_state.json"), st)
+
+
 def cmd_dub(ws, c, fh):
-    segs = aicn.jload(os.path.join(ws, "data", "02_bilingual_script.json"))
+    script_p = os.path.join(ws, "data", "02_bilingual_script.json")
+    segs = aicn.jload(script_p)
     dur = float(profile(ws)["duration"]); n = int(round(dur * SR))
+    dub_wav_p = os.path.join(ws, "media", "audio", "dub_voice_48k.wav")
+    aligned_p = os.path.join(ws, "data", "03_aligned_subtitles.json")
+    log_p = os.path.join(ws, "data", "03_dub_sentences.json")
+    srt_p = os.path.join(ws, "data", "subtitles_full.srt")
+    wav_dir = os.path.join(ws, "media", "tts_segments"); os.makedirs(wav_dir, exist_ok=True)
+    dub_key = None
+    if fh is not None and os.path.exists(script_p):
+        dub_key = aicn.h_obj({
+            "v": AUDIO_VERSION, "script": fh(script_p), "dur": round(dur, 3),
+            "cfg": {k: c.get(k) for k in ("voice", "temperature", "top_k", "group_max_gap_s", "base_tempo",
+                                          "max_tempo", "lead_gap_s", "expander_thresh_db", "expander_depth_db")},
+        })
+        st_cache = _audio_state_load(ws)
+        outs_ok = (
+            all(os.path.exists(p) for p in (dub_wav_p, aligned_p, log_p, srt_p))
+            and all(os.path.exists(os.path.join(wav_dir, f"seg_{i:04d}.wav")) for i in range(len(segs)))
+        )
+        if not c.get("_force") and st_cache.get("dub_key") == dub_key and outs_ok:
+            print(f"[dub] cached ({len(segs)} lines, key={dub_key[:12]})")
+            return
+
     groups = group_lines(segs, c["group_max_gap_s"])
     cache = _tts_cache_dir(ws)
-    tts = None; track = np.zeros(n, np.float32); aligned = [None] * len(segs); log = []; synth = 0; t0 = time.time()
-    wav_dir = os.path.join(ws, "media", "tts_segments"); os.makedirs(wav_dir, exist_ok=True)
+    rb_cache = os.path.join(ws, ".cache", "rb_clause"); os.makedirs(rb_cache, exist_ok=True)
+    track = np.zeros(n, np.float32); aligned = [None] * len(segs); log = []; synth = 0; t0 = time.time()
     jobs, seen = [], set()
     for g in groups:
         text = " ".join(segs[i]["tts_text"].strip() for i in g)
@@ -267,8 +332,9 @@ def cmd_dub(ws, c, fh):
         p_ = os.path.join(cache, key + ".wav")
         if not os.path.exists(p_) and p_ not in seen:
             seen.add(p_); jobs.append((text, voice, c["temperature"], c["top_k"], p_))
-    presynth(jobs, int(c.get("tts_workers", 2)), int(c.get("tts_threads", 4))); synth = len(jobs)
-    # Prepare raw cleaned waves, split into per-clause pieces, and run rubberband time-stretch in parallel
+    tts_w, tts_th = _resolve_tts_parallelism(c)
+    presynth(jobs, tts_w, tts_th); synth = len(jobs)
+    # Prepare raw cleaned waves, split into per-clause pieces, and run rubberband time-stretch with per-clause cache
     prep_clauses = []
     group_meta = []
     for gi, g in enumerate(groups):
@@ -291,17 +357,34 @@ def cmd_dub(ws, c, fh):
             win_j = max(0.25, nxt_line - gap - s0)
             nat_j = len(raw_piece) / SR
             tempo_j = max(c["base_tempo"], min(c["max_tempo"], nat_j / win_j)) if len(raw_piece) > 480 else 1.0
-            prep_clauses.append((gi, j, i, raw_piece, tempo_j))
+            rb_k = aicn.h_obj({"sk": key, "a": int(cuts[j]), "b": int(cuts[j + 1]), "t": round(tempo_j, 4)})[:20]
+            prep_clauses.append((gi, j, i, raw_piece, tempo_j, os.path.join(rb_cache, rb_k + ".wav")))
         group_meta.append((gi, g, text, st, window, natural, c_start_idx, len(prep_clauses)))
-    rb_workers = min(6, os.cpu_count() or 4, max(1, len(prep_clauses)))
+
+    rb_hits = 0
+
+    def _stretch_cached(it):
+        raw_p, tempo_j, cp = it[3], it[4], it[5]
+        if len(raw_p) <= 480:
+            return raw_p, True
+        if not c.get("_force") and os.path.exists(cp):
+            return sf.read(cp, dtype="float32")[0], True
+        out = stretch(raw_p, tempo_j)
+        sf.write(cp + ".part.wav", out, SR, subtype="FLOAT")
+        os.replace(cp + ".part.wav", cp)
+        return out, False
+
+    rb_workers = min(8, os.cpu_count() or 4, max(1, len(prep_clauses)))
     with ThreadPoolExecutor(max_workers=rb_workers) as ex:
-        stretched_clauses = list(ex.map(lambda it: stretch(it[3], it[4]) if len(it[3]) > 480 else it[3], prep_clauses))
+        res_clauses = list(ex.map(_stretch_cached, prep_clauses))
+    stretched_clauses = [r[0] for r in res_clauses]
+    rb_hits = sum(1 for r in res_clauses if r[1])
     prev_sp_e = -1.0
     for gi, g, text, st, window, natural, c0, c1 in group_meta:
         piece_tempos = []
         piece_durs = 0.0
         for idx_c in range(c0, c1):
-            _, j, i, _raw_p, tempo_j = prep_clauses[idx_c]
+            _, j, i, _raw_p, tempo_j, _cp = prep_clauses[idx_c]
             piece = stretched_clauses[idx_c].astype(np.float32, copy=True)
             f = min(int(0.005 * SR), len(piece) // 4)
             if f > 0:
@@ -329,16 +412,20 @@ def cmd_dub(ws, c, fh):
         log.append({"group": gi, "ids": g, "start": round(st, 3), "natural_s": round(natural, 2), "window_s": round(window, 2),
                     "tempo": round(max(piece_tempos, default=1.0), 3), "overflow_s": round(overflow, 2),
                     "syl_per_s": round(syl / max(0.05, piece_durs), 2), "text": text})
-    os.makedirs(os.path.join(ws, "media", "audio"), exist_ok=True)
-    sf.write(os.path.join(ws, "media", "audio", "dub_voice_48k.wav"), track, SR, subtype="FLOAT")
-    aicn.jdump(os.path.join(ws, "data", "03_aligned_subtitles.json"), aligned)
-    aicn.jdump(os.path.join(ws, "data", "03_dub_sentences.json"), log)
-    with open(os.path.join(ws, "data", "subtitles_full.srt"), "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(dub_wav_p), exist_ok=True)
+    sf.write(dub_wav_p, track, SR, subtype="FLOAT")
+    aicn.jdump(aligned_p, aligned)
+    aicn.jdump(log_p, log)
+    with open(srt_p, "w", encoding="utf-8") as f:
         for k, it in enumerate(aligned, 1):
             f.write(f"{k}\n{srt_t(it['slot_start'])} --> {srt_t(it['slot_end'])}\n{it['sub_text']}\n\n")
+    if dub_key is not None:
+        st_cache = _audio_state_load(ws)
+        st_cache["dub_key"] = dub_key
+        _audio_state_save(ws, st_cache)
     over = [l for l in log if l["overflow_s"] > 0.05]
     rates = [l["syl_per_s"] for l in log]
-    print(f"[dub] {len(segs)} lines -> {len(groups)} sentences, synthesized {synth} (rest cached) in {time.time() - t0:.1f}s; "
+    print(f"[dub] {len(segs)} lines -> {len(groups)} sentences, synth {synth}, rb_cached {rb_hits}/{len(prep_clauses)} in {time.time() - t0:.1f}s; "
           f"tempo median {np.median([l['tempo'] for l in log]):.2f}x max {max(l['tempo'] for l in log):.2f}x; "
           f"rate median {np.median(rates):.2f} syl/s; overflow {len(over)}")
     for l in over[:10]:
@@ -405,20 +492,67 @@ def hangover_hold(mask, fps, hold_s):
     return out
 
 
+def _biquad_peaking(f0, gain_db, q, sr=SR):
+    """RBJ Audio EQ Cookbook peaking biquad returned as a (1, 6) SOS array (zero comb-filtering)."""
+    A = 10.0 ** (float(gain_db) / 40.0)
+    w0 = 2.0 * np.pi * float(f0) / float(sr)
+    alpha = np.sin(w0) / (2.0 * float(q))
+    cw = np.cos(w0)
+    b0 = 1.0 + alpha * A
+    b1 = -2.0 * cw
+    b2 = 1.0 - alpha * A
+    a0 = 1.0 + alpha / A
+    a1 = -2.0 * cw
+    a2 = 1.0 - alpha / A
+    return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
+
+
+def _biquad_highshelf(f0, gain_db, slope=0.7, sr=SR):
+    """RBJ Audio EQ Cookbook high-shelf biquad returned as a (1, 6) SOS array."""
+    A = 10.0 ** (float(gain_db) / 40.0)
+    w0 = 2.0 * np.pi * float(f0) / float(sr)
+    cw = np.cos(w0)
+    sw = np.sin(w0)
+    alpha = sw / 2.0 * np.sqrt(max(1e-6, (A + 1.0 / A) * (1.0 / float(slope) - 1.0) + 2.0))
+    sq = 2.0 * np.sqrt(A) * alpha
+    b0 = A * ((A + 1.0) + (A - 1.0) * cw + sq)
+    b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cw)
+    b2 = A * ((A + 1.0) + (A - 1.0) * cw - sq)
+    a0 = (A + 1.0) - (A - 1.0) * cw + sq
+    a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cw)
+    a2 = (A + 1.0) - (A - 1.0) * cw - sq
+    return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
+
+
 def spectral_profile(x, sr=SR):
-    """Measure multi-band spectral share, centroid, RMS/Peak dBFS, and crest factor."""
+    """Measure active-frame multi-band spectral share, centroid, RMS/Peak dBFS, and crest factor."""
     from scipy.signal import stft
     arr = np.asarray(x, dtype=np.float32)
     mono = arr if arr.ndim == 1 else arr.mean(axis=1)
     if len(mono) < NFFT:
         mono = np.pad(mono, (0, NFFT - len(mono)))
-    rms = float(np.sqrt(np.mean(mono ** 2) + 1e-12))
     peak = float(np.max(np.abs(mono)) + 1e-12)
-    rms_db = round(20.0 * np.log10(rms), 2)
     peak_db = round(20.0 * np.log10(peak), 2)
+
+    # Measure RMS and spectrum on active frames (> -55 dBFS) so silence padding does not skew speech stats
+    blk = max(1, sr // 50)  # 20 ms blocks
+    n_blk = len(mono) // blk
+    if n_blk > 0:
+        b_rms = np.sqrt(np.mean(mono[: n_blk * blk].reshape(n_blk, blk) ** 2, axis=1) + 1e-15)
+        act_b = b_rms > max(10.0 ** (-55.0 / 20.0), peak * 1e-3)
+        active_ratio = float(act_b.mean())
+        rms = float(np.sqrt(np.mean(b_rms[act_b] ** 2) + 1e-12)) if act_b.any() else float(np.sqrt(np.mean(mono ** 2) + 1e-12))
+    else:
+        active_ratio = 1.0
+        rms = float(np.sqrt(np.mean(mono ** 2) + 1e-12))
+    rms_db = round(20.0 * np.log10(rms), 2)
     crest_db = round(peak_db - rms_db, 2)
+
     f, _, Z = stft(mono, sr, nperseg=NFFT, noverlap=NFFT - HOP)
-    mag2 = (Z.real * Z.real + Z.imag * Z.imag).mean(axis=1)
+    Z2 = Z.real * Z.real + Z.imag * Z.imag
+    frame_e = Z2.sum(axis=0)
+    act_f = frame_e > max(float(frame_e.max()) * 1e-5, 1e-12)
+    mag2 = Z2[:, act_f].mean(axis=1) if act_f.any() else Z2.mean(axis=1)
     tot = float(mag2.sum() + 1e-15)
     bands_pct = {}
     bands_db = {}
@@ -432,31 +566,38 @@ def spectral_profile(x, sr=SR):
         "rms_dbfs": rms_db,
         "peak_dbfs": peak_db,
         "crest_factor_db": crest_db,
+        "active_frame_ratio": round(active_ratio, 3),
         "spectral_centroid_hz": centroid_hz,
         "bands_pct": bands_pct,
         "bands_rel_db": bands_db,
     }
 
 
-def resolve_spectral_plan(stems_profiles, c):
-    """Derive adaptive HP/LP cutoffs and subtle mud trim from spectral analysis + user overrides."""
+def resolve_spectral_plan(stems_profiles, c, user_keys=None):
+    """Derive adaptive HP/LP cutoffs and subtle mud trim from spectral analysis while strictly respecting user overrides."""
+    ukeys = set(user_keys or ())
     dub_p = stems_profiles.get("dub", {})
     voc_p = stems_profiles.get("vocals", {})
     acc_p = stems_profiles.get("accomp", {})
 
     dub_hp = float(c.get("dub_hp_hz", DEFAULTS["dub_hp_hz"]))
-    if dub_p.get("bands_pct", {}).get("sub_rumble", 0.0) > 1.5 and dub_hp == DEFAULTS["dub_hp_hz"]:
+    if "dub_hp_hz" not in ukeys and dub_p.get("bands_pct", {}).get("sub_rumble", 0.0) > 1.5:
         dub_hp = max(dub_hp, 100.0)
     dub_lp = float(c.get("dub_lp_hz", DEFAULTS["dub_lp_hz"]))
     mud_pct = dub_p.get("bands_pct", {}).get("box_mud", 0.0)
     dub_mud_cut_db = -1.5 if mud_pct > 28.0 else 0.0
 
     voc_hp = float(c.get("vocal_hp_hz", DEFAULTS["vocal_hp_hz"]))
-    if voc_p.get("bands_pct", {}).get("sub_rumble", 0.0) + voc_p.get("bands_pct", {}).get("bass_warmth", 0.0) > 8.0:
-        voc_hp = max(voc_hp, 130.0)
+    if "vocal_hp_hz" not in ukeys and (
+        voc_p.get("bands_pct", {}).get("sub_rumble", 0.0) + voc_p.get("bands_pct", {}).get("bass_warmth", 0.0) > 8.0
+    ):
+        voc_hp = max(voc_hp, 120.0)
     voc_lp = float(c.get("vocal_lp_hz", DEFAULTS["vocal_lp_hz"]))
-    if voc_p.get("bands_pct", {}).get("sibilance", 0.0) + voc_p.get("bands_pct", {}).get("air", 0.0) > 14.0:
-        voc_lp = min(voc_lp, 11000.0)
+    voc_high_dip_db = float(c.get("vocal_high_dip_db", DEFAULTS["vocal_high_dip_db"]))
+    if "vocal_high_dip_db" not in ukeys and (
+        voc_p.get("bands_pct", {}).get("sibilance", 0.0) + voc_p.get("bands_pct", {}).get("air", 0.0) > 14.0
+    ):
+        voc_high_dip_db = min(voc_high_dip_db, -4.5)
 
     bgm_hp = float(c.get("bgm_hp_hz", DEFAULTS["bgm_hp_hz"]))
     bgm_lp = float(c.get("bgm_lp_hz", DEFAULTS["bgm_lp_hz"]))
@@ -466,6 +607,7 @@ def resolve_spectral_plan(stems_profiles, c):
         "dub_mud_cut_db": dub_mud_cut_db,
         "vocal_hp_hz": round(voc_hp, 1),
         "vocal_lp_hz": round(voc_lp, 1),
+        "vocal_high_dip_db": round(voc_high_dip_db, 1),
         "bgm_hp_hz": round(bgm_hp, 1),
         "bgm_lp_hz": round(bgm_lp, 1),
         "bgm_sub_rumble_pct": acc_p.get("bands_pct", {}).get("sub_rumble", 0.0),
@@ -475,6 +617,7 @@ def resolve_spectral_plan(stems_profiles, c):
 def analyze_stems_and_dub(ws, c, V=None, B=None, T=None):
     """Run frequency analysis on stems + dub and save data/03_spectral_analysis.json."""
     stems_dir = os.path.join(ws, "media", "stems")
+    raw_user = aicn.jload(os.path.join(ws, "config", "audio_mix.json"), {}) or {}
     profiles = {}
     if V is None and os.path.exists(os.path.join(stems_dir, "vocals.wav")):
         V = sf.read(os.path.join(stems_dir, "vocals.wav"), dtype="float32", always_2d=True)[0]
@@ -491,7 +634,7 @@ def analyze_stems_and_dub(ws, c, V=None, B=None, T=None):
         profiles["dub"] = spectral_profile(T)
     if not profiles and os.path.exists(source_path(ws) or ""):
         profiles["source"] = spectral_profile(load(source_path(ws)))
-    plan = resolve_spectral_plan(profiles, c)
+    plan = resolve_spectral_plan(profiles, c, user_keys=raw_user.keys())
     report = {
         "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "version": AUDIO_VERSION,
@@ -506,18 +649,19 @@ def cmd_analyze(ws, c, fh):
     rep = analyze_stems_and_dub(ws, c)
     fp = rep["filter_plan"]
     print(f"[analyze] saved data/03_spectral_analysis.json | dub HP/LP={fp['dub_hp_hz']}/{fp['dub_lp_hz']} Hz, "
-          f"vocal HP/LP={fp['vocal_hp_hz']}/{fp['vocal_lp_hz']} Hz, bgm HP/LP={fp['bgm_hp_hz']}/{fp['bgm_lp_hz']} Hz")
+          f"vocal HP/LP={fp['vocal_hp_hz']}/{fp['vocal_lp_hz']} Hz (dyn_hi={fp['vocal_high_dip_db']} dB), "
+          f"bgm HP/LP={fp['bgm_hp_hz']}/{fp['bgm_lp_hz']} Hz")
 
 
 def voice_chain(x, hp_hz=90.0, lp_hz=16000.0, mud_cut_db=0.0):
-    from scipy.signal import butter, sosfilt
-    x = apply_hp_lp(x, hp_hz=hp_hz, lp_hz=lp_hz, order=2)
+    from scipy.signal import sosfilt
+    x = apply_hp_lp(x, hp_hz=hp_hz, lp_hz=lp_hz, order=2).astype(np.float64)
+    sos_list = []
     if mud_cut_db < -0.1:
-        mud = sosfilt(butter(2, [300, 500], "bp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
-        x = x - np.float32(1.0 - 10.0 ** (mud_cut_db / 20.0)) * mud
-    pres = sosfilt(butter(2, [2200, 4500], "bp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
-    hi = sosfilt(butter(2, 8000, "hp", fs=SR, output="sos").astype(np.float32), x).astype(np.float32)
-    x = x + np.float32(0.33) * pres - np.float32(0.2) * hi
+        sos_list.append(_biquad_peaking(380.0, mud_cut_db, q=1.1, sr=SR))
+    sos_list.append(_biquad_peaking(3100.0, 2.5, q=0.9, sr=SR))
+    sos_list.append(_biquad_highshelf(8000.0, -2.0, slope=0.7, sr=SR))
+    x = sosfilt(np.vstack(sos_list), x).astype(np.float32)
     # 100 Hz envelope (10 ms step matches 10 ms attack; 10x faster than 1 kHz Python loop)
     step = 480
     pad_n = (-len(x)) % step
@@ -579,14 +723,33 @@ def apply_gain(x, g, idx):
 
 def cmd_mix(ws, c, fh):
     sd = os.path.join(ws, "media", "stems")
-    for f in ("vocals.wav", "accomp.wav"):
-        if not os.path.exists(os.path.join(sd, f)):
+    voc_p, acc_p = os.path.join(sd, "vocals.wav"), os.path.join(sd, "accomp.wav")
+    for f, p in (("vocals.wav", voc_p), ("accomp.wav", acc_p)):
+        if not os.path.exists(p):
             sys.exit(f"[aicn-audio] missing media/stems/{f}: run `separate` (the original audio is never replaced by silence)")
-    n = int(round(float(profile(ws)["duration"]) * SR))
+    dub_p = os.path.join(ws, "media", "audio", "dub_voice_48k.wav")
+    pre_p = os.path.join(ws, "media", "audio", "premaster_48k.wav")
+    stats_p = os.path.join(ws, "data", "03_mix_stats.json")
+    spec_p = os.path.join(ws, "data", "03_spectral_analysis.json")
+    dur = float(profile(ws)["duration"])
+    mix_key = None
+    if fh is not None and os.path.exists(dub_p):
+        mix_key = aicn.h_obj({
+            "v": AUDIO_VERSION, "voc": fh(voc_p), "acc": fh(acc_p), "dub": fh(dub_p), "dur": round(dur, 3),
+            "cfg": {k: c.get(k) for k in ("dub_over_vocal_lu", "snr_vocal_db", "snr_bgm_db", "floor_vocal_db",
+                                          "floor_bgm_db", "base_vocal_db", "vocal_high_dip_db", "attack_s", "hold_s",
+                                          "release_s", "dub_hp_hz", "dub_lp_hz", "vocal_hp_hz", "vocal_lp_hz",
+                                          "bgm_hp_hz", "bgm_lp_hz")},
+        })
+        st_cache = _audio_state_load(ws)
+        if not c.get("_force") and st_cache.get("mix_key") == mix_key and all(os.path.exists(p) for p in (pre_p, stats_p, spec_p)):
+            print(f"[mix] cached (key={mix_key[:12]})")
+            return
+    n = int(round(dur * SR))
     fit = lambda a: np.pad(a, ((0, max(0, n - len(a))), (0, 0)))[:n]
-    V, B = fit(sf.read(os.path.join(sd, "vocals.wav"), dtype="float32", always_2d=True)[0]), \
-        fit(sf.read(os.path.join(sd, "accomp.wav"), dtype="float32", always_2d=True)[0])
-    T = sf.read(os.path.join(ws, "media", "audio", "dub_voice_48k.wav"), dtype="float32")[0]
+    V, B = fit(sf.read(voc_p, dtype="float32", always_2d=True)[0]), \
+        fit(sf.read(acc_p, dtype="float32", always_2d=True)[0])
+    T = sf.read(dub_p, dtype="float32")[0]
     T = np.pad(T, (0, max(0, n - len(T))))[:n]
     t0 = time.time()
     spec_rep = analyze_stems_and_dub(ws, c, V=V, B=B, T=T)
@@ -602,18 +765,23 @@ def cmd_mix(ws, c, fh):
     fps = SR / HOP; W = BAND_W[:, None]
     hold_s = float(c.get("hold_s", 0.35))
     raw_active = PT > PT.max(1, keepdims=True) * 10 ** (-45 / 10)
-    active = hangover_hold(raw_active, fps, hold_s * 0.6)
     tot = PT.sum(0)
     talk_mask = hangover_hold(tot > tot.max() * 1e-4, fps, hold_s)
     talk = follow(talk_mask.astype(float)[None], fps, c["attack_s"], max(c["release_s"], 0.40))[0]
 
     def need(Pc, snr, floor):
         g = np.sqrt(np.clip(PT / (Pc * 10 ** (snr / 10) + 1e-12), 10 ** (floor / 10), 1.0))
-        return np.where(active, g, 1.0)
-    gV = need(PV, c["snr_vocal_db"], c["floor_vocal_db"]) * (1 - talk * (1 - 10 ** (c["base_vocal_db"] / 20)))
-    gB = need(PB, c["snr_bgm_db"], c["floor_bgm_db"])
-    gV = follow(1 - W * (1 - gV), fps, c["attack_s"], c["release_s"])
-    gB = follow(1 - W * (1 - gB), fps, c["attack_s"], c["release_s"])
+        return np.where(raw_active, g, 1.0)
+    base_dip = 1.0 - talk * (1.0 - 10.0 ** (c["base_vocal_db"] / 20.0))
+    hi_dip_db = float(fp.get("vocal_high_dip_db", c.get("vocal_high_dip_db", -3.5)))
+    hi_band = np.ones((len(BAND_W), len(talk)), dtype=np.float64)
+    if hi_dip_db < -0.1:
+        hi_band[9:, :] = 1.0 - talk[None, :] * (1.0 - 10.0 ** (hi_dip_db / 20.0))
+    voc_floor_lin = 10.0 ** ((c["floor_vocal_db"] + c["base_vocal_db"]) / 20.0)
+    gV_raw = np.maximum(voc_floor_lin, need(PV, c["snr_vocal_db"], c["floor_vocal_db"]) * base_dip * hi_band)
+    gB_raw = need(PB, c["snr_bgm_db"], c["floor_bgm_db"])
+    gV = follow_hold(1 - W * (1 - gV_raw), fps, c["attack_s"], hold_s, c["release_s"])
+    gB = follow_hold(1 - W * (1 - gB_raw), fps, c["attack_s"], hold_s, c["release_s"])
     mix = istft_from_Z(ZV, gV, band_of_bin, n) + istft_from_Z(ZB, gB, band_of_bin, n) + T[:, None]
     os.makedirs(os.path.join(ws, "media", "audio"), exist_ok=True)
     sf.write(os.path.join(ws, "media", "audio", "premaster_48k.wav"), mix.astype(np.float32), SR, subtype="FLOAT")
@@ -628,7 +796,11 @@ def cmd_mix(ws, c, fh):
              "bgm_atten_db_median_during_dub": round(float(np.median(20 * np.log10(gB[SPEECH][:, on].mean(0)))), 2) if on.any() else 0,
              "bgm_atten_db_min": round(float(20 * np.log10(gB.min())), 2),
              "filter_plan": fp, "seconds": round(time.time() - t0, 1)}
-    aicn.jdump(os.path.join(ws, "data", "03_mix_stats.json"), stats)
+    aicn.jdump(stats_p, stats)
+    if mix_key is not None:
+        st_cache = _audio_state_load(ws)
+        st_cache["mix_key"] = mix_key
+        _audio_state_save(ws, st_cache)
     print("[mix] " + json.dumps(stats))
 
 
@@ -699,6 +871,27 @@ def cmd_master(ws, c, fh):
     ff = ap.find_tool("ffmpeg")
     mode = profile(ws).get("localization_mode", "voice_dub")
     src = os.path.join(ws, "media", "audio", "premaster_48k.wav")
+    out = os.path.join(ws, "media", "master_audio_48k.wav")
+    dur = float(profile(ws)["duration"])
+    script_p = os.path.join(ws, "data", "02_bilingual_script.json")
+    master_key = None
+    if fh is not None:
+        in_ref = source_path(ws) if mode == "sub_only" else src
+        if in_ref and os.path.exists(in_ref):
+            master_key = aicn.h_obj({
+                "v": AUDIO_VERSION, "mode": mode, "src": fh(in_ref),
+                "script": fh(script_p) if (mode == "sub_only" and os.path.exists(script_p)) else None,
+                "dur": round(dur, 3),
+                "cfg": {k: c.get(k) for k in ("target_lufs", "true_peak_db", "lra", "master_mode")},
+            })
+            st_cache = _audio_state_load(ws)
+            sub_ok = (mode != "sub_only") or (
+                os.path.exists(os.path.join(ws, "data", "03_aligned_subtitles.json"))
+                and os.path.exists(os.path.join(ws, "data", "subtitles_full.srt"))
+            )
+            if not c.get("_force") and st_cache.get("master_key") == master_key and os.path.exists(out) and sub_ok:
+                print(f"[master] cached (key={master_key[:12]})")
+                return
     if mode == "sub_only":
         n_cues = write_sub_only_alignment(ws)
         print(f"[master] sub_only: aligned {n_cues} cues -> 03_aligned_subtitles.json & subtitles_full.srt")
@@ -707,8 +900,6 @@ def cmd_master(ws, c, fh):
     if not os.path.exists(src):
         sys.exit("[aicn-audio] no premaster: run `mix`")
     pre = "acompressor=threshold=-18dB:ratio=2:attack=20:release=250:makeup=1"
-    out = os.path.join(ws, "media", "master_audio_48k.wav")
-    dur = float(profile(ws)["duration"])
     t0 = time.time()
     if c.get("master_mode", "fast") == "loudnorm":
         ln = f"loudnorm=I={c['target_lufs']}:TP={c['true_peak_db']}:LRA={c['lra']}"
@@ -740,6 +931,10 @@ def cmd_master(ws, c, fh):
             run([ff, "-v", "error", "-y", "-i", src, "-af", af_tp, "-t", f"{dur:.3f}",
                  "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
             i, pk = lufs_file(out)
+    if master_key is not None:
+        st_cache = _audio_state_load(ws)
+        st_cache["master_key"] = master_key
+        _audio_state_save(ws, st_cache)
     print(f"[master] {out}: {i:.1f} LUFS, peak {pk:.1f} dBFS ({time.time() - t0:.1f}s)")
 
 
@@ -792,9 +987,10 @@ def cmd_verify(ws, c, fh):
         chk("dub_sync", len(aligned_segs) == len(script_segs) and not sync_bad,
             f"speech_start vs script start in [{min_d:+.3f}s, {max_d:+.3f}s] (allowed [-0.15, +0.75]), bad={sync_bad[:5]}")
     passed = all(x["passed"] for x in checks)
+    pub_params = {k: v for k, v in c.items() if not k.startswith("_")}
     aicn.jdump(os.path.join(ws, "data", "03_mix_report.json"), {"passed": passed, "version": AUDIO_VERSION, "checks": checks,
-                                                                 "params": c})
-    write_stage3_report(ws, mode, checks, c)
+                                                                 "params": pub_params})
+    write_stage3_report(ws, mode, checks, pub_params)
     for x in checks:
         print(f"  [{'PASS' if x['passed'] else 'FAIL'}] {x['id']}: {x['detail']}")
     if not passed:
@@ -809,8 +1005,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["separate", "dub", "analyze", "mix", "master", "verify", "all"])
     ap.add_argument("--unit", required=True)
+    ap.add_argument("--force", action="store_true", help="Ignore step/clause content-hash caches and recompute")
     a = ap.parse_args()
     ws = os.path.abspath(a.unit); c = cfg(ws); fh = aicn.FastHash(ws)
+    if a.force:
+        c["_force"] = True
     mode = profile(ws).get("localization_mode", "voice_dub")
     steps = {"separate": [cmd_separate], "dub": [cmd_dub], "analyze": [cmd_analyze], "mix": [cmd_mix], "master": [cmd_master], "verify": [cmd_verify],
              "all": ([cmd_master, cmd_verify] if mode == "sub_only" else [cmd_separate, cmd_dub, cmd_mix, cmd_master, cmd_verify])}

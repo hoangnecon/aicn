@@ -32,6 +32,19 @@ def strip_en_tags(text: str) -> str:
     return re.sub(r"<en>.*?</en>", "", text)
 
 
+def estimate_vieneu_tts_seconds(tts_text: str) -> float:
+    """Predict VieNeu v3 Turbo raw speaking duration (s) so Stage 2 catches Stage 3 OVERFLOW before TTS runs."""
+    en_spans = re.findall(r"<en>(.*?)</en>", tts_text)
+    en_words = sum(len(s.split()) for s in en_spans)
+    vi_clean = re.sub(r"[^\w\sÀ-ỹ]", " ", strip_en_tags(tts_text))
+    vi_syls = len([w for w in vi_clean.split() if w])
+    inner = tts_text.strip()[:-1] if len(tts_text.strip()) > 1 else ""
+    soft_pauses = len(re.findall(r"[,;:]", inner))
+    hard_pauses = len(re.findall(r"[.!?…]", inner))
+    # Empirical VieNeu v3 Turbo rate: ~5.15 VI syl/s, ~0.32s per English token, +0.06s trim margin
+    return (vi_syls / 5.15) + (en_words * 0.32) + (soft_pauses * 0.08) + (hard_pauses * 0.14) + 0.06
+
+
 def main():
     parser = argparse.ArgumentParser(description="Validate 02_bilingual_script.json and sign Stage 2 CI/CD gate.")
     parser.add_argument("--workspace", help="Workspace path (workspace/<slug>).")
@@ -53,9 +66,12 @@ def main():
 
     profile_path = os.path.join(ws, "data", "00_video_profile.json")
     loc_mode = "voice_dub"
+    video_dur = 0.0
     if os.path.exists(profile_path):
         with open(profile_path, "r", encoding="utf-8") as f:
-            loc_mode = json.load(f).get("localization_mode", "voice_dub")
+            _prof = json.load(f)
+            loc_mode = _prof.get("localization_mode", "voice_dub")
+            video_dur = float(_prof.get("duration", 0.0))
 
     with open(script_path, "r", encoding="utf-8") as f:
         segments = json.load(f)
@@ -109,6 +125,17 @@ def main():
             budget_errors.append(f"Seg #{sid}: sub_text length={len(sub)} chars (>96 max): {sub}")
         if syl_rate > max_syl_cap:
             budget_errors.append(f"Seg #{sid}: syllable rate={syl_rate:.2f} syl/s (>{max_syl_cap} max): {sub}")
+        if loc_mode == "voice_dub":
+            nxt_st = float(segments[idx + 1].get("start", et + 1.0)) if idx + 1 < len(segments) else (video_dur - 0.05 if video_dur > st else et + 0.5)
+            is_chained = not re.search(r"[.!?…]\s*$", tts) and idx + 1 < len(segments) and (nxt_st - et) < 0.6
+            lead_gap = 0.03 if is_chained else 0.10
+            avail_win = max(0.25, nxt_st - lead_gap - st)
+            est_s = estimate_vieneu_tts_seconds(tts)
+            est_tempo = est_s / avail_win
+            if est_tempo > 1.25:
+                budget_errors.append(
+                    f"Seg #{sid}: predicted Stage-3 TTS overflow ({est_s:.2f}s / {avail_win:.2f}s = {est_tempo:.2f}x > 1.25x): {tts}"
+                )
 
     if modified_tts_mirror:
         with open(script_path, "w", encoding="utf-8") as f:
@@ -190,7 +217,7 @@ def main():
             "description": f"All segments satisfy sub_text <= 96 chars, mean syllable rate <= {mean_syl_cap} syl/s, max <= {max_syl_cap} syl/s",
             "weight": 15,
             "passed": len(budget_errors) == 0 and mean_syl <= mean_syl_cap,
-            "detail": f"mean_syl={mean_syl:.2f} syl/s, max_syl={max_syl:.2f} syl/s, max_chars={max_chars}, budget_errors={len(budget_errors)}"
+            "detail": f"mean_syl={mean_syl:.2f} syl/s, max_syl={max_syl:.2f} syl/s, max_chars={max_chars}, budget_errors={len(budget_errors)} {budget_errors[:5]}"
         },
         {
             "id": "live_seag2p_ipa_compilation",

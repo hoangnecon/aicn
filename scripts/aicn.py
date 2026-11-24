@@ -156,6 +156,18 @@ def is_hub(d):
     return os.path.isdir(os.path.join(d, "units")) and os.path.exists(os.path.join(d, "config", "series_bible.json"))
 
 
+def resolve_unit_hub(ws, cfg=None):
+    """Return active Series Hub directory for a unit, falling back to parent-of-units if hub was renamed."""
+    cfg = cfg if cfg is not None else (jload(os.path.join(ws, "config", "project_config.json"), {}) or {})
+    hub = cfg.get("series_hub_dir") or ""
+    if hub and os.path.isdir(hub):
+        return hub
+    cand = os.path.dirname(os.path.dirname(os.path.abspath(ws)))
+    if os.path.basename(os.path.dirname(os.path.abspath(ws))) == "units" and is_hub(cand):
+        return cand
+    return ""
+
+
 def gate_status(ws):
     out = []
     for n in range(6):
@@ -599,7 +611,7 @@ def ffprobe_duration(p):
 def ffprobe_streams(p):
     out = subprocess.check_output([
         ap.find_tool("ffprobe"), "-v", "error", "-show_entries",
-        "stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,time_base,start_time,duration,nb_frames,sample_rate,channels",
+        "stream=index,codec_type,codec_name,codec_tag_string,width,height,r_frame_rate,avg_frame_rate,time_base,start_time,duration,nb_frames,sample_rate,channels",
         "-of", "json", p,
     ], text=True)
     return json.loads(out).get("streams", [])
@@ -1069,7 +1081,7 @@ def cmd_log(a):
     with open(p, "a", encoding="utf-8") as f:
         f.write(f"- {now()} [{a.kind}] {a.message}\n")
     cfg = jload(os.path.join(ws, "config", "project_config.json"), {})
-    hub = cfg.get("series_hub_dir")
+    hub = resolve_unit_hub(ws, cfg)
     if hub and os.path.exists(os.path.join(hub, "PROGRESS.md")):
         refresh_progress(hub)
     print(f"[log] appended to {p}")

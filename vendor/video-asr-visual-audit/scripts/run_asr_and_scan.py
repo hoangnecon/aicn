@@ -335,10 +335,28 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
 
 
 
+ASR_PIPELINE_VERSION = "asr-2.2"
+HALLUCINATION_SUBSTRINGS = (
+    "索兰娅", "谢谢观看", "感谢观看", "感谢收看", "请不吝点赞", "点赞订阅",
+    "字幕由", "优优独播剧场", "Amara.org", "Thank you for watching", "Thanks for watching",
+    "Please subscribe", "Subtitles by",
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    low = t.lower()
+    return any(h.lower() in low for h in HALLUCINATION_SUBSTRINGS)
+
+
 class _Seg:
     def __init__(self, d):
         self.text, self.start, self.end = d["text"], d["start"], d["end"]
         self.avg_logprob = d.get("avg_logprob", -0.2)
+        self.no_speech_prob = d.get("no_speech_prob", 0.0)
+        self.compression_ratio = d.get("compression_ratio", 1.0)
 
 
 class _MlxWhisper:
@@ -597,14 +615,14 @@ def run_multipass_whisper_asr(
                 f"{visual_ocr_cnt} visual-only sub-clause gaps for mandatory keyframe OCR.",
                 flush=True,
             )
-    # Pass 2B: Acoustic Quiet-Whisper, Telephone/Radio & Uncovered Vocal Burst Recovery (independent of hardsub presence)
-    boosted_ac = None
-    from analyze_voice_waveform import compute_voice_mask_and_bursts
-    tel_src = decode_audio_16k(
-        video_path,
-        af_filter="highpass=f=280,lowpass=f=3600,dynaudnorm=f=50:g=16:p=0.92:m=15.0",
-    )
-    raw_tel = decode_audio_16k(video_path, af_filter="highpass=f=300,lowpass=f=3400")
+    # Pass 2B: Acoustic Quiet-Whisper, Telephone/Radio & Uncovered Vocal Burst Recovery (in-RAM bandpass, independent of hardsub)
+    from analyze_voice_waveform import compute_voice_mask_and_bursts, _bandpass_in_ram
+    raw_tel = _bandpass_in_ram(raw_audio, 300.0, 3400.0, sr=16000)
+    # Fast local RMS normalization for telephony envelope without spawning an extra ffmpeg decode
+    win_n = 1600
+    tel_env = np.sqrt(np.convolve(raw_tel ** 2, np.ones(win_n, dtype=np.float32) / win_n, mode="same") + 1e-8)
+    tel_src = np.clip(raw_tel / np.maximum(tel_env * 3.0, 0.04), -0.95, 0.95).astype(np.float32)
+    voc_bp = _bandpass_in_ram(voc_audio, 150.0, 6000.0, sr=16000)
     _, merged_bursts = compute_voice_mask_and_bursts(
         voc_audio, tel_src, raw_tel_arr=raw_tel, raw_arr=raw_audio, sr=16000
     )
@@ -629,19 +647,24 @@ def run_multipass_whisper_asr(
             f"[PASS 2B ACOUSTIC RECOVERY] Probing {len(uncovered_bursts)} uncovered whisper/phone/vocal bursts...",
             flush=True,
         )
-        boosted_ac = tel_src
         rec_cnt = 0
         for b in uncovered_bursts:
             kind = b.get("kind", "normal")
             pad_s = max(0.0, float(b["start"]) - 0.22)
-            pad_e = min(len(boosted_ac) / sr, float(b["end"]) + 0.22)
+            pad_e = min(len(raw_audio) / sr, float(b["end"]) + 0.22)
             s_idx, e_idx = int(round(pad_s * sr)), int(round(pad_e * sr))
-            src_wave = boosted_ac if kind in ("phone_call", "whisper") else voc_audio
+            # Whisper uses separated vocals (so BGM does not drown soft voice); phone_call uses telephony bandpass raw audio
+            if kind == "phone_call":
+                src_wave = tel_src
+            elif kind == "whisper":
+                src_wave = voc_bp
+            else:
+                src_wave = voc_audio
             clip = src_wave[s_idx:min(len(src_wave), e_idx)]
             if len(clip) < int(0.35 * sr):
                 continue
             mx = float(np.max(np.abs(clip)))
-            if mx > 0.003:
+            if mx > 0.002:
                 clip = clip / mx * 0.85
             sub_gen, _ = model.transcribe(
                 clip,
@@ -653,14 +676,15 @@ def run_multipass_whisper_asr(
                 temperature=0.0,
             )
             sub_list = list(sub_gen)
-            texts = [sg.text.strip() for sg in sub_list if sg.text.strip() and "索兰娅" not in sg.text]
+            texts = [sg.text.strip() for sg in sub_list if sg.text.strip() and not _is_hallucination(sg.text)]
             if texts:
                 rec_text = " ".join(texts)
                 rec_prob = round(float(getattr(sub_list[0], "avg_logprob", -0.6)), 3)
                 no_sp = float(getattr(sub_list[0], "no_speech_prob", 0.0))
+                comp_r = float(getattr(sub_list[0], "compression_ratio", 1.0))
                 n_cjk = len([c for c in rec_text if "\u4e00" <= c <= "\u9fff"])
                 has_words = (n_cjk >= 2) if (source_lang == "zh") else (len(rec_text.strip()) >= 3)
-                if rec_prob > -0.95 and no_sp < 0.65 and has_words:
+                if rec_prob > -0.95 and no_sp < 0.65 and comp_r <= 2.2 and has_words:
                     rec_cnt += 1
                     results.append({
                         "id": -1,
@@ -691,6 +715,7 @@ def main():
     parser.add_argument("--with-bbox-scan", action="store_true", help="Opt-in to legacy 5fps pixel bbox scan (disabled by default in v2.0.0 dub+watermark pipeline).")
     parser.add_argument("--skip-scan", action="store_true", help="Deprecated no-op (bbox scan is already skipped by default).")
     parser.add_argument("--skip-asr", action="store_true", help="Skip Whisper ASR if 01_asr_raw_segments.json already exists.")
+    parser.add_argument("--force", action="store_true", help="Ignore Stage 1 content-hash cache and re-run ASR.")
     args = parser.parse_args()
 
     require_gate(args.workspace, 0)
@@ -720,17 +745,36 @@ def main():
         print("[SKIP] 5fps hardsub bbox scan skipped (v2.0.0 dub+watermark pipeline uses Whisper ASR + acoustic waveform).", flush=True)
 
     if not (args.skip_asr and os.path.exists(asr_json)):
+        import hashlib as _hashlib
+        from analyze_voice_waveform import _fast_file_sig
         stems_voc = os.path.join(args.workspace, "media", "stems", "vocals.wav")
         legacy_voc = os.path.join(args.workspace, "media", "demucs", "vocals.wav")
         vocals_path = stems_voc if os.path.exists(stems_voc) else legacy_voc
         source_lang = resolve_source_language(args.workspace, args.source_lang)
-        run_multipass_whisper_asr(
-            video_path=args.video,
-            vocals_path=vocals_path,
-            bbox_json=bbox_json,
-            out_json=asr_json,
-            source_lang=source_lang,
-        )
+        asr_key = _hashlib.sha256(
+            f"{ASR_PIPELINE_VERSION}|{_fast_file_sig(args.video)}|{_fast_file_sig(vocals_path)}|{_fast_file_sig(bbox_json)}|{source_lang}".encode()
+        ).hexdigest()[:16]
+        asr_cache_p = os.path.join(args.workspace, ".cache", "stage1_asr_cache.json")
+        prev_key = None
+        if os.path.exists(asr_cache_p):
+            try:
+                with open(asr_cache_p, "r", encoding="utf-8") as cf:
+                    prev_key = json.load(cf).get("key")
+            except Exception:
+                prev_key = None
+        if not args.force and prev_key == asr_key and os.path.exists(asr_json):
+            print(f"[CACHE] Stage 1 ASR hit ({asr_key}) -> keeping {asr_json}", flush=True)
+        else:
+            run_multipass_whisper_asr(
+                video_path=args.video,
+                vocals_path=vocals_path,
+                bbox_json=bbox_json,
+                out_json=asr_json,
+                source_lang=source_lang,
+            )
+            os.makedirs(os.path.dirname(asr_cache_p), exist_ok=True)
+            with open(asr_cache_p, "w", encoding="utf-8") as cf:
+                json.dump({"key": asr_key, "version": ASR_PIPELINE_VERSION, "source_lang": source_lang}, cf, indent=2)
 
     # Always run Multi-Band Acoustic Waveform & Sub-Clause Alignment Audit
     from analyze_voice_waveform import analyze_waveform_and_clauses

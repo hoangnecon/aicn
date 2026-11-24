@@ -208,6 +208,23 @@ class CLI(unittest.TestCase):
             disc = self.run_cli("discover", "--root", d).stdout
             self.assertIn("title_vi: Bộ Mới VIP", disc)
             self.assertIn("title_zh: 新剧名", disc)
+            # Renamed hub fallback when unit project_config still points at old hub dir
+            u1 = os.path.join(new_hub, "units", "unit_01")
+            os.makedirs(os.path.join(u1, "config"), exist_ok=True)
+            aicn.jdump(os.path.join(u1, "config", "project_config.json"), {"slug": "unit_01", "series_hub_dir": old_hub})
+            self.assertEqual(os.path.normcase(aicn.resolve_unit_hub(u1)), os.path.normcase(new_hub))
+
+    def test_ffprobe_streams_includes_codec_tag_string(self):
+        with tempfile.TemporaryDirectory() as td:
+            vid = os.path.join(td, "sample.mp4")
+            subprocess.run([
+                aicn.ap.find_tool("ffmpeg"), "-v", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=160x120:d=0.5:r=24",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", vid,
+            ], check=True)
+            streams = aicn.ffprobe_streams(vid)
+            vs = next(s for s in streams if s.get("codec_type") == "video")
+            self.assertTrue(vs.get("codec_tag_string"), f"codec_tag_string missing from ffprobe_streams: {vs}")
 
     def test_portrait_9x16_watermark_scaling(self):
         with tempfile.TemporaryDirectory() as td:

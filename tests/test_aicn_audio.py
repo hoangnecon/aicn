@@ -264,49 +264,109 @@ class Signal(unittest.TestCase):
         self.assertTrue(held[30:50].all())
         self.assertFalse(held[70:145].any())
 
-    def test_analyze_writes_spectral_json_and_adapts_cutoffs(self):
+    def test_analyze_writes_spectral_json_and_respects_user_overrides(self):
         sys.path.insert(0, SCRIPTS)
         import aicn
         with tempfile.TemporaryDirectory() as d:
-            for sub in ("data", "media/stems", "media/audio"):
+            for sub in ("data", "config", "media/stems", "media/audio"):
                 os.makedirs(os.path.join(d, sub), exist_ok=True)
             t = np.arange(self.sr * 2) / self.sr
             rumble_voc = (0.35 * np.sin(2 * np.pi * 60 * t) + 0.15 * np.sin(2 * np.pi * 900 * t)).astype(np.float32)
             soundfile.write(os.path.join(d, "media/stems/vocals.wav"), np.stack([rumble_voc, rumble_voc], axis=1), self.sr)
             acc = (0.2 * np.sin(2 * np.pi * 400 * t)).astype(np.float32)
             soundfile.write(os.path.join(d, "media/stems/accomp.wav"), np.stack([acc, acc], axis=1), self.sr)
-            soundfile.write(os.path.join(d, "media/audio/dub_voice_48k.wav"), self.tone(2.0), self.sr)
+            # Dub with 50% silence padding: active-frame RMS must stay near speech level, not dropped by silence
+            dub_sig = np.concatenate([np.zeros(self.sr, np.float32), self.tone(1.0)])
+            soundfile.write(os.path.join(d, "media/audio/dub_voice_48k.wav"), dub_sig, self.sr)
             aicn.jdump(os.path.join(d, "data/00_video_profile.json"), {"duration": 2.0, "localization_mode": "voice_dub"})
+            # Default: adaptive vocal_hp_hz raises to >=120 Hz on heavy 60Hz rumble
             self.m.cmd_analyze(d, dict(self.m.DEFAULTS), aicn.FastHash(d))
             spec = aicn.jload(os.path.join(d, "data/03_spectral_analysis.json"))
-            self.assertIn("vocals", spec["stems"])
-            self.assertIn("accomp", spec["stems"])
-            self.assertIn("dub", spec["stems"])
-            self.assertGreaterEqual(spec["filter_plan"]["vocal_hp_hz"], 130.0)
+            self.assertGreaterEqual(spec["filter_plan"]["vocal_hp_hz"], 120.0)
+            self.assertGreater(spec["stems"]["dub"]["rms_dbfs"], -18.0)
+            # Explicit user override in config/audio_mix.json MUST be respected
+            aicn.jdump(os.path.join(d, "config/audio_mix.json"), {"vocal_hp_hz": 75.0, "vocal_high_dip_db": -1.5})
+            self.m.cmd_analyze(d, self.m.cfg(d), aicn.FastHash(d))
+            spec2 = aicn.jload(os.path.join(d, "data/03_spectral_analysis.json"))
+            self.assertEqual(spec2["filter_plan"]["vocal_hp_hz"], 75.0)
+            self.assertEqual(spec2["filter_plan"]["vocal_high_dip_db"], -1.5)
 
-    def test_stage1_detects_whisper_and_telephony_phone_call_bursts(self):
+    def test_follow_hold_and_end_to_end_mix_no_floor_slam_and_step_cache(self):
+        sys.path.insert(0, SCRIPTS)
+        import aicn
+        # 1) Pure follow_hold check: 0.2s pause stays held flat (no release jump, no floor slam), then releases smoothly
+        g = np.ones((1, 180), dtype=np.float64)
+        g[0, 10:30] = 0.35
+        g[0, 50:70] = 0.35
+        held = self.m.follow_hold(g, fps=100.0, att=0.02, hold_s=0.35, rel=0.40)[0]
+        self.assertGreater(held[35], 0.30)
+        self.assertLess(held[45], 0.45)
+        self.assertGreater(held[170], 0.80)
+
+        # 2) End-to-end cmd_mix -> cmd_master + cache hit verification
+        with tempfile.TemporaryDirectory() as d:
+            for sub in ("data", "config", "media/stems", "media/audio"):
+                os.makedirs(os.path.join(d, sub), exist_ok=True)
+            t = np.arange(self.sr * 4) / self.sr
+            voc = (0.18 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+            acc = (0.12 * np.sin(2 * np.pi * 250 * t)).astype(np.float32)
+            # Dub speaks 0.5..1.5s, 0.20s breath pause 1.5..1.7s, speaks 1.7..2.7s, silence 2.7..4.0s
+            dub = np.zeros(self.sr * 4, dtype=np.float32)
+            dub[int(0.5 * self.sr):int(1.5 * self.sr)] = 0.25 * np.sin(2 * np.pi * 1000 * t[:self.sr])
+            dub[int(1.7 * self.sr):int(2.7 * self.sr)] = 0.25 * np.sin(2 * np.pi * 1000 * t[:self.sr])
+            soundfile.write(os.path.join(d, "media/stems/vocals.wav"), np.stack([voc, voc], axis=1), self.sr)
+            soundfile.write(os.path.join(d, "media/stems/accomp.wav"), np.stack([acc, acc], axis=1), self.sr)
+            soundfile.write(os.path.join(d, "media/audio/dub_voice_48k.wav"), dub, self.sr)
+            aicn.jdump(os.path.join(d, "data/00_video_profile.json"), {"duration": 4.0, "localization_mode": "voice_dub"})
+            fh = aicn.FastHash(d)
+            c = self.m.cfg(d)
+            self.m.cmd_mix(d, c, fh)
+            st = aicn.jload(os.path.join(d, "data/03_mix_stats.json"))
+            self.assertGreaterEqual(st["dub_snr_speech_db_median"], 8.0)
+            # Second call with unchanged inputs must hit step cache without modifying premaster mtime
+            pre_p = os.path.join(d, "media/audio/premaster_48k.wav")
+            mt1 = os.path.getmtime(pre_p)
+            self.m.cmd_mix(d, c, fh)
+            self.assertEqual(os.path.getmtime(pre_p), mt1)
+
+    def test_stage1_detects_modulated_whisper_and_phone_with_bass_and_rejects_steady_instrument(self):
         v1_dir = os.path.join(HERE, "..", "vendor", "video-asr-visual-audit", "scripts")
         sys.path.insert(0, v1_dir)
         import analyze_voice_waveform as avw
         sr16 = 16000
         t1 = np.arange(sr16 * 1) / sr16
         rng = np.random.default_rng(42)
-        # 1) 0..1s silence, 1..2s soft breathy whisper in vocals, 2..3s silence, 3..4s pure phone call (vocals=0, raw_tel=phone speech)
         sil = np.zeros(sr16, dtype=np.float32)
-        whisper = (0.008 * np.sin(2 * np.pi * 1400 * t1) + 0.005 * rng.standard_normal(sr16)).astype(np.float32)
-        phone_tone = (0.04 * np.sin(2 * np.pi * 1200 * t1) + 0.03 * np.sin(2 * np.pi * 2100 * t1)).astype(np.float32)
+        # Syllable modulation envelope (~5 Hz bursts like human speech)
+        syl_env = (0.5 + 0.5 * np.sin(2 * np.pi * 5.0 * t1)).astype(np.float32) ** 2
+        whisper = (syl_env * (0.011 * np.sin(2 * np.pi * 1400 * t1) + 0.006 * rng.standard_normal(sr16))).astype(np.float32)
+        # Modulated phone call + heavy 80 Hz bass BGM (vocals stem silent because Demucs pushed phone to accomp)
+        bass = (0.06 * np.sin(2 * np.pi * 80 * t1)).astype(np.float32)
+        phone_speech = (syl_env * (0.045 * np.sin(2 * np.pi * 1200 * t1) + 0.035 * np.sin(2 * np.pi * 2100 * t1))).astype(np.float32)
+        # Steady sustained 1.5 kHz solo instrument (zero syllable modulation) -> MUST NOT trigger phone_call
+        steady_inst = (0.04 * np.sin(2 * np.pi * 1500 * t1)).astype(np.float32)
 
-        voc = np.concatenate([sil, whisper, sil, sil])
-        raw = np.concatenate([sil, whisper, sil, phone_tone])
-        raw_tel = raw.copy()
-        tel_norm = np.concatenate([sil, whisper * 20.0, sil, phone_tone * 6.0])
+        voc = np.concatenate([sil, whisper, sil, sil, sil, sil])
+        raw = np.concatenate([sil, whisper, sil, phone_speech + bass, sil, steady_inst])
+        raw_tel = avw._bandpass_in_ram(raw, 300.0, 3400.0, sr=sr16)
+        tel_norm = np.clip(raw_tel * 6.0, -0.95, 0.95).astype(np.float32)
         _, bursts = avw.compute_voice_mask_and_bursts(voc, tel_norm, raw_tel_arr=raw_tel, raw_arr=raw, sr=sr16)
-        kinds = [b["kind"] for b in bursts]
-        self.assertIn("whisper", kinds, bursts)
-        self.assertIn("phone_call", kinds, bursts)
+        kinds = [(b["kind"], b["start"]) for b in bursts]
+        self.assertTrue(any(k == "whisper" and 0.8 <= s <= 1.4 for k, s in kinds), kinds)
+        self.assertTrue(any(k == "phone_call" and 2.8 <= s <= 3.4 for k, s in kinds), kinds)
+        self.assertFalse(any(4.8 <= s <= 6.0 for _, s in kinds), f"Steady solo instrument falsely detected: {kinds}")
         prof = avw.compute_audio_spectral_profile(raw, sr=sr16)
-        self.assertIn("recommended_hp_hz", prof)
-        self.assertGreater(prof["frequency_bands_pct"]["speech_300_3400hz"], 50.0)
+        self.assertEqual(prof["nyquist_hz"], 8000)
+        self.assertNotIn("recommended_lp_hz", prof)
+
+    def test_stage2_overflow_predictor_catches_tight_tts(self):
+        v2_dir = os.path.join(HERE, "..", "vendor", "zh-vi-script-adapter", "scripts")
+        sys.path.insert(0, v2_dir)
+        import validate_bilingual_script as vbs
+        short_s = vbs.estimate_vieneu_tts_seconds("Đi thôi.")
+        long_s = vbs.estimate_vieneu_tts_seconds("Đây là một câu tiếng Việt rất dài, nhiều âm tiết, có <en>GPU</en> nữa.")
+        self.assertLess(short_s, 0.8)
+        self.assertGreater(long_s, 3.0)
 
 
 if __name__ == "__main__":

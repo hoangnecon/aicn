@@ -46,56 +46,81 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+WAVEFORM_CACHE_VERSION = "wf-2.2"
+
+
+def _fast_file_sig(path: str) -> str:
+    if not path or not os.path.exists(path):
+        return "missing"
+    st = os.stat(path)
+    return f"{os.path.abspath(path)}:{st.st_size}:{st.st_mtime_ns}"
+
+
 def compute_audio_spectral_profile(audio_arr: np.ndarray, sr: int = 16000) -> dict:
-    """Compute 5-band frequency share, spectral centroid, waveform RMS/Peak/Crest, and HP/LP hints."""
+    """Compute active-frame 5-band frequency share (respecting Nyquist sr/2), centroid, RMS/Peak/Crest, and HP hint."""
     x = np.asarray(audio_arr, dtype=np.float32)
     if x.size == 0:
         return {}
-    rms = float(np.sqrt(np.mean(x ** 2) + 1e-12))
     peak = float(np.max(np.abs(x)) + 1e-12)
-    rms_db = round(20.0 * np.log10(rms), 2)
     peak_db = round(20.0 * np.log10(peak), 2)
-    crest_db = round(peak_db - rms_db, 2)
 
     win = min(len(x), 4096)
     n_blocks = max(1, len(x) // win)
     blk = x[: n_blocks * win].reshape(n_blocks, win)
+    b_rms = np.sqrt(np.mean(blk ** 2, axis=1) + 1e-15)
+    act = b_rms > max(10.0 ** (-55.0 / 20.0), peak * 1e-3)
+    active_blk = blk[act] if act.any() else blk
+    rms = float(np.sqrt(np.mean(active_blk ** 2) + 1e-12))
+    rms_db = round(20.0 * np.log10(rms), 2)
+    crest_db = round(peak_db - rms_db, 2)
+
     hann = np.hanning(win).astype(np.float32)[None, :]
-    spec = np.fft.rfft(blk * hann, axis=1)
+    spec = np.fft.rfft(active_blk * hann, axis=1)
     mag2 = (spec.real ** 2 + spec.imag ** 2).mean(axis=0)
     freqs = np.fft.rfftfreq(win, 1.0 / sr)
     tot = float(mag2.sum() + 1e-15)
+    nyq = sr / 2.0
 
     def band_pct(lo, hi):
-        m = (freqs >= lo) & (freqs < hi)
+        m = (freqs >= lo) & (freqs < min(hi, nyq + 1.0))
         return round(100.0 * float(mag2[m].sum()) / tot, 2) if m.any() else 0.0
 
     sub_pct = band_pct(0, 120)
     low_pct = band_pct(120, 300)
     speech_pct = band_pct(300, 3400)
     pres_pct = band_pct(3400, 6500)
-    air_pct = band_pct(6500, sr / 2.0 + 1)
+    high_pct = band_pct(6500, nyq + 1.0)
     centroid_hz = round(float((freqs * mag2).sum() / tot), 1)
     rec_hp = 110 if sub_pct > 18.0 else (95 if sub_pct > 10.0 else 85)
-    rec_lp = 11500 if air_pct > 12.0 else 14500
 
     return {
+        "sample_rate_hz": sr,
+        "nyquist_hz": int(nyq),
         "waveform": {
             "rms_dbfs": rms_db,
             "peak_dbfs": peak_db,
             "crest_factor_db": crest_db,
+            "active_block_ratio": round(float(act.mean()), 3),
         },
         "frequency_bands_pct": {
             "sub_lt120hz": sub_pct,
             "low_mid_120_300hz": low_pct,
             "speech_300_3400hz": speech_pct,
             "presence_3400_6500hz": pres_pct,
-            "air_gt6500hz": air_pct,
+            "high_6500_nyquist": high_pct,
         },
         "spectral_centroid_hz": centroid_hz,
         "recommended_hp_hz": rec_hp,
-        "recommended_lp_hz": rec_lp,
+        "lp_note": "Full-band LP cutoff is analyzed at 48 kHz in Stage 3 (aicn_audio.py analyze).",
     }
+
+
+def _bandpass_in_ram(x: np.ndarray, lo_hz: float, hi_hz: float, sr: int = 16000) -> np.ndarray:
+    """Fast zero-disk Butterworth bandpass filter in RAM (avoids redundant ffmpeg MP4 decodes)."""
+    from scipy.signal import butter, sosfilt
+    nyq = 0.5 * sr
+    sos = butter(2, [max(10.0, lo_hz) / nyq, min(nyq * 0.95, hi_hz) / nyq], btype="band", output="sos")
+    return sosfilt(sos, np.asarray(x, dtype=np.float32)).astype(np.float32)
 
 
 def compute_voice_mask_and_bursts(
@@ -105,6 +130,11 @@ def compute_voice_mask_and_bursts(
     raw_arr: np.ndarray = None,
     sr: int = 16000,
 ):
+    """
+    Detect:
+      - `voice_mask`: clean primary speech mask (for onset clamping without BGM/instrument false positives)
+      - `merged_bursts`: normal, adaptive-floor `whisper`, and modulation-validated `phone_call` bursts
+    """
     hop = int(0.05 * sr)
     lens = [len(voc_arr), len(tel_arr)]
     if raw_tel_arr is not None:
@@ -112,101 +142,158 @@ def compute_voice_mask_and_bursts(
     if raw_arr is not None:
         lens.append(len(raw_arr))
     n_hops = min(lens) // hop
+    if n_hops <= 0:
+        return np.zeros(0, dtype=bool), []
+
+    v_blks = voc_arr[: n_hops * hop].reshape(n_hops, hop)
+    t_blks = tel_arr[: n_hops * hop].reshape(n_hops, hop)
+    v_rms_arr = np.sqrt(np.mean(v_blks ** 2, axis=1) + 1e-12)
+    t_rms_arr = np.sqrt(np.mean(t_blks ** 2, axis=1) + 1e-12)
+    zcr_arr = np.mean(np.abs(np.diff(np.sign(v_blks), axis=1)), axis=1) / 2.0
+    t_zcr_arr = np.mean(np.abs(np.diff(np.sign(t_blks), axis=1)), axis=1) / 2.0
+
+    # Adaptive noise floor & speech reference so detection scales across quiet (-24 LUFS) and loud (-11 LUFS) dramas
+    voc_floor = max(0.002, min(0.006, float(np.percentile(v_rms_arr, 15))))
+    nz_v = v_rms_arr[v_rms_arr > voc_floor * 1.2]
+    voc_ref = max(0.020, float(np.percentile(nz_v, 85))) if nz_v.size >= 10 else 0.035
+    normal_thresh = max(0.016, min(0.024, voc_floor * 3.0))
+    whisper_lo = max(0.0040, voc_floor * 1.8)
+    whisper_hi = max(normal_thresh, min(0.022, voc_ref * 0.38))
+
+    if raw_tel_arr is not None and raw_arr is not None:
+        rt_blks = raw_tel_arr[: n_hops * hop].reshape(n_hops, hop)
+        rt_rms_arr = np.sqrt(np.mean(rt_blks ** 2, axis=1) + 1e-12)
+        # Upper-band (>3.5 kHz) energy on raw audio: real telephone lines roll off sharply above 3.4 kHz
+        hi_arr = _bandpass_in_ram(raw_arr[: n_hops * hop], 3600.0, 7200.0, sr=sr)
+        hi_rms_arr = np.sqrt(np.mean(hi_arr.reshape(n_hops, hop) ** 2, axis=1) + 1e-12)
+        tel_vs_hi_arr = rt_rms_arr / (hi_rms_arr + 1e-6)
+        has_raw_tel = True
+    else:
+        rt_rms_arr = np.zeros(n_hops, dtype=np.float32)
+        tel_vs_hi_arr = np.zeros(n_hops, dtype=np.float32)
+        has_raw_tel = False
+
     voice_mask = np.zeros(n_hops, dtype=bool)
     raw_bursts = []
     in_burst = False
-    b_st = 0.0
+    b_i0 = 0
     b_peak_voc = 0.0
     b_peak_tel = 0.0
     b_phone_hits = 0
     b_whisper_hits = 0
     b_normal_hits = 0
 
+    def _finalize_burst(i0, i1, peak_v, peak_t, n_ph, n_wh, n_nm):
+        if (i1 - i0) < 2:
+            return
+        b_st = i0 * 0.05
+        b_et = i1 * 0.05
+        raw_bursts.append({
+            "start": round(b_st, 2),
+            "end": round(b_et, 2),
+            "peak_voc_rms": round(float(peak_v), 4),
+            "peak_tel_rms": round(float(peak_t), 4),
+            "_i0": int(i0),
+            "_i1": int(i1),
+            "_ph": int(n_ph),
+            "_wh": int(n_wh),
+            "_nm": int(n_nm),
+        })
+
     for i in range(n_hops):
-        t = i * 0.05
-        vc = voc_arr[i * hop:(i + 1) * hop]
-        tc = tel_arr[i * hop:(i + 1) * hop]
-        v_rms = float(np.sqrt(np.mean(vc ** 2)))
-        t_rms = float(np.sqrt(np.mean(tc ** 2)))
-        zcr = float(np.mean(np.abs(np.diff(np.sign(vc)))) / 2.0)
+        v_rms = float(v_rms_arr[i])
+        t_rms = float(t_rms_arr[i])
+        zcr = float(zcr_arr[i])
+        t_zcr = float(t_zcr_arr[i])
 
-        rt_rms = float(np.sqrt(np.mean(raw_tel_arr[i * hop:(i + 1) * hop] ** 2))) if raw_tel_arr is not None else 0.0
-        r_rms = float(np.sqrt(np.mean(raw_arr[i * hop:(i + 1) * hop] ** 2))) if raw_arr is not None else max(v_rms, 1e-6)
-        tel_ratio = rt_rms / (r_rms + 1e-6)
-        t_zcr = float(np.mean(np.abs(np.diff(np.sign(tc)))) / 2.0)
-
-        is_normal = (v_rms > 0.018 and 0.02 <= zcr <= 0.32)
-        is_whisper = (0.0055 <= v_rms <= 0.018 and 0.02 <= zcr <= 0.45)
-        if raw_tel_arr is not None:
-            is_phone = (tel_ratio > 0.55 and rt_rms > 0.004 and rt_rms > v_rms * 1.35 and 0.02 <= t_zcr <= 0.36)
+        is_normal = (v_rms > normal_thresh and 0.02 <= zcr <= 0.32)
+        is_whisper = (whisper_lo <= v_rms <= whisper_hi and 0.02 <= zcr <= 0.45 and not is_normal)
+        if has_raw_tel:
+            rt_rms = float(rt_rms_arr[i])
+            tel_vs_hi = float(tel_vs_hi_arr[i])
+            # Works even with bass BGM present because it compares 300-3400Hz telephony vs >3.6kHz roll-off
+            is_phone = (
+                rt_rms > max(0.004, voc_floor * 1.8)
+                and rt_rms > v_rms * 1.35
+                and tel_vs_hi > 2.2
+                and 0.02 <= t_zcr <= 0.36
+            )
         else:
             is_phone = (t_rms > 0.12 and v_rms > 0.006 and 0.02 <= zcr <= 0.35)
-        is_voice = is_normal or is_whisper or is_phone
-        voice_mask[i] = is_voice
 
-        is_strong_burst = (
-            (v_rms > 0.020 and 0.02 <= zcr <= 0.30)
-            or is_whisper
-            or is_phone
-        )
-        if is_strong_burst:
+        # Keep voice_mask clean for onset clamping (normal speech + confirmed vocals, not ambient hiss/instruments)
+        voice_mask[i] = is_normal or (t_rms > 0.14 and v_rms > max(0.008, voc_floor * 2.5) and 0.02 <= zcr <= 0.32)
+
+        is_candidate = is_normal or is_whisper or is_phone
+        if is_candidate:
             if not in_burst:
                 in_burst = True
-                b_st = t
+                b_i0 = i
                 b_peak_voc = v_rms
                 b_peak_tel = t_rms
                 b_phone_hits = 1 if is_phone else 0
-                b_whisper_hits = 1 if (is_whisper and not is_normal) else 0
+                b_whisper_hits = 1 if is_whisper else 0
                 b_normal_hits = 1 if is_normal else 0
             else:
                 b_peak_voc = max(b_peak_voc, v_rms)
                 b_peak_tel = max(b_peak_tel, t_rms)
                 if is_phone:
                     b_phone_hits += 1
-                if is_whisper and not is_normal:
+                if is_whisper:
                     b_whisper_hits += 1
                 if is_normal:
                     b_normal_hits += 1
         else:
             if in_burst:
-                b_et = t
-                if (b_et - b_st) >= 0.35:
-                    kind = "phone_call" if (b_phone_hits > b_normal_hits and b_phone_hits >= 3) else (
-                        "whisper" if (b_whisper_hits >= 3 and b_normal_hits == 0) else "normal"
-                    )
-                    raw_bursts.append({
-                        "start": round(b_st, 2),
-                        "end": round(b_et, 2),
-                        "peak_voc_rms": round(b_peak_voc, 4),
-                        "peak_tel_rms": round(b_peak_tel, 4),
-                        "kind": kind,
-                    })
+                _finalize_burst(b_i0, i, b_peak_voc, b_peak_tel, b_phone_hits, b_whisper_hits, b_normal_hits)
                 in_burst = False
 
     if in_burst:
-        b_et = round(n_hops * 0.05, 2)
-        if (b_et - b_st) >= 0.35:
-            kind = "phone_call" if (b_phone_hits > b_normal_hits and b_phone_hits >= 3) else (
-                "whisper" if (b_whisper_hits >= 3 and b_normal_hits == 0) else "normal"
-            )
-            raw_bursts.append({
-                "start": round(b_st, 2),
-                "end": round(b_et, 2),
-                "peak_voc_rms": round(b_peak_voc, 4),
-                "peak_tel_rms": round(b_peak_tel, 4),
-                "kind": kind,
-            })
+        _finalize_burst(b_i0, n_hops, b_peak_voc, b_peak_tel, b_phone_hits, b_whisper_hits, b_normal_hits)
+
+    # Merge syllable-level micro-bursts across <=0.22s pauses BEFORE applying duration & modulation checks
+    grouped = []
+    for b in raw_bursts:
+        if grouped and (b["start"] - grouped[-1]["end"]) <= 0.22:
+            prev = grouped[-1]
+            prev["end"] = b["end"]
+            prev["_i1"] = b["_i1"]
+            prev["peak_voc_rms"] = max(prev["peak_voc_rms"], b["peak_voc_rms"])
+            prev["peak_tel_rms"] = max(prev["peak_tel_rms"], b["peak_tel_rms"])
+            prev["_ph"] += b["_ph"]
+            prev["_wh"] += b["_wh"]
+            prev["_nm"] += b["_nm"]
+        else:
+            grouped.append(dict(b))
 
     merged_bursts = []
-    for b in raw_bursts:
-        if merged_bursts and (b["start"] - merged_bursts[-1]["end"]) <= 0.22:
-            merged_bursts[-1]["end"] = b["end"]
-            merged_bursts[-1]["peak_voc_rms"] = max(merged_bursts[-1]["peak_voc_rms"], b["peak_voc_rms"])
-            merged_bursts[-1]["peak_tel_rms"] = max(merged_bursts[-1]["peak_tel_rms"], b["peak_tel_rms"])
-            if merged_bursts[-1].get("kind") == "normal" and b.get("kind") != "normal":
-                merged_bursts[-1]["kind"] = b["kind"]
+    for b in grouped:
+        i0, i1 = b["_i0"], b["_i1"]
+        if (i1 - i0) < 7:
+            continue
+        n_ph, n_wh, n_nm = b["_ph"], b["_wh"], b["_nm"]
+        # Reject steady hum/sustained solo instruments using syllable envelope modulation CV across the full burst
+        if n_ph > n_nm and n_ph >= 3:
+            env = rt_rms_arr[i0:i1] if has_raw_tel else t_rms_arr[i0:i1]
+            mod_cv = float(np.std(env) / (np.mean(env) + 1e-6))
+            if mod_cv < 0.16:
+                continue
+            kind = "phone_call"
+        elif n_wh >= 3 and n_nm == 0:
+            env = v_rms_arr[i0:i1]
+            mod_cv = float(np.std(env) / (np.mean(env) + 1e-6))
+            if mod_cv < 0.14:
+                continue
+            kind = "whisper"
         else:
-            merged_bursts.append(dict(b))
+            kind = "normal"
+        merged_bursts.append({
+            "start": b["start"],
+            "end": b["end"],
+            "peak_voc_rms": b["peak_voc_rms"],
+            "peak_tel_rms": b["peak_tel_rms"],
+            "kind": kind,
+        })
 
     return voice_mask, merged_bursts
 
@@ -452,22 +539,49 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
     audio_src = source_audio_path if os.path.exists(source_audio_path) else video_path
 
     print(f"[PLAN] Analyzing Multi-Band Acoustic Waveform (50ms hop) + Visual Sub-Clauses + Onset Sync in {ws}", flush=True)
-    tel_arr = decode_audio_16k(
-        audio_src,
-        af_filter="highpass=f=280,lowpass=f=3600,dynaudnorm=f=75:g=15:p=0.92:m=12.0",
-    )
-    raw_arr = decode_audio_16k(audio_src)
-    raw_tel_arr = decode_audio_16k(audio_src, af_filter="highpass=f=300,lowpass=f=3400")
-    if os.path.exists(vocals_path):
-        voc_arr = decode_audio_16k(vocals_path)
-    else:
-        voc_arr = raw_arr
+    import hashlib as _hashlib
+    wf_sig = _hashlib.sha256(
+        f"{WAVEFORM_CACHE_VERSION}|{_fast_file_sig(audio_src)}|{_fast_file_sig(vocals_path)}".encode()
+    ).hexdigest()[:16]
+    cache_dir = os.path.join(ws, ".cache")
+    wf_meta_p = os.path.join(cache_dir, f"waveform_features_{wf_sig}.json")
+    wf_mask_p = os.path.join(cache_dir, f"waveform_features_{wf_sig}.npy")
 
-    voice_mask, merged_bursts = compute_voice_mask_and_bursts(
-        voc_arr, tel_arr, raw_tel_arr=raw_tel_arr, raw_arr=raw_arr, sr=16000
-    )
-    spectral_summary = compute_audio_spectral_profile(raw_arr, sr=16000)
-    vocal_spectral_summary = compute_audio_spectral_profile(voc_arr, sr=16000) if os.path.exists(vocals_path) else {}
+    if os.path.exists(wf_meta_p) and os.path.exists(wf_mask_p):
+        with open(wf_meta_p, "r", encoding="utf-8") as cf:
+            cmeta = json.load(cf)
+        voice_mask = np.load(wf_mask_p).astype(bool)
+        merged_bursts = cmeta["merged_bursts"]
+        spectral_summary = cmeta["spectral_summary"]
+        vocal_spectral_summary = cmeta["vocal_spectral_summary"]
+        print(f"[CACHE] Waveform features hit ({wf_sig}) -> skipped ffmpeg decode", flush=True)
+    else:
+        tel_arr = decode_audio_16k(
+            audio_src,
+            af_filter="highpass=f=280,lowpass=f=3600,dynaudnorm=f=75:g=15:p=0.92:m=12.0",
+        )
+        raw_arr = decode_audio_16k(audio_src)
+        raw_tel_arr = _bandpass_in_ram(raw_arr, 300.0, 3400.0, sr=16000)
+        if os.path.exists(vocals_path):
+            voc_arr = decode_audio_16k(vocals_path)
+        else:
+            voc_arr = raw_arr
+
+        voice_mask, merged_bursts = compute_voice_mask_and_bursts(
+            voc_arr, tel_arr, raw_tel_arr=raw_tel_arr, raw_arr=raw_arr, sr=16000
+        )
+        spectral_summary = compute_audio_spectral_profile(raw_arr, sr=16000)
+        vocal_spectral_summary = compute_audio_spectral_profile(voc_arr, sr=16000) if os.path.exists(vocals_path) else {}
+        os.makedirs(cache_dir, exist_ok=True)
+        np.save(wf_mask_p, voice_mask)
+        with open(wf_meta_p, "w", encoding="utf-8") as cf:
+            json.dump({
+                "sig": wf_sig,
+                "version": WAVEFORM_CACHE_VERSION,
+                "merged_bursts": merged_bursts,
+                "spectral_summary": spectral_summary,
+                "vocal_spectral_summary": vocal_spectral_summary,
+            }, cf)
     n_hops = len(voice_mask)
 
     bbox_path = os.path.join(data_dir, "01_zh_bbox_scan.json")

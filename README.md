@@ -13,7 +13,7 @@ stream-copies all verified batches into the final full-series master.
 - `scripts/aicn_platform.py`: cross-platform runtime, hardware/GPU/encoder detection (`VideoToolbox` / `NVENC` / `libx264`), tool/Python discovery, and locking (`fcntl`/`msvcrt`).
 - `scripts/aicn.py`: the engine (`doctor`, `discover`, `init-series`, `adopt`, `plan`, `render`, `verify-overlay`, `run-series`, `merge-series`, `clean`, `log`, `progress`; legacy `tts-sync`).
 - `scripts/aicn_audio.py`: Stage 3 audio (Demucs MLX/PyTorch-CUDA stems, sentence-level CPU VieNeu dub with 2×4 threads + parallel rubberband, cached-Z frequency-aware mix, fast 48 kHz -14 LUFS master, audio gate).
-- `scripts/hg_tool.cjs`: Hongguo discovery, freshness/trend analytics, cover JPEG fetcher, and 1080p CENC-decrypted downloader (backed by `tools/hongguo-drama`).
+- `scripts/hg_tool.cjs`: thin dynamic wrapper around upstream `jackotom/hongguo-drama` (`check-upstream [--sync]`, discovery, freshness/trend analytics, public details, creator albums, cover JPEG fetcher, and 1080p CENC-decrypted downloads — zero hardcoded upstream internals).
 - `scripts/dy_tool.py`: Douyin detail, mix/collection, hot boards, and watermark-free MP4 downloader (`Evil0ctal/Douyin_TikTok_Download_API` + `tools/.venv-dy`).
 - `scripts/aicn_radar.py`: Unified Hongguo + Douyin + Bilibili SQLite FTS5 analytics & search index (`data/drama_index.db`).
 - `vendor/`: the five stage skills it drives, with their gate scripts. See `vendor/README.md`.

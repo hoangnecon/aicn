@@ -27,7 +27,7 @@ inputs changed. Everything else comes from cache. Nothing is recomputed because 
 |---|---|
 | `<skill>` | the folder holding this file |
 | Engine | `python <skill>/scripts/aicn.py <cmd>` (`--help` lists commands) |
-| Hongguo Sourcing CLI | `node <skill>/scripts/hg_tool.cjs <cmd>` (backed by `tools/hongguo-drama`; replaces retired `ohg`) |
+| Hongguo Sourcing CLI | `node <skill>/scripts/hg_tool.cjs <cmd>` (thin dynamic wrapper over `tools/hongguo-drama`; always run `check-upstream` first) |
 | Douyin Sourcing CLI | `<dy_py> <skill>/scripts/dy_tool.py <cmd>` (`tools/.venv-dy/bin/python` or `Scripts/python.exe`) |
 | English DramaDunyam CLI | `python <skill>/scripts/dd_tool.py top\|list\|search\|detail\|download` (clean `lang=en`, non-adult `dramadunyam.com` API) |
 | Unified Radar & Index | `python <skill>/scripts/aicn_radar.py sync-all\|search\|top` (`data/drama_index.db`, Hongguo + Douyin + Bilibili + DramaDunyam) |
@@ -61,8 +61,13 @@ the unit `CHECKLIST.md`. Do not open media to find out where things stand.
 ## 1b. Sourcing, Discovery Analytics & Candidate Lists (Chinese-First, Zero YouTube)
 
 Full sourcing & analytics guide: `references/sourcing_and_analytics.md`.
-Original-platform engines: **`jackotom/hongguo-drama`** (`scripts/hg_tool.cjs`), **`Evil0ctal/Douyin_TikTok_Download_API`** (`scripts/dy_tool.py`), **DramaDunyam EN** (`scripts/dd_tool.py`), **`yt-dlp`** (Bilibili `--user-agent`), indexed together by **`scripts/aicn_radar.py`** -> `data/drama_index.db`.
+Original-platform engines: **`jackotom/hongguo-drama`** (thin wrapper `scripts/hg_tool.cjs`), **`Evil0ctal/Douyin_TikTok_Download_API`** (`scripts/dy_tool.py`), **DramaDunyam EN** (`scripts/dd_tool.py`), **`yt-dlp`** (Bilibili `--user-agent`), indexed together by **`scripts/aicn_radar.py`** -> `data/drama_index.db`.
 
+- **Mandatory Upstream Open-Source Check FIRST (zero hardcoding):** `scripts/hg_tool.cjs` is strictly a **thin dynamic wrapper** around `jackotom/hongguo-drama` — never hardcode upstream Hongguo private API routes, signing headers, or SDK internals in the skill or ad-hoc scripts. **Before ANY Hongguo search, ranking, episode inspection, or download**, the agent MUST run:
+  ```bash
+  node <skill>/scripts/hg_tool.cjs check-upstream --json
+  ```
+  Verify `up_to_date: true` (matching the latest GitHub release of `jackotom/hongguo-drama`) and `wrapper_contract_ok: true` (live `api_surface` + `sdk_cli` capabilities). If `up_to_date` is `false`, run `node <skill>/scripts/hg_tool.cjs check-upstream --sync` first and inspect the upstream release notes & `tools/hongguo-drama/src/native/` exports before querying or downloading. If upstream refactored an export (`wrapper_contract_ok: false`), update the thin wrapper to match upstream rather than hardcoding endpoints.
 - **Chinese-original & verified clean English-distribution sources (NO YouTube):** Never search or download Chinese dramas from YouTube (YouTube hosts recaps/re-ups). For Chinese dramas, always start in **Chinese keywords (`中文`)** on **Hongguo `红果`**, **Douyin `抖音`**, **Bilibili `B站`**, **Hema `河马`**, **Kuaishou `快手`**. For English AI/short dramas (DramaBox/ReelShort/NetShort/FreeReels), use **`dd_tool.py`** (`dramadunyam.com`, `--lang en`, excluding `yetiskin: true`) — set `--source-lang en` at `init-series` so Stage 1 Whisper & 9:16 portrait typography adapt cleanly (`720x1280` supported end-to-end).
 - **Search local analytics index first:** Run `aicn_radar.py sync-all` periodically, then query `aicn_radar.py search "<中文关键词>"` or `aicn_radar.py top --format ai --limit 15` (scored by recency-weighted engagement velocity from `first_visible_time`/`create_time` + `likes` + `favorites`).
 - **Freshness-first live queries:** Combine `hg_tool.cjs new --genre ai|real|all`, `hg_tool.cjs rank --category hot-ai-drama|hot-real-drama|hot-comic-drama`, `dy_tool.py detail` + `related_posts`, and `yt-dlp bilisearch`. Do not pitch stale/old dramas as "trending".
@@ -199,6 +204,7 @@ Whenever an upstream API breaks, a QA gate fails, the user corrects an output/wo
 - "Upload one unit/batch as a standalone episode" → never. `units/` are internal working batches; every published video must be the full series assembled by `aicn.py merge-series`.
 - "Skip dubbing (`sub_only`) to hit a time target" → never. Every full-series release requires complete Vietnamese dubbing + subtitles.
 - "Use `ohg` / `openhongguo` to download" → retired and deleted; always use `hg_tool.cjs` (Hongguo) or `dy_tool.py` (Douyin).
+- "Skip `check-upstream` or hardcode Hongguo private API routes / SDK internals" → forbidden. `hg_tool.cjs` is strictly a thin wrapper over `jackotom/hongguo-drama`; always run `node <skill>/scripts/hg_tool.cjs check-upstream [--sync]` to verify the latest upstream release and live `src/native/` API surface before sourcing or downloading.
 - "Grab Chinese dramas from YouTube or search in Vietnamese/English first" → forbidden. YouTube is recap/re-up. Search in Chinese and acquire only from Hongguo, Douyin, Bilibili, Hema, or Kuaishou.
 - "Present a candidate list with only Chinese titles or without thumbnails" → never. Always include Vietnamese title, Vietnamese synopsis, `--series-slug`, recency/trend signal, and embedded local `.jpg` covers.
 - "I'll remember not to make that mistake next time" → never prose-only; log `L-NNN` in `LESSONS.md` and codify into code, tests, or a hard gate.

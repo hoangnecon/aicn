@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -200,43 +201,11 @@ def infer_format(tags: list[str], fallback: str = "unknown") -> str:
 
 
 def enrich_hongguo_details(series_ids: list[str]) -> dict[str, dict[str, Any]]:
-    """Fetch exact first_visible_time, like_count, favorite_count & synopsis from Hongguo web details."""
-    if not series_ids or not HONGGUO_REPO.exists():
+    """Fetch exact publish timestamp, like/favorite counts & synopsis via hg_tool.cjs details (thin wrapper over upstream public-details.js)."""
+    if not series_ids or not HG_TOOL.exists():
         return {}
-    js = """
-const axios = require('axios');
-const { readRouterData } = require('./src/native/catalog');
-const ids = JSON.parse(process.argv[1]);
-(async () => {
-  const out = {};
-  for (const sid of ids) {
-    try {
-      const res = await axios.get(`https://hongguoduanju.com/detail?series_id=${sid}`, {
-        timeout: 6000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36' }
-      });
-      const router = readRouterData(res.data);
-      const d = Object.values(router.loaderData || {}).find(v => v && v.seriesDetail);
-      if (d && d.seriesDetail) {
-        const sd = d.seriesDetail;
-        const soc = d.seriesSocialInfo || {};
-        out[sid] = {
-          first_visible_time: Number(sd.first_visible_time || 0),
-          like_count: Number(soc.series_like_count || 0),
-          favorite_count: Number(soc.series_favorite_count || 0),
-          episodes: Number(sd.episode_cnt || 0),
-          synopsis: String(sd.series_intro || ''),
-          cover: String(sd.series_cover || '')
-        };
-      }
-    } catch (_) {}
-  }
-  console.log(JSON.stringify(out));
-})();
-"""
     res = subprocess.run(
-        [NODE_BIN, "-e", js, json.dumps(series_ids)],
-        cwd=str(HONGGUO_REPO),
+        [NODE_BIN, str(HG_TOOL), "details", *[str(s) for s in series_ids], "--batch", "--json"],
         capture_output=True,
         text=True,
         check=False,
@@ -244,15 +213,61 @@ const ids = JSON.parse(process.argv[1]);
     if res.returncode != 0 or not res.stdout.strip():
         return {}
     try:
-        return json.loads(res.stdout.strip())
+        raw = json.loads(res.stdout.strip())
     except json.JSONDecodeError:
         return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for sid, d in raw.items():
+        if not isinstance(d, dict) or not d.get("success"):
+            continue
+        pub_raw = int(d.get("published_at") or d.get("first_visible_time") or 0)
+        pub_ts = pub_raw // 1000 if pub_raw > 10_000_000_000 else pub_raw
+        ep_num = int(d.get("episode_count") or 0)
+        if not ep_num and d.get("episode_label"):
+            m = re.search(r"(\d+)", str(d["episode_label"]))
+            if m:
+                ep_num = int(m.group(1))
+        out[str(sid)] = {
+            "first_visible_time": pub_ts,
+            "like_count": int(d.get("like_count") or 0),
+            "favorite_count": int(d.get("favorite_count") or 0),
+            "episodes": ep_num,
+            "synopsis": str(d.get("description") or ""),
+            "cover": str(d.get("cover") or ""),
+        }
+    return out
 
 
 def sync_hongguo(conn: sqlite3.Connection, pages: int = 2, enrich_top: int = 15) -> int:
     """Sync Hongguo live charts and new releases into SQLite index."""
     if not HG_TOOL.exists():
         raise FileNotFoundError(f"Missing {HG_TOOL}")
+
+    # Mandatory pre-sourcing upstream check (non-blocking warning if outdated)
+    chk = subprocess.run(
+        [NODE_BIN, str(HG_TOOL), "check-upstream", "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if chk.stdout.strip():
+        try:
+            info = json.loads(chk.stdout.strip())
+            if info.get("up_to_date") is False:
+                print(
+                    f"[aicn_radar] WARN: tools/hongguo-drama is at {info.get('local_tag') or info.get('local_version')} "
+                    f"(latest upstream release: {info.get('latest_tag')}). Run: node {HG_TOOL} check-upstream --sync",
+                    file=sys.stderr,
+                )
+            if info.get("wrapper_contract_ok") is False:
+                print(
+                    f"[aicn_radar] WARN: upstream API surface changed (missing hooks: {info.get('missing_hooks')}).",
+                    file=sys.stderr,
+                )
+        except json.JSONDecodeError:
+            pass
 
     collected: dict[str, dict[str, Any]] = {}
 

@@ -1,19 +1,30 @@
 # Sourcing, Discovery Analytics & Candidate Presentation Contract
 
-Primary Chinese short-drama sourcing engine: **`jackotom/hongguo-drama`** (installed at `<project-root>/tools/hongguo-drama`, driven by `scripts/hg_tool.cjs`).
-> **Retired tool:** `openhongguo` (`ohg v0.4.0`) is permanently retired and deleted because its playback POST endpoints (`/novel/player/multi_video_model/player/v1` and `/novel/player/video_model/v1/`) return HTTP 200 / 0 bytes (`ErrAnonymousLimited`). Do **not** reinstall or reference `ohg`.
+Primary Chinese short-drama sourcing engine: **`jackotom/hongguo-drama`** (installed at `<project-root>/tools/hongguo-drama`, wrapped dynamically by `scripts/hg_tool.cjs`).
+> **Retired tools:**
+> - `openhongguo` (`ohg v0.4.0`) is permanently retired and deleted. Do **not** reinstall or reference `ohg`.
+> - `scripts/hg_sdk_helper.py` is retired (since `aicn v2.3.0`) because PR #189 & PR #190 upstreamed cross-platform file locks, `--serve` JSONL session reuse, and 8-episode batch SDK resolution directly into `jackotom/hongguo-drama v8.2` (`scripts/sdk-playback/resolve_cli.py`).
 
 ---
 
-## 1. Setup & Primary Engine (`tools/hongguo-drama`)
+## 1. Thin-Wrapper Contract & Mandatory Upstream Preflight (`tools/hongguo-drama`)
 
-```bash
-# One-time setup (runtime deps only — skips 300 MB Electron devDependencies)
-git clone --depth 1 https://github.com/jackotom/hongguo-drama tools/hongguo-drama
-cd tools/hongguo-drama && npm install --omit=dev --ignore-scripts
-```
+> **Mandatory Rule (Zero Hardcoding — Always Check Upstream Latest Release First):**
+> `scripts/hg_tool.cjs` is strictly a **thin dynamic wrapper** around `jackotom/hongguo-drama`. Never hardcode Hongguo private API paths, request signing headers, or `phone_account` SDK internals inside `aicn` or ad-hoc scripts.
+>
+> **Before EVERY Hongguo discovery, metadata lookup, or download session**, the agent MUST run:
+> ```bash
+> node <skill>/scripts/hg_tool.cjs check-upstream --json
+> ```
+> 1. **Check release currency:** Verify `up_to_date: true` against the latest GitHub release of `jackotom/hongguo-drama`. If `up_to_date` is `false` (or `installed: false`), run:
+>    ```bash
+>    node <skill>/scripts/hg_tool.cjs check-upstream --sync
+>    ```
+>    This fetches and checks out the latest release tag (shallow `--depth 1`) and installs runtime dependencies only (`npm install --omit=dev --ignore-scripts`, skipping ~300 MB Electron devDependencies).
+> 2. **Inspect live API surface:** Review `release_highlights`, `api_surface`, `sdk_cli` (`script`/`binary`/`capabilities`), and `wrapper_contract_ok`.
+> 3. **Adapt wrapper if upstream changed:** If `wrapper_contract_ok` is `false` (upstream renamed or restructured a native export), inspect `tools/hongguo-drama/src/native/` and update the thin wrapper (`scripts/hg_tool.cjs`) to match upstream — never bypass upstream by hardcoding private endpoints.
 
-All discovery, analytics, cover fetching, and 1080p CENC-decrypted downloads run through:
+All discovery, analytics, metadata, cover fetching, and 1080p CENC-decrypted downloads run through:
 ```bash
 node <skill>/scripts/hg_tool.cjs <command> [options]
 ```
@@ -22,17 +33,21 @@ node <skill>/scripts/hg_tool.cjs <command> [options]
 
 | Goal | Command |
 |---|---|
+| **Mandatory upstream release & API check** | `node <skill>/scripts/hg_tool.cjs check-upstream [--sync] [--strict] [--json]` |
 | **Trending charts (by format)** | `node <skill>/scripts/hg_tool.cjs rank --category hot-ai-drama\|hot-real-drama\|hot-comic-drama\|hot-drama [--page 1] [--json]` |
 | **Newest releases (freshness-first)** | `node <skill>/scripts/hg_tool.cjs new [--genre all\|ai\|real] [--pages 2] [--limit 20] [--json]` |
 | **Keyword search** | `node <skill>/scripts/hg_tool.cjs search "<keyword>" [--page 1] [--json]` |
+| **Public details & engagement metrics** | `node <skill>/scripts/hg_tool.cjs details <series_id...> [--vid <vid>] [--json]` |
+| **Creator album (`content_type=1001`)** | `node <skill>/scripts/hg_tool.cjs album <album_id> [--json]` |
 | **Inspect episodes & IDs** | `node <skill>/scripts/hg_tool.cjs episodes <series_id> [--json]` |
-| **Download 1080p + CENC decrypt** | `node <skill>/scripts/hg_tool.cjs download <series_id> --out <dir> [--episodes 1-10\|all] [--quality 1080p\|auto] [--delay-ms 1500]` |
+| **Download 1080p + CENC decrypt** | `node <skill>/scripts/hg_tool.cjs download <series_id> --out <dir> [--episodes 1-10\|all] [--quality 1080p\|auto] [--content-type 1004\|1001] [--delay-ms 1500]` |
 | **Download & convert JPEG covers** | `node <skill>/scripts/hg_tool.cjs fetch-covers --input <catalog.json> --out <covers_dir>` |
 
-### How Playback & CENC Decryption Works Under the Hood
-1. `fetchAppPlayUrl()` registers an anonymous device and queries `POST /novel/player/multi_video_model/player/v1`; on `EMPTY_RESPONSE` (HTTP 200 / 0 bytes), it automatically falls back to **`GET /reading/bookapi/video_tab/multi_video_model/v1/`** signed with V5 bodyless headers (`x-khronos`, `x-helios`, `x-medusa`, no `x-ss-stub`).
-2. Selects the highest compatible stream (`1080p` HEVC/`bytevc1` or H.264 — avoiding unsupported `bytevc2` unless unavoidable).
-3. Derives the 16-byte AES-128-CTR content key locally from `encrypt_info.spade_a` via `deriveKey()`, downloads the CDN MP4, and decrypts cleanly with `ffmpeg -decryption_key <hex> -i raw.mp4 -c copy out.mp4` (validated via `ffprobe`).
+### How Playback & CENC Decryption Delegates to Upstream
+1. **Primary (Upstream Official Entry First):** Calls upstream `app-source.js` `fetchAppPlayUrl(vid, { quality, allowLowerQuality: true, contentType })`, which dynamically uses whatever official App endpoints & signing chain the latest `jackotom/hongguo-drama` release provides (in `v8.2+`: V8/current-app official entry first).
+2. **Fallback (Upstream SDK CLI):** Only if `fetchAppPlayUrl()` fails (or `--prefer-sdk` is explicitly passed), `hg_tool.cjs` lazily delegates to upstream's own compiled binary or `scripts/sdk-playback/resolve_cli.py --serve` (cross-platform file locks, persistent JSONL session reuse, up to 8-episode batch resolution via `videos`, `contentType` `1004`/`1001` separation).
+3. **Optional Web Fallback:** Disabled by default so 1080p jobs never silently downgrade to 360p; opt-in only via `--allow-web-fallback`.
+4. **CENC Decryption:** Derives the 16-byte AES-128-CTR content key via upstream `deriveKey()` (or uses upstream `contentKey` directly), downloads the CDN MP4 with upstream's returned `userAgent`/`referer`, decrypts cleanly with `ffmpeg -decryption_key <hex> -i raw.mp4 -c copy out.mp4`, and validates via `ffprobe`.
 
 ---
 

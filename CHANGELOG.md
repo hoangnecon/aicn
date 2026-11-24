@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.0 (2026-11-24)
+- **Thin Dynamic Hongguo Wrapper & Mandatory Upstream Release Preflight (`scripts/hg_tool.cjs`, `scripts/aicn_radar.py`, `SKILL.md`, `L-014`)**:
+  - Updated for upstream `jackotom/hongguo-drama v8.2` (merging PR #189 cross-platform SDK v5 helper + `--serve` JSONL reuse, PR #190 up-to-8 batch SDK resolution + `1001`/`1004` content types, and unified official V8/current-app entry first -> SDK fallback).
+  - Retired and removed redundant `scripts/hg_sdk_helper.py` (no more duplicated `phone_account` internal imports inside `aicn`).
+  - Added `node <skill>/scripts/hg_tool.cjs check-upstream [--sync] [--strict] [--offline] [--json]` to verify the latest GitHub release of `jackotom/hongguo-drama`, auto-sync `tools/hongguo-drama` to the latest release tag, and dynamically introspect live `src/native/*` exports and `scripts/sdk-playback/resolve_cli.py` capabilities.
+  - Added `hg_tool.cjs details <series_id...>` (delegating to upstream `public-details.js`) and `hg_tool.cjs album <album_id>` (delegating to upstream `hongguo-creator-album.js`), and updated `resolveRepoDir()` to walk up from `process.cwd()` so running from inside `<project-root>` finds `tools/hongguo-drama` automatically.
+  - Removed hardcoded inline `hongguoduanju.com/detail` Node snippet from `scripts/aicn_radar.py` (`enrich_hongguo_details` now delegates to `hg_tool.cjs details --batch --json`, and `sync_hongguo` runs `check-upstream --json` first).
+  - Codified the mandatory pre-sourcing `check-upstream` + anti-hardcoding wrapper contract in `SKILL.md`, `references/sourcing_and_analytics.md`, `LESSONS.md`, and regression tests in `tests/test_hg_tool.py`.
+
+## 2.2.0 (2026-11-24)
+- **DSP Attack-Hold-Release & RBJ EQ, Stage 1 Acoustic Whisper/Phone Recovery, Stage 2 Overflow Guard & End-to-End Content-Hash Caching**:
+  - Upgraded `scripts/aicn_audio.py` with `follow_hold` anti-pumping envelope, RBJ peaking/high-shelf biquads, dynamic `>5 kHz` vocal softening during dub, active-frame `spectral_profile`, and strict user-override preservation.
+  - Enhanced Stage 1 `analyze_voice_waveform.py` / `run_asr_and_scan.py` with modulation-gated `whisper`/`phone_call` speech recovery from separated vocals and SHA-256 content-hash caching across Stage 1–3, plus Stage 2 `validate_bilingual_script.py` TTS overflow prediction.
+  - Added `aicn.py update-series` (slug/title rename + metadata preservation) and Windows CUDA DLL + mixed-HEVC Stage 6 merge fixes (`v2.1.3`–`v2.1.5`).
+
 ## 2.1.2 (2026-11-24)
 - **Cross-Platform Hongguo SDK v5 Playback (`scripts/hg_sdk_helper.py`, `scripts/hg_tool.cjs`, `L-013`)**:
   - Added `scripts/hg_sdk_helper.py` using `aicn_platform.file_lock` and `hongguo-drama/scripts/sdk-playback/vendor/phone_account` (`pycryptodome` + `unicorn`), bypassing the upstream `darwin`/`electronApp()`/`fcntl` restrictions so Windows, macOS, and Linux CLIs resolve full 1080p episodes cleanly (~1s/ep in `--serve` mode) even when legacy Hongguo App endpoints return `200 / 0 bytes`.

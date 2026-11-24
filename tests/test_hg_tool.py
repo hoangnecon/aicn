@@ -30,7 +30,7 @@ class TestHgToolAndRsi(unittest.TestCase):
             check=False,
         )
         self.assertEqual(res.returncode, 0, res.stderr)
-        for cmd in ("rank", "new", "search", "episodes", "download", "fetch-covers"):
+        for cmd in ("check-upstream", "rank", "new", "search", "details", "album", "episodes", "download", "fetch-covers"):
             self.assertIn(cmd, res.stdout)
 
     def test_hg_tool_unknown_command_fails_nonzero(self):
@@ -44,7 +44,7 @@ class TestHgToolAndRsi(unittest.TestCase):
         self.assertIn("Unknown command", res.stderr)
 
     def test_hg_tool_missing_args_fail_cleanly(self):
-        for argv in (["search"], ["episodes"], ["download"], ["fetch-covers"]):
+        for argv in (["search"], ["details"], ["album"], ["episodes"], ["download"], ["fetch-covers"]):
             res = subprocess.run(
                 [NODE_BIN, str(HG_TOOL), *argv],
                 capture_output=True,
@@ -308,20 +308,76 @@ class TestHgToolAndRsi(unittest.TestCase):
         self.assertIn("Referer: https://dramadunyam.com/en/series/my-test-series", headers_val)
         self.assertIn("Cookie: dd_bilet=guest_tok_123", headers_val)
 
-    def test_hg_sdk_helper_exists_and_uses_platform_lock(self):
-        helper = SKILL_DIR / "scripts" / "hg_sdk_helper.py"
-        self.assertTrue(helper.exists(), f"Missing {helper}")
-        src = helper.read_text(encoding="utf-8")
-        self.assertIn("aicn_platform", src)
-        self.assertNotIn("import fcntl", src)
-        res = subprocess.run(
-            [sys.executable, str(helper), "--help"],
-            capture_output=True,
-            text=True,
-            check=False,
+    def test_hg_tool_is_thin_wrapper_no_hardcoded_upstream_internals(self):
+        # Redundant hg_sdk_helper.py must stay retired (upstreamed into hongguo-drama v8.2 resolve_cli.py)
+        self.assertFalse(
+            (SKILL_DIR / "scripts" / "hg_sdk_helper.py").exists(),
+            "Retire scripts/hg_sdk_helper.py — delegate to upstream hongguo-drama/scripts/sdk-playback/resolve_cli.py",
         )
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("--serve", res.stdout)
+        hg_src = HG_TOOL.read_text(encoding="utf-8")
+        for forbidden in (
+            "/novel/player/",
+            "/reading/bookapi/",
+            "phone_sdk_core_v5",
+            "phone_playback_request_v5",
+            "hg_sdk_helper.py",
+        ):
+            self.assertNotIn(forbidden, hg_src, f"hg_tool.cjs must not hardcode upstream internal: {forbidden}")
+        self.assertIn("check-upstream", hg_src)
+        self.assertIn("resolve_cli.py", hg_src)
+
+        radar_src = RADAR_TOOL.read_text(encoding="utf-8")
+        self.assertNotIn("require('./src/native/catalog')", radar_src)
+        self.assertIn('"check-upstream"', radar_src)
+        self.assertIn('"details"', radar_src)
+
+    def test_hg_tool_check_upstream_offline_introspects_mock_repo(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "hongguo-drama"
+            native = repo / "src" / "native"
+            sdk_dir = repo / "scripts" / "sdk-playback"
+            native.mkdir(parents=True)
+            sdk_dir.mkdir(parents=True)
+            (repo / "node_modules").mkdir()
+            (repo / "package.json").write_text('{"name":"hongguo-downloader","version":"8.2.0"}', encoding="utf-8")
+            (native / "hongguo-app-catalog.js").write_text(
+                "module.exports = { browseList() {}, catalogCover(u) { return u; } };", encoding="utf-8"
+            )
+            (native / "hongguo-app-new.js").write_text(
+                "module.exports = { listNewReleases() {} };", encoding="utf-8"
+            )
+            (native / "hongguo-app-search.js").write_text(
+                "module.exports = { searchApp() {} };", encoding="utf-8"
+            )
+            (native / "hongguo.js").write_text(
+                "module.exports = { fetchEpisodeList() {}, deriveKey() {}, UA: 'test-ua' };", encoding="utf-8"
+            )
+            (native / "app-source.js").write_text(
+                "module.exports = { fetchAppPlayUrl() {} };", encoding="utf-8"
+            )
+            (native / "public-details.js").write_text(
+                "module.exports = { fetchPublicDetails() {} };", encoding="utf-8"
+            )
+            (sdk_dir / "resolve_cli.py").write_text(
+                "# flags: --serve --videos --content-type\n", encoding="utf-8"
+            )
+
+            res = subprocess.run(
+                [NODE_BIN, str(HG_TOOL), "check-upstream", "--offline", "--json", "--repo", str(repo)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            report = json.loads(res.stdout)
+            self.assertTrue(report["installed"])
+            self.assertEqual(report["local_version"], "8.2.0")
+            self.assertTrue(report["wrapper_contract_ok"])
+            self.assertEqual(report["missing_hooks"], [])
+            self.assertEqual(report["sdk_cli"]["capabilities"], ["--serve", "--videos", "--content-type"])
+            self.assertIn("fetchAppPlayUrl", report["api_surface"]["app-source.js"])
 
 
 if __name__ == "__main__":

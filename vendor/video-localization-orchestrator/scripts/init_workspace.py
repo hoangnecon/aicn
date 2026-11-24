@@ -425,9 +425,28 @@ def provision_series_hub(workspace_root: str, series_slug: str, genre: str, loca
         os.makedirs(os.path.join(hub_dir, sd), exist_ok=True)
 
     series_cfg_path = os.path.join(hub_dir, "config", "series_config.json")
+    existing_cfg = {}
+    if os.path.exists(series_cfg_path):
+        try:
+            with open(series_cfg_path, "r", encoding="utf-8") as f:
+                existing_cfg = json.load(f) or {}
+        except Exception:
+            existing_cfg = {}
+    bible_data = {}
+    hub_bible_path = os.path.join(hub_dir, "config", "series_bible.json")
+    if os.path.exists(hub_bible_path):
+        try:
+            with open(hub_bible_path, "r", encoding="utf-8") as f:
+                bible_data = json.load(f) or {}
+        except Exception:
+            bible_data = {}
+    title_vi = existing_cfg.get("title_vi") or bible_data.get("title_vi") or ""
+    title_zh = existing_cfg.get("title_zh") or bible_data.get("title_zh") or ""
     series_cfg = {
         "schema_version": "2.0",
         "series_slug": series_slug,
+        "title_vi": title_vi,
+        "title_zh": title_zh,
         "genre": genre,
         "localization_mode": localization_mode,
         "export_formats": export_formats,
@@ -441,6 +460,9 @@ def provision_series_hub(workspace_root: str, series_slug: str, genre: str, loca
         with open(hub_manifest, "w", encoding="utf-8") as f:
             f.write(f"""# Series Hub Manifest: `{series_slug}`
 
+- **Series Slug:** `{series_slug}`
+- **Title (VI):** {title_vi or series_slug}
+- **Title (ZH):** {title_zh or '_unspecified_'}
 - **Series Root:** `{hub_dir}`
 - **Genre:** `{genre}`
 - **Default Localization Mode:** `{localization_mode}`

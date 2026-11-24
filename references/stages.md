@@ -18,7 +18,9 @@ to run while the previous gate is missing or its artifacts changed. Tick the uni
 ## Stage 0: series hub and unit
 
 ```bash
-$A init-series --series-slug <series> --title "<title>" --total-episodes <N> --rights <basis>
+$A init-series --series-slug <series> --title-vi "<Tên Tiếng Việt>" --title-zh "<Tên Gốc ZH>" --total-episodes <N> --rights <basis>
+# update slug / title_vi / title_zh anytime without breaking existing translations or unit gates:
+$A update-series --hub workspace/<series> [--series-slug <new-slug>] [--title-vi "<Tên VI>"] [--title-zh "<Tên ZH>"]
 # put the downloaded episodes in workspace/<series>/source_inbox/<batch>/
 $PY $V/video-localization-orchestrator/scripts/init_workspace.py --topology series_episodic \
     --series-slug <series> --unit-slug <unit> --episodes-dir workspace/<series>/source_inbox/<batch> --genre short-drama

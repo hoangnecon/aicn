@@ -181,6 +181,14 @@ def cmd_discover(a):
         print(f"[discover] no Series Hub under {root} (looked in ./ and ./workspace/*)")
     for hub in found:
         print(f"\nSERIES  {ap.normalize_rel_path(hub, root)}")
+        bible = jload(os.path.join(hub, "config", "series_bible.json"), {}) or {}
+        scfg = jload(os.path.join(hub, "config", "series_config.json"), {}) or {}
+        t_vi = bible.get("title_vi") or scfg.get("title_vi") or ""
+        t_zh = bible.get("title_zh") or scfg.get("title_zh") or ""
+        if t_vi:
+            print(f"  title_vi: {t_vi}")
+        if t_zh:
+            print(f"  title_zh: {t_zh}")
         for f in ("CHANGELOG.md", "PROGRESS.md", "config/series_bible.json", "00_series_manifest.md"):
             print(f"  {'ok ' if os.path.exists(os.path.join(hub, f)) else 'MISSING'} {f}")
         inbox = glob.glob(os.path.join(hub, "source_inbox", "**", "*.mp4"), recursive=True)
@@ -225,19 +233,86 @@ def write_if_absent(p, content):
     print(f"  create  {p}")
 
 
-def cmd_init_series(a):
+def validate_series_slug(slug, ctx="init-series"):
     import re
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", a.series_slug):
+    if not slug or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
         sys.exit(
-            f"[init-series] invalid --series-slug '{a.series_slug}': "
+            f"[{ctx}] invalid --series-slug '{slug}': "
             "must be translated to Vietnamese, no accents, lowercase, hyphen-separated "
             "(e.g. 'nam-18-tuoi-toi-che-tao-than-khi')"
         )
+    return slug
+
+
+def _sync_series_manifest(hub, series_slug, title_vi="", title_zh="", scfg=None):
+    scfg = scfg if scfg is not None else (jload(os.path.join(hub, "config", "series_config.json"), {}) or {})
+    genre = scfg.get("genre", "short-drama")
+    mode = scfg.get("localization_mode", "voice_dub")
+    formats = ", ".join(scfg.get("export_formats") or ["16x9"])
+    units = [u for u in sorted(glob.glob(os.path.join(hub, "units", "*"))) if is_unit(u)]
+    rows = []
+    for u in units:
+        uslug = os.path.basename(u)
+        ep_man = jload(os.path.join(u, "data", "00_episodes_manifest.json"), {}) or {}
+        n_eps = len(ep_man) if isinstance(ep_man, list) else len(ep_man.get("episodes", []))
+        gs = gate_status(u)
+        status = "READY (Stage 5 PASS)" if (len(gs) >= 6 and gs[5] == "P") else f"GATES:{gs}"
+        rows.append(
+            f"| `{uslug}` | `series_episodic` | `{n_eps or '?'}` | `{status}` | "
+            f"`deliverables/16x9/final_{uslug}_vi.mp4` | `deliverables/9x16/final_{uslug}_vi_9x16.mp4` | `deliverables/subtitles/{uslug}_vi.srt` |"
+        )
+    if not rows:
+        rows.append("| _pending_ | `series_episodic` | `-` | `PENDING` | `-` | `-` | `-` |")
+    manifest_p = os.path.join(hub, "00_series_manifest.md")
+    lines = [
+        f"# Series Hub Manifest: `{series_slug}`",
+        "",
+        f"- **Series Slug:** `{series_slug}`",
+        f"- **Title (VI):** {title_vi or series_slug}",
+        f"- **Title (ZH):** {title_zh or '_unspecified_'}",
+        f"- **Series Root:** `{hub}`",
+        f"- **Genre:** `{genre}`",
+        f"- **Default Localization Mode:** `{mode}`",
+        f"- **Default Export Formats:** `{formats}`",
+        "- **Shared Series Bible:** `config/series_bible.json`",
+        "",
+        "## Working Units / Episodes Registry",
+        "| Unit Slug | Topology | Episodes | Stage Status | 16:9 Deliverable | 9:16 Deliverable | SRT Deliverable |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        *rows,
+        "",
+    ]
+    with open(manifest_p, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def _sync_progress_header(hub, series_slug, title_vi, old_slug=None):
+    p = os.path.join(hub, "PROGRESS.md")
+    if not os.path.exists(p):
+        return
+    with open(p, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    heading = f"# PROGRESS — {title_vi or series_slug} (`{series_slug}`)"
+    if lines and lines[0].startswith("# PROGRESS"):
+        lines[0] = heading
+    else:
+        lines.insert(0, heading)
+    txt = "\n".join(lines) + "\n"
+    if old_slug and old_slug != series_slug:
+        txt = txt.replace(f"final_{old_slug}_full_vi", f"final_{series_slug}_full_vi")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(txt)
+
+
+def cmd_init_series(a):
+    validate_series_slug(a.series_slug, "init-series")
+    title_vi = getattr(a, "title_vi", "") or a.title or ""
+    title_zh = getattr(a, "title_zh", "") or ""
     hub = os.path.abspath(os.path.join(a.workspace_root, a.series_slug))
     for d in ("config", "source_inbox", "units", "deliverables/16x9", "deliverables/9x16",
               "deliverables/subtitles", "deliverables/episodes", "posters", ".cache/tts"):
         os.makedirs(os.path.join(hub, d), exist_ok=True)
-    kw = dict(series=a.series_slug, title=a.title or a.series_slug, date=now(), total=a.total_episodes,
+    kw = dict(series=a.series_slug, title=title_vi or a.series_slug, date=now(), total=a.total_episodes,
               unit_size=a.unit_size, rights=a.rights)
     write_if_absent(os.path.join(hub, "CHANGELOG.md"), render_tpl("CHANGELOG.md", **kw))
     write_if_absent(os.path.join(hub, "PROGRESS.md"), render_tpl("PROGRESS.md", **kw))
@@ -245,10 +320,148 @@ def cmd_init_series(a):
         {"series": a.series_slug, "basis": a.rights, "proof": "", "platforms_allowed": [], "content_id_risk": "unknown"},
         ensure_ascii=False, indent=2))
     write_if_absent(os.path.join(hub, "config", "series_bible.json"), json.dumps(
-        {"series_slug": a.series_slug, "source_language": getattr(a, "source_lang", "zh"), "title_zh": "", "title_vi": a.title or "", "characters": [],
+        {"series_slug": a.series_slug, "source_language": getattr(a, "source_lang", "zh"),
+         "title_zh": title_zh, "title_vi": title_vi, "characters": [],
          "pronoun_matrix": [], "glossary": [], "voices": {}},
         ensure_ascii=False, indent=2))
+    scfg_p = os.path.join(hub, "config", "series_config.json")
+    scfg = {"schema_version": "2.0", "series_slug": a.series_slug, "title_vi": title_vi, "title_zh": title_zh,
+            "genre": "short-drama", "localization_mode": "voice_dub", "export_formats": ["16x9"], "updated_at": now()}
+    write_if_absent(scfg_p, json.dumps(scfg, ensure_ascii=False, indent=2))
+    if not os.path.exists(os.path.join(hub, "00_series_manifest.md")):
+        _sync_series_manifest(hub, a.series_slug, title_vi=title_vi, title_zh=title_zh, scfg=scfg)
     print("[init-series] done. Next: drop episodes in source_inbox/<batch>/, then init_workspace.py --topology series_episodic, then `aicn.py adopt`.")
+
+
+def _rename_hub_slug_artifacts(hub, old_slug, new_slug):
+    renamed = []
+    targets = [
+        (os.path.join(hub, "deliverables", f"final_{old_slug}_full_vi.mp4"),
+         os.path.join(hub, "deliverables", f"final_{new_slug}_full_vi.mp4")),
+        (os.path.join(hub, "deliverables", "subtitles", f"final_{old_slug}_full_vi.srt"),
+         os.path.join(hub, "deliverables", "subtitles", f"final_{new_slug}_full_vi.srt")),
+    ]
+    posters_dir = os.path.join(hub, "posters")
+    if os.path.isdir(posters_dir):
+        for fn in sorted(os.listdir(posters_dir)):
+            if old_slug in fn:
+                targets.append((os.path.join(posters_dir, fn),
+                                os.path.join(posters_dir, fn.replace(old_slug, new_slug))))
+    for src, dst in targets:
+        if os.path.exists(src) and src != dst and not os.path.exists(dst):
+            os.replace(src, dst)
+            renamed.append(ap.normalize_rel_path(dst, hub))
+    return renamed
+
+
+def cmd_update_series(a):
+    hub = os.path.abspath(a.hub)
+    if not is_hub(hub):
+        sys.exit(f"[update-series] {hub} is not a Series Hub (expected units/ + config/series_bible.json)")
+
+    bible_p = os.path.join(hub, "config", "series_bible.json")
+    scfg_p = os.path.join(hub, "config", "series_config.json")
+    rights_p = os.path.join(hub, "config", "rights.json")
+    bible = jload(bible_p, {}) or {}
+    scfg = jload(scfg_p, {}) or {}
+    old_slug = os.path.basename(hub)
+    cur_vi = bible.get("title_vi") or scfg.get("title_vi") or ""
+    cur_zh = bible.get("title_zh") or scfg.get("title_zh") or ""
+
+    new_slug = a.series_slug if a.series_slug is not None else old_slug
+    new_vi = a.title_vi if a.title_vi is not None else cur_vi
+    new_zh = a.title_zh if a.title_zh is not None else cur_zh
+
+    if a.series_slug is None and a.title_vi is None and a.title_zh is None:
+        print(f"series_slug: {old_slug}\ntitle_vi:    {cur_vi}\ntitle_zh:    {cur_zh}")
+        return
+
+    validate_series_slug(new_slug, "update-series")
+
+    renamed_hub = False
+    if new_slug != old_slug:
+        new_hub = os.path.join(os.path.dirname(hub), new_slug)
+        if os.path.exists(new_hub):
+            sys.exit(f"[update-series] target directory already exists: {new_hub}")
+        os.rename(hub, new_hub)
+        hub = new_hub
+        bible_p = os.path.join(hub, "config", "series_bible.json")
+        scfg_p = os.path.join(hub, "config", "series_config.json")
+        rights_p = os.path.join(hub, "config", "rights.json")
+        renamed_hub = True
+
+    renamed_files = _rename_hub_slug_artifacts(hub, old_slug, new_slug) if new_slug != old_slug else []
+
+    bible["series_slug"] = new_slug
+    bible["title_vi"] = new_vi
+    bible["title_zh"] = new_zh
+    jdump(bible_p, bible)
+
+    scfg.setdefault("schema_version", "2.0")
+    scfg["series_slug"] = new_slug
+    scfg["title_vi"] = new_vi
+    scfg["title_zh"] = new_zh
+    scfg.setdefault("genre", "short-drama")
+    scfg.setdefault("localization_mode", "voice_dub")
+    scfg.setdefault("export_formats", ["16x9"])
+    scfg["updated_at"] = now()
+    jdump(scfg_p, scfg)
+
+    if os.path.exists(rights_p):
+        rights = jload(rights_p, {}) or {}
+        rights["series"] = new_slug
+        jdump(rights_p, rights)
+
+    locked_units = []
+    for u in [d for d in sorted(glob.glob(os.path.join(hub, "units", "*"))) if is_unit(d)]:
+        ub_p = os.path.join(u, "config", "series_bible.json")
+        if os.path.exists(ub_p):
+            ub = jload(ub_p, {}) or {}
+            ub["series_slug"] = new_slug
+            ub["title_vi"] = new_vi
+            ub["title_zh"] = new_zh
+            jdump(ub_p, ub)
+        if new_slug != old_slug:
+            has_gate0 = os.path.exists(os.path.join(u, ".cicd", "stage_0_gate.json"))
+            if getattr(a, "sync_unit_configs", False) or not has_gate0:
+                pc_p = os.path.join(u, "config", "project_config.json")
+                pc = jload(pc_p, {}) or {}
+                pc["series_slug"] = new_slug
+                pc["series_hub_dir"] = hub
+                jdump(pc_p, pc)
+                vp_p = os.path.join(u, "data", "00_video_profile.json")
+                if os.path.exists(vp_p):
+                    vp = jload(vp_p, {}) or {}
+                    vp["series_slug"] = new_slug
+                    jdump(vp_p, vp)
+            else:
+                locked_units.append(os.path.basename(u))
+
+    _sync_series_manifest(hub, new_slug, title_vi=new_vi, title_zh=new_zh, scfg=scfg)
+    if os.path.exists(os.path.join(hub, "PROGRESS.md")):
+        _sync_progress_header(hub, new_slug, new_vi, old_slug=old_slug)
+        refresh_progress(hub)
+
+    changes = []
+    if new_slug != old_slug:
+        changes.append(f"series_slug={old_slug}->{new_slug}")
+    if a.title_vi is not None:
+        changes.append(f"title_vi='{new_vi}'")
+    if a.title_zh is not None:
+        changes.append(f"title_zh='{new_zh}'")
+    clog = os.path.join(hub, "CHANGELOG.md")
+    if os.path.exists(clog):
+        with open(clog, "a", encoding="utf-8") as f:
+            f.write(f"- {now()} [edit] hub: update-series ({', '.join(changes)})\n")
+
+    print(f"[update-series] hub={hub}")
+    print(f"  series_slug: {new_slug}")
+    print(f"  title_vi:    {new_vi}")
+    print(f"  title_zh:    {new_zh}")
+    if renamed_hub and renamed_files:
+        print(f"  renamed:     {', '.join(renamed_files)}")
+    if locked_units:
+        print(f"  note:        kept Stage-0 signed project_config.json for {', '.join(locked_units)} (series_bible.json updated; pass --sync-unit-configs if re-initializing Stage 0)")
 
 
 def cmd_adopt(a):
@@ -971,11 +1184,20 @@ def main():
     p = sp.add_parser("doctor"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_doctor)
     p = sp.add_parser("discover"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_discover)
     p = sp.add_parser("init-series"); p.add_argument("--series-slug", required=True); p.add_argument("--title", default="")
+    p.add_argument("--title-vi", default="", help="Vietnamese series title (alias for --title)")
+    p.add_argument("--title-zh", default="", help="Original Chinese/source series title")
     p.add_argument("--workspace-root", default="workspace"); p.add_argument("--total-episodes", default="?")
     p.add_argument("--unit-size", default=10); p.add_argument("--source-lang", default="zh", help="source audio language (zh, en, auto)")
     p.add_argument("--rights", required=True,
                    help="license basis: own | licensed:<contract> | cps:<platform> | mcn:<name>")
     p.set_defaults(f=cmd_init_series)
+    p = sp.add_parser("update-series", help="update series_slug, title_vi, and/or title_zh in a Series Hub")
+    p.add_argument("--hub", required=True)
+    p.add_argument("--series-slug", default=None, help="new Vietnamese hyphenated slug (renames hub & deliverables)")
+    p.add_argument("--title-vi", default=None, help="Vietnamese series title")
+    p.add_argument("--title-zh", default=None, help="Original Chinese/source series title")
+    p.add_argument("--sync-unit-configs", action="store_true", help="also rewrite unit project_config.json/00_video_profile.json if Stage 0 already signed")
+    p.set_defaults(f=cmd_update_series)
     p = sp.add_parser("adopt"); p.add_argument("--unit", required=True); p.set_defaults(f=cmd_adopt)
     p = sp.add_parser("plan"); p.add_argument("--unit", required=True)
     p.add_argument("--codec", choices=list(ENCODE_PRESETS), default=None)

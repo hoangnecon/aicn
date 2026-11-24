@@ -100,7 +100,7 @@ class CLI(unittest.TestCase):
 
     def test_help_lists_all_commands(self):
         out = self.run_cli("--help").stdout
-        for c in ("doctor", "discover", "init-series", "adopt", "plan", "tts-sync", "render",
+        for c in ("doctor", "discover", "init-series", "update-series", "adopt", "plan", "tts-sync", "render",
                   "verify-overlay", "verify-render", "clean", "merge-series", "run-series", "log", "progress"):
             self.assertIn(c, out)
 
@@ -156,6 +156,58 @@ class CLI(unittest.TestCase):
             rs = self.run_cli("run-series", "--hub", hub, "--phase", "produce", "--dry-run")
             self.assertEqual(rs.returncode, 0, rs.stderr)
             self.assertIn("phase=produce", rs.stdout)
+
+    def test_init_and_update_series_slug_and_titles(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws_root = os.path.join(d, "workspace")
+            r = self.run_cli(
+                "init-series", "--workspace-root", ws_root,
+                "--series-slug", "bo-cu", "--title-vi", "Bộ Cũ", "--title-zh", "旧片",
+                "--total-episodes", "10", "--rights", "own",
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            old_hub = os.path.join(ws_root, "bo-cu")
+            bible = aicn.jload(os.path.join(old_hub, "config", "series_bible.json"))
+            bible["characters"] = [{"zh": "猫", "vi": "Mèo"}]
+            aicn.jdump(os.path.join(old_hub, "config", "series_bible.json"), bible)
+            with open(os.path.join(old_hub, "deliverables", "final_bo-cu_full_vi.mp4"), "wb") as f:
+                f.write(b"mp4")
+            with open(os.path.join(old_hub, "deliverables", "subtitles", "final_bo-cu_full_vi.srt"), "w", encoding="utf-8") as f:
+                f.write("1\n00:00:00,000 --> 00:00:01,000\nHi\n")
+            with open(os.path.join(old_hub, "posters", "official_poster_bo-cu_zh.jpg"), "wb") as f:
+                f.write(b"jpg")
+
+            bad = self.run_cli("update-series", "--hub", old_hub, "--series-slug", "Bad_Slug")
+            self.assertNotEqual(bad.returncode, 0)
+
+            u = self.run_cli(
+                "update-series", "--hub", old_hub,
+                "--series-slug", "bo-moi", "--title-vi", "Bộ Mới VIP", "--title-zh", "新剧名",
+            )
+            self.assertEqual(u.returncode, 0, u.stderr)
+            new_hub = os.path.join(ws_root, "bo-moi")
+            self.assertFalse(os.path.exists(old_hub))
+            self.assertTrue(os.path.exists(new_hub))
+            self.assertTrue(os.path.exists(os.path.join(new_hub, "deliverables", "final_bo-moi_full_vi.mp4")))
+            self.assertTrue(os.path.exists(os.path.join(new_hub, "deliverables", "subtitles", "final_bo-moi_full_vi.srt")))
+            self.assertTrue(os.path.exists(os.path.join(new_hub, "posters", "official_poster_bo-moi_zh.jpg")))
+            nb = aicn.jload(os.path.join(new_hub, "config", "series_bible.json"))
+            self.assertEqual(nb["series_slug"], "bo-moi")
+            self.assertEqual(nb["title_vi"], "Bộ Mới VIP")
+            self.assertEqual(nb["title_zh"], "新剧名")
+            self.assertEqual(nb["characters"], [{"zh": "猫", "vi": "Mèo"}])
+            nc = aicn.jload(os.path.join(new_hub, "config", "series_config.json"))
+            self.assertEqual(nc["title_vi"], "Bộ Mới VIP")
+            self.assertEqual(nc["title_zh"], "新剧名")
+            self.assertEqual(aicn.jload(os.path.join(new_hub, "config", "rights.json"))["series"], "bo-moi")
+            with open(os.path.join(new_hub, "00_series_manifest.md"), "r", encoding="utf-8") as f:
+                man = f.read()
+            self.assertIn("Bộ Mới VIP", man)
+            self.assertIn("新剧名", man)
+            self.assertIn("bo-moi", man)
+            disc = self.run_cli("discover", "--root", d).stdout
+            self.assertIn("title_vi: Bộ Mới VIP", disc)
+            self.assertIn("title_zh: 新剧名", disc)
 
     def test_portrait_9x16_watermark_scaling(self):
         with tempfile.TemporaryDirectory() as td:

@@ -92,7 +92,8 @@ workspace/<series>/                      Series Hub
      subtitles/final_<series>_full_vi.srt
 ```
 
-New series: `aicn.py init-series --series-slug <slug> --title "<Tên Tiếng Việt>" --total-episodes N --rights <basis>`
+New series: `aicn.py init-series --series-slug <slug> --title-vi "<Tên Tiếng Việt>" --title-zh "<Tên Gốc ZH>" --total-episodes N --rights <basis>`
+- Update metadata anytime (including renaming slug across hub, config, bible, manifest & deliverables): `aicn.py update-series --hub workspace/<slug> [--series-slug <new-slug>] [--title-vi "<Tên Tiếng Việt>"] [--title-zh "<Tên Gốc ZH>"]`
 - **Naming rule (mandatory, enforced by CLI):** `--series-slug` MUST be the **Vietnamese translated title**, **no accents**, **lowercase**, **hyphen-separated** (`[a-z0-9]+(-[a-z0-9]+)*`), e.g. `《那年十八我造神器》` → `nam-18-tuoi-toi-che-tao-than-khi`. Never use pinyin, underscores, uppercase, or arbitrary names.
 - `--rights` is required: `own`, `licensed:<contract>`, `cps:<platform>`, `mcn:<name>`.
 - New internal working batch: `init_workspace.py --topology series_episodic ...`, then `aicn.py adopt --unit <batch>`.

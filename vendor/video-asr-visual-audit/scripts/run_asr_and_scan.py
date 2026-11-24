@@ -366,6 +366,8 @@ class _MlxWhisper:
 
 def load_whisper(size):
     """Select Whisper backend via aicn_platform (mlx on Apple Silicon, CUDA faster-whisper on NVIDIA, CPU int8 fallback)."""
+    if ap and hasattr(ap, "register_cuda_dll_dirs"):
+        ap.register_cuda_dll_dirs()
     bk = ap.detect_asr_backend(sys.executable) if ap else {"engine": os.environ.get("AICN_ASR", "mlx")}
     eng = bk["engine"]
     if eng == "mlx":
@@ -376,6 +378,11 @@ def load_whisper(size):
         except ImportError:
             print("[ASR] mlx_whisper missing -> falling back to faster-whisper", flush=True)
             eng = "faster-cpu"
+    if eng == "faster-cuda":
+        try:
+            import torch  # noqa: F401  # ensure PyTorch CUDA/cuBLAS DLLs are mapped on Windows
+        except ImportError:
+            pass
     from faster_whisper import WhisperModel
     if eng == "faster-cuda":
         for ctype in ("float16", "int8_float16"):
@@ -433,17 +440,17 @@ def run_multipass_whisper_asr(
         voc_audio = decode_audio_16k(vocals_path)
         min_len = min(len(raw_audio), len(voc_audio))
         pass1_audio = np.zeros_like(raw_audio)
-        pass1_audio[:min_len] = 0.65 * voc_audio[:min_len] + 0.35 * raw_audio[:min_len]
+        pass1_audio[:min_len] = 0.90 * voc_audio[:min_len] + 0.10 * raw_audio[:min_len]
     else:
         voc_audio = raw_audio
         pass1_audio = raw_audio
 
     model = load_whisper(model_size)
-    vad_params = dict(threshold=0.28, min_speech_duration_ms=120, min_silence_duration_ms=250, speech_pad_ms=220)
+    vad_params = dict(threshold=0.35, min_speech_duration_ms=100, min_silence_duration_ms=250, speech_pad_ms=150)
     segments_gen, _ = model.transcribe(
         pass1_audio,
         language=whisper_lang,
-        word_timestamps=False,
+        word_timestamps=True,
         vad_filter=True,
         vad_parameters=vad_params,
     )
@@ -455,14 +462,37 @@ def run_multipass_whisper_asr(
         if not txt:
             continue
         avg_prob = round(float(getattr(seg, "avg_logprob", -0.2)), 3)
-        results.append({
-            "id": len(results),
-            "start": round(float(seg.start), 3),
-            "end": round(float(seg.end), 3),
-            "text": txt,
-            "avg_logprob": avg_prob,
-            "source": "pass1_asr",
-        })
+        words = list(getattr(seg, "words", None) or [])
+        if words:
+            chunks = [[words[0]]]
+            for w in words[1:]:
+                if (float(w.start) - float(chunks[-1][-1].end)) >= 1.0:
+                    chunks.append([w])
+                else:
+                    chunks[-1].append(w)
+            for ch in chunks:
+                ch_txt = "".join(w.word for w in ch).strip()
+                if not ch_txt:
+                    continue
+                st_w = round(max(float(seg.start), float(ch[0].start)), 3)
+                et_w = round(min(float(seg.end), max(st_w + 0.15, float(ch[-1].end))), 3)
+                results.append({
+                    "id": len(results),
+                    "start": st_w,
+                    "end": et_w,
+                    "text": ch_txt,
+                    "avg_logprob": avg_prob,
+                    "source": "pass1_asr",
+                })
+        else:
+            results.append({
+                "id": len(results),
+                "start": round(float(seg.start), 3),
+                "end": round(float(seg.end), 3),
+                "text": txt,
+                "avg_logprob": avg_prob,
+                "source": "pass1_asr",
+            })
         if time.time() - last_log >= 15.0:
             print(f"[PROGRESS] Pass 1 transcribed {len(results)} segments (up to {seg.end:.1f}s) in {time.time()-t0:.1f}s", flush=True)
             last_log = time.time()
@@ -567,6 +597,69 @@ def run_multipass_whisper_asr(
                 f"{visual_ocr_cnt} visual-only sub-clause gaps for mandatory keyframe OCR.",
                 flush=True,
             )
+    elif os.path.exists(vocals_path):
+        # Pass 2 (v2.0.0 acoustic burst recovery): catch loud vocal dialogue bursts missed by Pass 1
+        from analyze_voice_waveform import compute_voice_mask_and_bursts
+        tel_voc = decode_audio_16k(
+            vocals_path,
+            af_filter="highpass=f=300,lowpass=f=3400,dynaudnorm=f=50:g=15:p=0.92:m=15.0",
+        )
+        _, merged_bursts = compute_voice_mask_and_bursts(voc_audio, tel_voc)
+        sr = 16000
+        uncovered_bursts = []
+        for b in merged_bursts:
+            bst, bet = float(b["start"]), float(b["end"])
+            bdur = bet - bst
+            if bdur < 0.35 or float(b.get("peak_voc_rms", 0.0)) < 0.09:
+                continue
+            ov = sum(max(0.0, min(bet, s["end"]) - max(bst, s["start"])) for s in results)
+            if (ov / max(0.2, bdur)) < 0.35:
+                uncovered_bursts.append(b)
+        if uncovered_bursts:
+            print(
+                f"[PASS 2 ACOUSTIC RECOVERY] Probing {len(uncovered_bursts)} uncovered loud vocal bursts...",
+                flush=True,
+            )
+            rec_cnt = 0
+            for b in uncovered_bursts:
+                pad_s = max(0.0, float(b["start"]) - 0.20)
+                pad_e = min(len(voc_audio) / sr, float(b["end"]) + 0.20)
+                clip = voc_audio[int(round(pad_s * sr)):int(round(pad_e * sr))]
+                if len(clip) < int(0.3 * sr):
+                    continue
+                mx = float(np.max(np.abs(clip)))
+                if mx > 0.005:
+                    clip = clip / mx * 0.85
+                sub_gen, _ = model.transcribe(
+                    clip,
+                    language=whisper_lang,
+                    beam_size=5,
+                    word_timestamps=True,
+                    vad_filter=False,
+                    condition_on_previous_text=False,
+                    temperature=0.0,
+                )
+                sub_list = list(sub_gen)
+                texts = [sg.text.strip() for sg in sub_list if sg.text.strip() and "索兰娅" not in sg.text]
+                if texts:
+                    rec_text = " ".join(texts)
+                    rec_prob = round(float(getattr(sub_list[0], "avg_logprob", -0.6)), 3)
+                    n_cjk = len([c for c in rec_text if "\u4e00" <= c <= "\u9fff"])
+                    if rec_prob > -0.85 and n_cjk >= 2:
+                        rec_cnt += 1
+                        results.append({
+                            "id": -1,
+                            "start": round(float(b["start"]), 3),
+                            "end": round(float(b["end"]), 3),
+                            "text": rec_text,
+                            "avg_logprob": rec_prob,
+                            "source": "pass2_acoustic_burst_recovery",
+                        })
+            if rec_cnt:
+                results.sort(key=lambda x: (x["start"], x["end"]))
+                for idx, item in enumerate(results):
+                    item["id"] = idx
+            print(f"[PASS 2 DONE] Recovered {rec_cnt} spoken bursts via Pass 2 acoustic recovery.", flush=True)
 
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

@@ -36,7 +36,7 @@ def probe_json(path: str) -> dict:
     cmd = [
         ap.find_tool("ffprobe") if ap else "ffprobe", "-v", "error",
         "-show_entries", "format=duration,size,bit_rate",
-        "-show_entries", "stream=index,codec_name,codec_type,width,height,r_frame_rate,sample_rate,channels",
+        "-show_entries", "stream=index,codec_name,codec_type,width,height,r_frame_rate,sample_rate,channels,duration",
         "-of", "json", path
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -60,6 +60,16 @@ def main():
         profile = json.load(f)
     slug = profile.get("slug", os.path.basename(ws))
     vid_dur = float(profile.get("duration", 0.0))
+    src_mp4 = os.path.join(ws, "source", "master_source.mp4")
+    if os.path.exists(src_mp4):
+        try:
+            src_info = probe_json(src_mp4)
+            src_v = next((s for s in src_info.get("streams", []) if s.get("codec_type") == "video"), {})
+            src_d = float(src_v.get("duration") or src_info.get("format", {}).get("duration") or 0.0)
+            if src_d > 0.0:
+                vid_dur = src_d
+        except Exception:
+            pass
     width = int(profile.get("width", 1920))
     height = int(profile.get("height", 1080))
 

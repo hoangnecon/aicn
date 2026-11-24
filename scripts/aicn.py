@@ -538,9 +538,15 @@ def cmd_verify_overlay(a):
         a_dur = float(sa.get("duration") or v_dur)
         v_st = float(sv.get("start_time") or 0.0)
         a_st = float(sa.get("start_time") or 0.0)
-        dur_ok = abs(v_dur - float(prof.get("duration", v_dur))) <= 0.30
+        src_p_dur = os.path.join(ws, "source", "master_source.mp4")
+        src_streams = ffprobe_streams(src_p_dur) if os.path.exists(src_p_dur) else []
+        src_v = next((s for s in src_streams if s.get("codec_type") == "video"), {})
+        src_a = next((s for s in src_streams if s.get("codec_type") == "audio"), {})
+        target_dur = float(src_v.get("duration") or 0.0) or float(prof.get("duration", v_dur))
+        dur_ok = abs(v_dur - target_dur) <= 0.30
         av_dur_ok = abs(v_dur - a_dur) <= 0.30
-        av_st_ok = abs(v_st - a_st) <= 0.12
+        src_offset = float(src_v.get("start_time") or 0.0) - float(src_a.get("start_time") or 0.0)
+        av_st_ok = abs(v_st - a_st) <= 0.12 or (bool(src_v) and abs((v_st - a_st) - src_offset) <= 0.12)
         frames_ok = True
         frame_note = ""
         src_p = os.path.join(ws, "source", "master_source.mp4")
@@ -654,7 +660,8 @@ def cmd_merge_series(a):
         cand_srt = (glob.glob(os.path.join(hub, "deliverables", "subtitles", f"*{os.path.basename(u)}*.srt"))
                     + [os.path.join(u, "data", "subtitles_full.srt")])
         srts.append(next((p for p in cand_srt if os.path.exists(p)), None))
-    batch_specs = set()
+    batch_specs, time_bases, codec_tags = set(), set(), set()
+    v_codec = None
     for p in mp4s:
         st = ffprobe_streams(p)
         vs = next((s for s in st if s.get("codec_type") == "video"), {})
@@ -662,6 +669,9 @@ def cmd_merge_series(a):
         vd, ad = float(vs.get("duration") or 0.0), float(as_.get("duration") or 0.0)
         if abs(vd - ad) > 0.30:
             sys.exit(f"[merge-series] A/V duration drift in {os.path.basename(p)}: video={vd:.3f}s audio={ad:.3f}s (diff={vd-ad:+.3f}s)")
+        v_codec = vs.get("codec_name")
+        time_bases.add(vs.get("time_base"))
+        codec_tags.add(vs.get("codec_tag_string"))
         batch_specs.add((
             vs.get("width"), vs.get("height"), vs.get("codec_name"), vs.get("r_frame_rate"),
             as_.get("codec_name"), as_.get("sample_rate"), as_.get("channels"),
@@ -674,10 +684,29 @@ def cmd_merge_series(a):
     os.makedirs(os.path.dirname(out_srt), exist_ok=True)
     lst = os.path.join(hub, ".cache", "merge_concat.txt")
     os.makedirs(os.path.dirname(lst), exist_ok=True)
+    ff_bin = ap.find_tool("ffmpeg")
+    concat_inputs = mp4s
+    norm_files = []
+    if len(time_bases) > 1 or len(codec_tags) > 1:
+        norm_dir = os.path.join(hub, ".cache", "merge_norm")
+        os.makedirs(norm_dir, exist_ok=True)
+        concat_inputs = []
+        tag_args = ["-tag:v", "hev1"] if (v_codec == "hevc" and len(codec_tags) > 1) else []
+        for idx, p in enumerate(mp4s):
+            np_out = os.path.join(norm_dir, f"norm_{idx:03d}.mp4")
+            subprocess.run([ff_bin, "-v", "error", "-y", "-i", p, "-c", "copy",
+                            "-video_track_timescale", "90000", *tag_args, np_out], check=True)
+            concat_inputs.append(np_out)
+            norm_files.append(np_out)
     with open(lst, "w", encoding="utf-8") as f:
-        f.writelines(ap.ffmpeg_concat_line(p) for p in mp4s)
-    subprocess.run([ap.find_tool("ffmpeg"), "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
-                    "-avoid_negative_ts", "make_zero", "-c", "copy", "-movflags", "+faststart", out_mp4 + ".part.mp4"], check=True)
+        f.writelines(ap.ffmpeg_concat_line(p) for p in concat_inputs)
+    try:
+        subprocess.run([ff_bin, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                        "-avoid_negative_ts", "make_zero", "-c", "copy", "-movflags", "+faststart", out_mp4 + ".part.mp4"], check=True)
+    finally:
+        for np_out in norm_files:
+            if os.path.exists(np_out):
+                os.remove(np_out)
     os.replace(out_mp4 + ".part.mp4", out_mp4)
     full_st = ffprobe_streams(out_mp4)
     f_vs = next((s for s in full_st if s.get("codec_type") == "video"), {})

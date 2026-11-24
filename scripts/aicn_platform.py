@@ -604,6 +604,44 @@ def vendor_h264_encode_args(bitrate: str = "5000k", backend: str | None = None) 
 
 
 # ----------------------------------------------------------------- ASR & Demucs backend selection
+def register_cuda_dll_dirs() -> list[str]:
+    """On Windows, register PyTorch/nvidia/ctranslate2 CUDA DLL directories before CTranslate2 loads cuBLAS/cuDNN."""
+    if not is_windows():
+        return []
+    import glob as _glob
+    import sysconfig as _sysconfig
+
+    added: list[str] = []
+    roots = [
+        _sysconfig.get_paths().get("purelib", ""),
+        os.path.join(sys.prefix, "Lib", "site-packages"),
+    ]
+    cands: list[str] = []
+    for sp in roots:
+        if not sp or not os.path.isdir(sp):
+            continue
+        cands.append(os.path.join(sp, "torch", "lib"))
+        cands.append(os.path.join(sp, "ctranslate2"))
+        cands.extend(_glob.glob(os.path.join(sp, "nvidia", "*", "bin")))
+    cur_path = os.environ.get("PATH", "")
+    path_parts = cur_path.split(os.pathsep) if cur_path else []
+    for d in cands:
+        nd = os.path.normpath(d)
+        if not os.path.isdir(nd) or nd in added:
+            continue
+        if hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(nd)
+            except OSError:
+                pass
+        if nd not in path_parts:
+            path_parts.insert(0, nd)
+        added.append(nd)
+    if added:
+        os.environ["PATH"] = os.pathsep.join(path_parts)
+    return added
+
+
 def _probe_module(py: str, mod: str) -> bool:
     try:
         return subprocess.run(

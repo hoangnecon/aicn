@@ -220,24 +220,101 @@ def snap_and_split_segments(segments: list, sub_clauses: list, spans: list, voic
             new_st = dom_ivs[0][0]
             new_et = dom_ivs[-1][1]
         elif first_v is not None:
-            new_st = first_v
-            new_et = max(new_st + min_dur_needed, last_v if last_v else et)
+            zh = s.get("zh_text", s.get("text", ""))
+            n_zh = max(1, len([c for c in zh if "\u4e00" <= c <= "\u9fff" or c.isalnum()]))
+            max_ok_dur = max(min_dur_needed, n_zh * 0.35 + 1.35)
+
+            clusters = []
+            for vt in v_times:
+                if clusters and (vt - clusters[-1][1]) <= 0.45:
+                    clusters[-1][1] = round(vt + 0.05, 2)
+                    clusters[-1][2] += 1
+                else:
+                    clusters.append([vt, round(vt + 0.05, 2), 1])
+
+            # Trim isolated tiny noise ticks (<=2 hops) separated by >=0.50s gap when stronger clusters exist
+            while len(clusters) >= 2 and clusters[0][2] <= 2 and (clusters[1][0] - clusters[0][1]) >= 0.50:
+                clusters.pop(0)
+            while len(clusters) >= 2 and clusters[-1][2] <= 2 and (clusters[-1][0] - clusters[-2][1]) >= 0.50:
+                clusters.pop()
+
+            new_st = clusters[0][0]
+            new_et = clusters[-1][1]
+            if (new_et - new_st) > max_ok_dur:
+                # Choose the contiguous cluster range fitting <= max_ok_dur with maximum active voice hops
+                # (preferring later anchor on tie since Whisper pads segment start back over preceding silence).
+                best_score = -1
+                best_pair = None
+                for i in range(len(clusters)):
+                    acc = 0
+                    for j in range(i, len(clusters)):
+                        if (clusters[j][1] - clusters[i][0]) > max_ok_dur:
+                            break
+                        acc += clusters[j][2]
+                        if (acc > best_score) or (acc == best_score and best_pair is not None and i > best_pair[0]):
+                            best_score = acc
+                            best_pair = (i, j)
+                if best_pair is not None:
+                    new_st = clusters[best_pair[0]][0]
+                    new_et = clusters[best_pair[1]][1]
+                else:
+                    # Single long cluster exceeding max_ok_dur: tighten to highest-density window of width max_ok_dur
+                    best_c = max(clusters, key=lambda c: (c[2], c[0]))
+                    w_hops = max(1, int(max_ok_dur / 0.05))
+                    ca0 = max(a0, int(round(best_c[0] / 0.05)))
+                    ca1 = min(a1, int(round(best_c[1] / 0.05)))
+                    if (ca1 - ca0 + 1) > w_hops:
+                        best_k = ca1 - w_hops + 1
+                        best_cnt = -1
+                        for k0 in range(ca0, ca1 - w_hops + 2):
+                            cnt = int(voice_mask[k0:k0 + w_hops].sum())
+                            if cnt >= best_cnt:
+                                best_cnt = cnt
+                                best_k = k0
+                        active_k = [k for k in range(best_k, best_k + w_hops) if voice_mask[k]]
+                        new_st = round((active_k[0] if active_k else best_k) * 0.05, 2)
+                        new_et = round(((active_k[-1] + 1) if active_k else (best_k + w_hops)) * 0.05, 2)
+                    else:
+                        new_st, new_et = best_c[0], best_c[1]
+            new_et = max(new_st + min_dur_needed, new_et)
         else:
             new_st, new_et = st, et
 
+        s["start"] = round(new_st, 2)
+        s["end"] = round(new_et, 2)
+        s["_snap_meta"] = (st, et, min_dur_needed, (new_st if first_v is not None else None), bool(dom_ivs))
+
+    # Second pass after all segment starts have snapped forward: pad short segments cleanly without premature lead
+    for idx, s in enumerate(expanded):
+        orig_st, orig_et, min_dur_needed, first_v, has_dom = s.pop("_snap_meta")
+        new_st, new_et = float(s["start"]), float(s["end"])
         if new_et - new_st < min_dur_needed:
             next_st = float(expanded[idx + 1]["start"]) - 0.02 if idx + 1 < len(expanded) else 99999.0
-            new_et = min(next_st, max(et, new_st + min_dur_needed))
+            new_et = min(next_st, max(orig_et, new_st + min_dur_needed))
             if new_et - new_st < min_dur_needed:
                 prev_et = float(expanded[idx - 1]["end"]) + 0.02 if idx > 0 else 0.0
-                new_st = max(prev_et, min(st, new_et - min_dur_needed))
-
+                lead_floor = (first_v - 0.25) if (not has_dom and first_v is not None) else 0.0
+                new_st = max(prev_et, lead_floor, min(orig_st, new_et - min_dur_needed))
         s["start"] = round(new_st, 2)
         s["end"] = round(new_et, 2)
 
     for i in range(len(expanded) - 1):
         if expanded[i]["end"] > expanded[i + 1]["start"] - 0.02:
             expanded[i]["end"] = round(max(expanded[i]["start"] + 0.35, expanded[i + 1]["start"] - 0.02), 2)
+            # Re-check post-clamp premature lead if clamping shortened the end
+            if expanded[i]["end"] - expanded[i]["start"] < 0.05:
+                expanded[i]["end"] = round(expanded[i]["start"] + 0.05, 2)
+
+    # Final safety guard: when padding/clamping pulls an utterance over a newly reached voice onset in v2.0.0 mode,
+    # clamp start to stay within 0.25s of actual voice onset so premature_lead == 0 on first pass.
+    if not sub_clauses:
+        for s in expanded:
+            st_f, et_f = float(s["start"]), float(s["end"])
+            a0_f = max(0, int(st_f / 0.05))
+            a1_f = min(n_hops - 1, int(et_f / 0.05))
+            vt_f = [round(k * 0.05, 2) for k in range(a0_f, a1_f + 1) if voice_mask[k]]
+            if vt_f and (vt_f[0] - st_f) > 0.28 and (et_f - (vt_f[0] - 0.22)) >= 0.20:
+                s["start"] = round(vt_f[0] - 0.22, 2)
 
     for idx, s in enumerate(expanded, 1):
         s["id"] = idx

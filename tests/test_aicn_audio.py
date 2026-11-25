@@ -397,5 +397,27 @@ class Signal(unittest.TestCase):
             self.m._TTS = orig_tts
 
 
+    def test_chunked_stft_istft_equivalence_and_concurrent_write_wav16(self):
+        from concurrent.futures import ThreadPoolExecutor
+        rng = np.random.default_rng(7)
+        x = (rng.standard_normal((self.sr * 4 + 137, 2)) * 0.25).astype(np.float32)
+        idx, bob = self.m._band_indices()
+        P_ref, Zs, _ = self.m.stft_and_power(x, idx)
+        P_chk, _ = self.m.band_power_chunked(x, idx, chunk_frames=100)
+        self.assertEqual(P_ref.shape, P_chk.shape)
+        self.assertLess(float(np.max(np.abs(P_ref - P_chk)) / (np.max(P_ref) + 1e-12)), 1e-4)
+        g = np.clip(0.25 + 0.65 * rng.random(P_ref.shape), 0.1, 1.0)
+        y_ref = self.m.istft_from_Z(Zs, g, bob, len(x))
+        y_chk = self.m.apply_gain_chunked(x, g, bob, chunk_frames=100)
+        self.assertLess(float(np.max(np.abs(y_ref - y_chk))), 2e-4)
+
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "same_hash.wav")
+            wav = np.zeros(self.sr // 5, dtype=np.float32)
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(lambda _: self.m._write_wav16(target, wav, self.sr), range(12)))
+            self.assertTrue(os.path.isfile(target))
+
+
 if __name__ == "__main__":
     unittest.main()

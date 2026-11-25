@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.7.1 (2026-11-25)
+- **Fix Windows Concurrent `_write_wav16` Race & 65× Lower-RAM Chunked STFT/iSTFT in Stage 3 Mix (`scripts/aicn_audio.py`, `L-022`)**:
+  - Updated `_write_wav16()` to write per-PID/per-thread temp files (`{path}.{pid}.{tid}.part.wav`) with Windows `PermissionError` (`WinError 32`) race handling so identical clauses stretched concurrently in `ThreadPoolExecutor` never collide on the same `.part.wav`.
+  - Replaced full-length `complex128` STFT/iSTFT allocations (`3.4–5.2 GiB` peak RAM on 20-minute units) in `spectral_profile()` and `cmd_mix()` with overlap-trimmed chunked `band_power_chunked()` + `apply_gain_chunked()` (`< 80 MiB` peak RAM, `1.8e-7` max sample error vs full STFT/iSTFT), preventing multi-tab Windows `ArrayMemoryError` crashes.
+  - Added regression test `test_chunked_stft_istft_equivalence_and_concurrent_write_wav16` in `tests/test_aicn_audio.py` (`71/71` passing).
+
 ## 2.7.0 (2026-11-25)
 - **Poster Localization, `brand-poster` CLI & Updated Upload Caption Standard (`references/poster_and_caption_guide.md`, `scripts/aicn.py`, `SKILL.md`, `L-021`)**:
   - Added `references/poster_and_caption_guide.md` codifying the full Tier-2 `posters/` release packaging flow: pulling HD unshrunk Hongguo official posters (`~tplv-resize:1440:0.image` -> `official_poster_<slug>_zh.jpg`), standardized `9:16` vertical poster & `16:9` horizontal thumbnail localization prompt templates (compatible with user-generated external Flow / Nano Banana 2 / Gemini assets), and the updated 2-line upload caption format (`<Hook Title> <2 emojis> | Full N Tập` + `#daudonho #aishortfilmdrama ...`).

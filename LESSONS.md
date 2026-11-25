@@ -177,3 +177,9 @@ Structured log of verified production failures, user corrections, and API change
   1. Added `references/poster_and_caption_guide.md` with the complete HD official poster pull, `9:16` / `16:9` prompt templates, and updated 2-line upload caption standard (`<Hook> <2 emojis> | Full N Tập` + `#daudonho ...`).
   2. Added `aicn.py brand-poster` to standardize any user-generated raw poster into `_raw`, `_clean.png`, and dual-corner `_branded.png` (with optional `--remove-star` and `--delete-source`), backed by unit tests in `tests/test_aicn.py`.
   3. Updated `SKILL.md` and `references/folder_contract.md`.
+
+## L-022 (2026-11-25) — Windows `_write_wav16` Multi-Thread Cache Collision (`WinError 32`) & 20-Min Unit `3.4 GiB` STFT `ArrayMemoryError`
+- **Symptom:** On dense 20-minute 48 kHz units (`550+` clauses) running concurrently across multi-series tabs on Windows, `aicn_audio.py` hit two failures: (1) `PermissionError: [WinError 32]` in `_write_wav16` when two threads concurrently stretched identical clauses hashing to the same `.cache/rb_clause/<hash>.wav.part.wav`, and (2) `numpy._core._exceptions._ArrayMemoryError: Unable to allocate 3.41 GiB` inside `spectral_profile()`, `stft_and_power()`, and `istft_from_Z()` because `scipy.signal.stft` upcast 20-minute arrays to `complex128` while holding stereo `ZV` + `ZB` simultaneously (`~5.2 GiB` per process).
+- **Guardrail Implemented (`v2.7.1`):**
+  1. Made `_write_wav16()` use unique per-PID/per-thread temp filenames (`{path}.{pid}.{tid}.part.wav`) with Windows `PermissionError` race retry/dedup.
+  2. Replaced full-array STFT/iSTFT in `spectral_profile()` and `cmd_mix()` with overlap-trimmed 120s chunked `band_power_chunked()` and `apply_gain_chunked()` (`< 80 MiB` peak RAM, `~1.8e-7` sample equivalence vs full STFT/iSTFT), backed by `test_chunked_stft_istft_equivalence_and_concurrent_write_wav16` (`71/71` unit tests passing).

@@ -13,7 +13,7 @@ aicn_audio.py - Stage 3 audio for AICN: separation, sentence-level dub, frequenc
 Run with the VieNeu venv python ($AICN_PY). Parameters: config/audio_mix.json overrides DEFAULTS.
 In sub_only mode there is no dub: the original stereo is mastered and verified.
 """
-import argparse, json, os, re, subprocess, sys, tempfile, time
+import argparse, json, os, re, subprocess, sys, tempfile, threading, time
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
@@ -140,8 +140,20 @@ def follow_hold(g, fps, att, hold_s, rel):
 def _write_wav16(path, arr, sr=SR):
     """Write compact lossless 16-bit PCM WAV atomically (-50% disk vs FLOAT32, -96 dB dynamic range)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + ".part.wav"
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.part.wav"
     sf.write(tmp, np.clip(np.asarray(arr, dtype=np.float32), -1.0, 0.999969), sr, subtype="PCM_16")
+    for attempt in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if os.path.exists(path) and os.path.getsize(path) > 44:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                return
+            time.sleep(0.05 * (attempt + 1))
     os.replace(tmp, path)
 
 
@@ -606,11 +618,42 @@ def spectral_profile(x, sr=SR):
     rms_db = round(20.0 * np.log10(rms), 2)
     crest_db = round(peak_db - rms_db, 2)
 
-    f, _, Z = stft(mono, sr, nperseg=NFFT, noverlap=NFFT - HOP)
-    Z2 = Z.real * Z.real + Z.imag * Z.imag
-    frame_e = Z2.sum(axis=0)
-    act_f = frame_e > max(float(frame_e.max()) * 1e-5, 1e-12)
-    mag2 = Z2[:, act_f].mean(axis=1) if act_f.any() else Z2.mean(axis=1)
+    # Chunked STFT (120s windows) keeps peak RAM < 50 MiB instead of 3.4 GiB complex128 on 20-min units
+    mono32 = np.asarray(mono, dtype=np.float32)
+    chunk_n = sr * 120
+    f = None
+    chunk_res = []
+    global_max_e = 0.0
+    for off in range(0, len(mono32), chunk_n):
+        seg = mono32[off : off + chunk_n]
+        if len(seg) < NFFT and off > 0:
+            continue
+        f_c, _, Z = stft(seg, sr, nperseg=NFFT, noverlap=NFFT - HOP)
+        f = f_c
+        Z2 = (Z.real * Z.real + Z.imag * Z.imag).astype(np.float64)
+        fe = Z2.sum(axis=0)
+        cmax = float(fe.max()) if fe.size else 0.0
+        if cmax > global_max_e:
+            global_max_e = cmax
+        chunk_res.append((Z2.shape[1], fe, Z2.mean(axis=1)))
+        del Z, Z2
+    thresh = max(global_max_e * 1e-5, 1e-12)
+    mag2_sum = np.zeros(len(f), dtype=np.float64)
+    n_act = 0
+    for off, (nf_c, fe, _) in zip(range(0, len(mono32), chunk_n), chunk_res):
+        act_c = fe > thresh
+        if not act_c.any():
+            continue
+        seg = mono32[off : off + chunk_n]
+        _, _, Z = stft(seg, sr, nperseg=NFFT, noverlap=NFFT - HOP)
+        Z2 = (Z.real * Z.real + Z.imag * Z.imag).astype(np.float64)
+        mag2_sum += Z2[:, act_c].sum(axis=1)
+        n_act += int(act_c.sum())
+        del Z, Z2
+    if n_act > 0:
+        mag2 = mag2_sum / float(n_act)
+    else:
+        mag2 = np.mean([m for _, _, m in chunk_res], axis=0)
     tot = float(mag2.sum() + 1e-15)
     bands_pct = {}
     bands_db = {}
@@ -738,6 +781,67 @@ def _band_indices():
     return idx, band_of_bin
 
 
+def band_power_chunked(x, idx=None, chunk_frames=11250):
+    """Low-RAM (<60 MiB) sample-exact band power over arbitrary-length audio via chunked STFT."""
+    from scipy.signal import stft
+    if idx is None:
+        idx, _ = _band_indices()
+    x = np.asarray(x, dtype=np.float32)
+    x = x if x.ndim == 2 else x[:, None]
+    n, nch = x.shape
+    n_frames = (n + HOP - 1) // HOP + 1
+    P = np.zeros((len(idx), n_frames), dtype=np.float64)
+    half = NFFT // 2
+    for ch in range(nch):
+        xp = np.pad(x[:, ch], (half, NFFT + HOP))
+        for f0 in range(0, n_frames, chunk_frames):
+            f1 = min(n_frames, f0 + chunk_frames)
+            seg = xp[f0 * HOP : (f1 - 1) * HOP + NFFT]
+            _, _, Z = stft(seg, SR, nperseg=NFFT, noverlap=NFFT - HOP, boundary=None, padded=False)
+            Z = Z.astype(np.complex64, copy=False)
+            nf = min(Z.shape[1], f1 - f0)
+            Z2 = (Z[:, :nf].real * Z[:, :nf].real + Z[:, :nf].imag * Z[:, :nf].imag)
+            for b, ii in enumerate(idx):
+                P[b, f0 : f0 + nf] += Z2[ii].sum(0)
+            del Z, Z2
+    return P / nch, idx
+
+
+def apply_gain_chunked(x, g, band_of_bin, chunk_frames=11250):
+    """Low-RAM (<80 MiB) overlap-trimmed chunked STFT/iSTFT gain application (exact to ~1e-6)."""
+    import warnings
+    from scipy.signal import stft, istft
+    x = np.asarray(x, dtype=np.float32)
+    is_1d = (x.ndim == 1)
+    x2 = x[:, None] if is_1d else x
+    n, nch = x2.shape
+    n_frames = min(g.shape[1], (n + HOP - 1) // HOP + 1)
+    half = NFFT // 2
+    pad_f = 4
+    out = np.empty((n, nch), dtype=np.float32)
+    for ch in range(nch):
+        xp = np.pad(x2[:, ch], (half, NFFT + HOP))
+        for f0 in range(0, n_frames, chunk_frames):
+            f1 = min(n_frames, f0 + chunk_frames)
+            flo = max(0, f0 - pad_f)
+            fhi = min(n_frames, f1 + pad_f)
+            seg = xp[flo * HOP : (fhi - 1) * HOP + NFFT]
+            _, _, Z = stft(seg, SR, nperseg=NFFT, noverlap=NFFT - HOP, boundary=None, padded=False)
+            nf = min(Z.shape[1], fhi - flo)
+            G = g[band_of_bin, flo : flo + nf].astype(np.float32)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="NOLA condition failed")
+                _, y = istft(Z[:, :nf].astype(np.complex64, copy=False) * G, SR, nperseg=NFFT, noverlap=NFFT - HOP, boundary=None)
+            # Sample i in y aligns with xp[flo * HOP + i] == x[flo * HOP + i - half]
+            dst0 = max(0, f0 * HOP - half) if f0 > 0 else 0
+            dst1 = min(n, f1 * HOP - half) if f1 < n_frames else n
+            src0 = dst0 + half - flo * HOP
+            src1 = dst1 + half - flo * HOP
+            out[dst0:dst1, ch] = y[src0:src1]
+            del Z, G, y
+    return out[:, 0] if is_1d else out
+
+
 def stft_and_power(x, idx=None):
     """Compute complex64 STFT once and return ((bands, frames) power, list of Z per channel, idx)."""
     from scipy.signal import stft
@@ -817,9 +921,9 @@ def cmd_mix(ws, c, fh):
     T = voice_chain(T, hp_hz=fp["dub_hp_hz"], lp_hz=fp["dub_lp_hz"], mud_cut_db=fp["dub_mud_cut_db"])
     lv = lufs(V); gain = lv + c["dub_over_vocal_lu"] - lufs(T[:, None]); T = T * np.float32(10 ** (gain / 20))
     idx, band_of_bin = _band_indices()
-    PT, _, _ = stft_and_power(T, idx)
-    PV, ZV, _ = stft_and_power(V, idx)
-    PB, ZB, _ = stft_and_power(B, idx)
+    PT, _ = band_power_chunked(T, idx)
+    PV, _ = band_power_chunked(V, idx)
+    PB, _ = band_power_chunked(B, idx)
     fps = SR / HOP; W = BAND_W[:, None]
     hold_s = float(c.get("hold_s", 0.35))
     raw_active = PT > PT.max(1, keepdims=True) * 10 ** (-45 / 10)
@@ -840,7 +944,11 @@ def cmd_mix(ws, c, fh):
     gB_raw = need(PB, c["snr_bgm_db"], c["floor_bgm_db"])
     gV = follow_hold(1 - W * (1 - gV_raw), fps, c["attack_s"], hold_s, c["release_s"])
     gB = follow_hold(1 - W * (1 - gB_raw), fps, c["attack_s"], hold_s, c["release_s"])
-    mix = istft_from_Z(ZV, gV, band_of_bin, n) + istft_from_Z(ZB, gB, band_of_bin, n) + T[:, None]
+    mix = apply_gain_chunked(V, gV, band_of_bin)
+    del V
+    mix += apply_gain_chunked(B, gB, band_of_bin)
+    del B
+    mix += T[:, None]
     os.makedirs(os.path.join(ws, "media", "audio"), exist_ok=True)
     _write_wav16(os.path.join(ws, "media", "audio", "premaster_48k.wav"), mix.astype(np.float32), SR)
     on = talk > 0.5

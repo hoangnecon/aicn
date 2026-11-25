@@ -178,10 +178,58 @@ class TestStage1MultiBandASR(unittest.TestCase):
             self.assertEqual(rep2["longest_uncovered_vocal_gap_s"], 0.0)
 
     def test_pass1_pipeline_version_and_defaults(self):
-        self.assertEqual(ras.ASR_PIPELINE_VERSION, "asr-3.1")
-        self.assertEqual(avw.WAVEFORM_CACHE_VERSION, "wf-3.1")
+        self.assertEqual(ras.ASR_PIPELINE_VERSION, "asr-3.2")
+        self.assertEqual(avw.WAVEFORM_CACHE_VERSION, "wf-3.2")
         self.assertEqual(ras._initial_prompt_for("zh"), "以下是普通话的句子，使用简体中文。")
         self.assertIsNone(ras._initial_prompt_for("en"))
+
+    def test_stitched_pass2b_blocks_prechop_hallucination_and_bloated_pass1_hiding(self):
+        sr = self.sr
+        t2 = np.arange(sr * 2) / sr
+        sil1 = np.zeros(sr * 1, dtype=np.float32)
+        syl = (0.5 + 0.5 * np.sin(2 * np.pi * 5.0 * t2)).astype(np.float32) ** 2
+        sp_a = (syl * (0.10 * np.sin(2 * np.pi * 650 * t2))).astype(np.float32)
+        sp_b = (syl * (0.09 * np.sin(2 * np.pi * 750 * t2))).astype(np.float32)
+        # [0..2s] spoken phrase A ("好吧"), [2..4s] silence, [4..6s] spoken phrase B, [6..7s] silence
+        # Pass 1 bloated segment [0.0..6.2s] for 2-char "好吧" MUST NOT hide [4..6s] from detect_uncovered_multiband_gaps!
+        voc = np.concatenate([sp_a, sil1, sil1, sp_b, sil1])
+        bloated_pass1 = [{"id": 0, "start": 0.0, "end": 6.2, "text": "好吧"}]
+        gaps = avw.detect_uncovered_multiband_gaps(bloated_pass1, voc, voc, sr=sr)
+        self.assertTrue(any(3.7 <= g["start"] <= 4.3 and g["end"] >= 5.5 for g in gaps), f"Bloated Pass 1 hid speech B: {gaps}")
+
+        # Verify stitched Pass 2B rejects full-sentence YouTube outro hallucination BEFORE splitting words across slots
+        # (so chopped fragments like "吝" or "镜与点点栏目" can never leak!) and never passes initial_prompt!
+        class _FakeW:
+            def __init__(self, start, end, word, probability=0.9):
+                self.start, self.end, self.word, self.probability = start, end, word, probability
+
+        seen_kwargs = []
+
+        class _HallucinatingStitchModel:
+            def transcribe(self, buf, **kwargs):
+                seen_kwargs.append(kwargs)
+                bad = _FakeSeg(0.1, 4.2, "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", avg_logprob=-0.20, no_speech_prob=0.05)
+                bad.words = [
+                    _FakeW(0.2, 0.9, "请不"),
+                    _FakeW(1.0, 1.4, "吝"),
+                    _FakeW(2.5, 4.0, "镜与点点栏目"),
+                ]
+                return [bad], {}
+
+        out = ras._probe_band_gaps_stitched(
+            model=_HallucinatingStitchModel(),
+            wave=voc,
+            gap_entries=[(0, {"start": 0.5, "end": 2.0, "peak_voc_rms": 0.08}), (1, {"start": 4.0, "end": 5.8, "peak_voc_rms": 0.08})],
+            band_name="full_vocal",
+            whisper_lang="zh",
+            source_lang="zh",
+            total_dur=7.0,
+            sr=sr,
+            force_stitch=True,
+        )
+        self.assertNotIn("initial_prompt", seen_kwargs[0], "Pass 2B vad_filter=False must never pass initial_prompt")
+        self.assertEqual(out[0], [], f"Chopped hallucination leaked into slot 0: {out}")
+        self.assertEqual(out[1], [], f"Chopped hallucination leaked into slot 1: {out}")
 
     def test_reentrant_gpu_lock_and_content_sha256_survives_move(self):
         scripts_dir = os.path.abspath(os.path.join(HERE, "..", "scripts"))

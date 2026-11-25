@@ -46,7 +46,7 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-WAVEFORM_CACHE_VERSION = "wf-3.1"
+WAVEFORM_CACHE_VERSION = "wf-3.2"
 
 
 def _fast_file_sig(path: str) -> str:
@@ -224,20 +224,7 @@ def detect_uncovered_multiband_gaps(
     if n_hops <= 0:
         return []
 
-    # 1. Build covered mask from existing ASR segments (inset by 0.05s so adjacent missed speech stays exposed)
-    covered = np.zeros(n_hops, dtype=bool)
-    for s in existing_segments or []:
-        st = float(s.get("start", 0.0)) + 0.05
-        et = float(s.get("end", 0.0)) - 0.05
-        if et <= st:
-            st = float(s.get("start", 0.0))
-            et = float(s.get("end", 0.0))
-        i0 = max(0, int(round(st / 0.05)))
-        i1 = min(n_hops, int(round(et / 0.05)))
-        if i1 > i0:
-            covered[i0:i1] = True
-
-    # 2. Per-band 50ms RMS, ZCR, and local syllable modulation CV
+    # 1. Per-band 50ms RMS, ZCR, and local syllable modulation CV
     voc_rms, voc_zcr = _hop_rms_and_zcr(streams["voc_raw"], n_hops, hop)
     full_rms, full_zcr = _hop_rms_and_zcr(streams["full_vocal_raw"], n_hops, hop)
     hi_rms, hi_zcr = _hop_rms_and_zcr(streams["high_raw"], n_hops, hop)
@@ -264,8 +251,39 @@ def detect_uncovered_multiband_gaps(
     mid_fl = _floor(mid_rms, 0.0025, 0.0100)
     lo_fl = _floor(lo_rms, 0.0025, 0.0100)
 
+    # 2. Build covered mask from existing ASR segments, clamping bloated Pass 1 spans to their densest
+    # active-energy window (<= n_chars * 0.35 + 1.35s) so Pass 1 silence tails NEVER hide adjacent speech
+    # before --snap-and-split shrinks them!
+    covered = np.zeros(n_hops, dtype=bool)
+    for s in existing_segments or []:
+        raw_st = float(s.get("start", 0.0))
+        raw_et = float(s.get("end", 0.0))
+        txt_s = s.get("zh_text", s.get("text", "")) or ""
+        n_ch = len([c for c in txt_s if ("\u4e00" <= c <= "\u9fff") or c.isalnum()])
+        max_cov_dur = (n_ch * 0.35 + 1.35) if n_ch > 0 else (raw_et - raw_st)
+        if n_ch > 0 and (raw_et - raw_st) > max_cov_dur:
+            a0 = max(0, int(round(raw_st / 0.05)))
+            a1 = min(n_hops, int(round(raw_et / 0.05)))
+            w_h = max(2, int(round(max_cov_dur / 0.05)))
+            if (a1 - a0) > w_h:
+                csum = np.concatenate([[0.0], np.cumsum(full_rms[a0:a1])])
+                win_sums = csum[w_h:] - csum[:-w_h]
+                best_off = int(np.argmax(win_sums))
+                raw_st = (a0 + best_off) * 0.05
+                raw_et = (a0 + best_off + w_h) * 0.05
+        st = raw_st + 0.05
+        et = raw_et - 0.05
+        if et <= st:
+            st, et = raw_st, raw_et
+        i0 = max(0, int(round(st / 0.05)))
+        i1 = min(n_hops, int(round(et / 0.05)))
+        if i1 > i0:
+            covered[i0:i1] = True
+
     # Active speech masks across all 4 bands (zero dead zone between whisper and loud speech!)
-    is_full = (voc_rms > max(0.0075, voc_fl * 2.1)) & (voc_zcr >= 0.015) & (voc_zcr <= 0.45) & (
+    is_full = (voc_rms > max(0.0075, voc_fl * 2.1)) & (voc_zcr >= 0.015) & (
+        (voc_zcr <= 0.45) | ((voc_rms > 0.035) & (voc_zcr <= 0.58))
+    ) & (
         (voc_rms > max(0.018, voc_fl * 3.2)) | (voc_mod >= 0.14)
     )
     # High band: child/cartoon voices (high pitch & ZCR up to 0.62) + breathy whispers
@@ -1028,53 +1046,7 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
             pass2b_report = {}
             verified_non_speech = []
 
-    speech_bursts_covered = 0
-    speech_bursts_total = 0
-    uncovered_acoustic_bursts = []
-    whisper_bursts_count = sum(1 for b in merged_bursts if b.get("kind") == "whisper")
-    phone_call_bursts_count = sum(1 for b in merged_bursts if b.get("kind") == "phone_call")
-    for b in merged_bursts:
-        bst, bet = b["start"], b["end"]
-        bdur = bet - bst
-        has_sub_clause = any(max(0.0, min(bet, sc["end"]) - max(bst, sc["start"])) >= 0.25 for sc in sub_clauses)
-        ov = sum(max(0.0, min(bet, float(s["end"])) - max(bst, float(s["start"]))) for s in segs)
-        ov_ratio = ov / max(0.2, bdur)
-        non_speech_ov = sum(
-            max(0.0, min(bet, float(ns["end"])) - max(bst, float(ns["start"])))
-            for ns in verified_non_speech
-        )
-        non_speech_ratio = non_speech_ov / max(0.2, bdur)
-        # Smart Acoustic Gate (v2.5.0): never blindly mark unprobed strong vocal bursts as covered when sub_clauses is empty.
-        # Pure BGM/SFX bursts explicitly probed across High/Mid/Low/Full bands by Pass 2B (`verified_non_speech_gaps`)
-        # do not deadlock Stage 1 (preserving L-015), while unprobed strong vocal gaps are caught immediately.
-        if has_sub_clause:
-            speech_bursts_total += 1
-            if ov_ratio >= 0.40:
-                speech_bursts_covered += 1
-            else:
-                uncovered_acoustic_bursts.append({**b, "coverage_ratio": round(ov_ratio, 3)})
-        elif b["peak_voc_rms"] >= 0.035:
-            speech_bursts_total += 1
-            if ov_ratio >= 0.40 or (ov_ratio + non_speech_ratio) >= 0.60:
-                speech_bursts_covered += 1
-            else:
-                uncovered_acoustic_bursts.append({
-                    **b,
-                    "coverage_ratio": round(ov_ratio, 3),
-                    "probed_non_speech_ratio": round(non_speech_ratio, 3),
-                })
-        elif b.get("kind") in ("whisper", "phone_call"):
-            speech_bursts_total += 1
-            if ov_ratio >= 0.40 or non_speech_ratio >= 0.50 or not verified_non_speech:
-                speech_bursts_covered += 1
-            else:
-                uncovered_acoustic_bursts.append({
-                    **b,
-                    "coverage_ratio": round(ov_ratio, 3),
-                    "probed_non_speech_ratio": round(non_speech_ratio, 3),
-                })
-
-    # Compute longest contiguous unprobed active-vocal gap (catches 20-90s Whisper stalls immediately)
+    # Build hop-level covered-or-verified mask first so wide BGM-bridged bursts can check exact active vocal coverage
     covered_or_verified = np.zeros(n_hops, dtype=bool)
     for s in segs:
         i0 = max(0, int(round(float(s["start"]) / 0.05)))
@@ -1086,6 +1058,73 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         i1 = min(n_hops, int(round(float(ns["end"]) / 0.05)))
         if i1 > i0:
             covered_or_verified[i0:i1] = True
+
+    speech_bursts_covered = 0
+    speech_bursts_total = 0
+    uncovered_acoustic_bursts = []
+    whisper_bursts_count = sum(1 for b in merged_bursts if b.get("kind") == "whisper")
+    phone_call_bursts_count = sum(1 for b in merged_bursts if b.get("kind") == "phone_call")
+    for b in merged_bursts:
+        bst, bet = b["start"], b["end"]
+        bdur = bet - bst
+        bi0 = max(0, int(round(bst / 0.05)))
+        bi1 = min(n_hops, int(round(bet / 0.05)))
+        v_hops = int(voice_mask[bi0:bi1].sum()) if bi1 > bi0 else 0
+        v_cov_hops = int((voice_mask[bi0:bi1] & covered_or_verified[bi0:bi1]).sum()) if bi1 > bi0 else 0
+        v_cov_ratio = (v_cov_hops / v_hops) if v_hops > 0 else 0.0
+        has_sub_clause = any(max(0.0, min(bet, sc["end"]) - max(bst, sc["start"])) >= 0.25 for sc in sub_clauses)
+        ov = sum(max(0.0, min(bet, float(s["end"])) - max(bst, float(s["start"]))) for s in segs)
+        ov_ratio = ov / max(0.2, bdur)
+        non_speech_ov = sum(
+            max(0.0, min(bet, float(ns["end"])) - max(bst, float(ns["start"])))
+            for ns in verified_non_speech
+        )
+        non_speech_ratio = non_speech_ov / max(0.2, bdur)
+        # Smart Acoustic Gate (v2.6.1): never blindly mark unprobed strong vocal bursts as covered when sub_clauses is empty.
+        # Pure BGM/SFX bursts or steady-BGM-bridged bursts whose active vocal hops were transcribed/probed by Pass 2B
+        # (`verified_non_speech_gaps`) do not deadlock Stage 1 (preserving L-015), while unprobed vocal gaps fail immediately.
+        if has_sub_clause:
+            speech_bursts_total += 1
+            if ov_ratio >= 0.40:
+                speech_bursts_covered += 1
+            else:
+                uncovered_acoustic_bursts.append({**b, "coverage_ratio": round(ov_ratio, 3)})
+        elif b["peak_voc_rms"] >= 0.035:
+            speech_bursts_total += 1
+            if (
+                ov_ratio >= 0.40
+                or (ov_ratio + non_speech_ratio) >= 0.55
+                or (v_hops >= 4 and v_cov_ratio >= 0.65)
+                or (v_hops < 4 and (ov_ratio + non_speech_ratio) >= 0.25)
+            ):
+                speech_bursts_covered += 1
+            else:
+                uncovered_acoustic_bursts.append({
+                    **b,
+                    "coverage_ratio": round(ov_ratio, 3),
+                    "probed_non_speech_ratio": round(non_speech_ratio, 3),
+                    "vocal_hop_coverage": round(v_cov_ratio, 3),
+                })
+        elif b.get("kind") in ("whisper", "phone_call"):
+            # Skip <1.0s low-vocal BGM breath ticks that Pass 2B's short-pause filter intentionally ignored
+            if bdur < 1.0 and b["peak_voc_rms"] < 0.025:
+                continue
+            speech_bursts_total += 1
+            if (
+                ov_ratio >= 0.35
+                or (ov_ratio + non_speech_ratio) >= 0.45
+                or (v_hops == 0 and bool(verified_non_speech))
+                or not verified_non_speech
+            ):
+                speech_bursts_covered += 1
+            else:
+                uncovered_acoustic_bursts.append({
+                    **b,
+                    "coverage_ratio": round(ov_ratio, 3),
+                    "probed_non_speech_ratio": round(non_speech_ratio, 3),
+                })
+
+    # Compute longest contiguous unprobed active-vocal gap (catches 20-90s Whisper stalls immediately)
     unprobed_vocal = voice_mask & (~covered_or_verified)
     longest_gap_hops = 0
     cur_run = 0

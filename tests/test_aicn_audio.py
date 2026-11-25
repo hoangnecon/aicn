@@ -377,16 +377,22 @@ class Signal(unittest.TestCase):
                 return [np.zeros(sr // 10, dtype=np.float32) for _ in texts]
         orig_cuda = self.m._tts_cuda_available
         orig_tts = self.m._TTS
+        old_lock = os.environ.get("AICN_LOCK_DIR")
         try:
             self.m._tts_cuda_available = lambda: True
             self.m._TTS = _FakeCudaTTS()
             with tempfile.TemporaryDirectory() as td:
+                os.environ["AICN_LOCK_DIR"] = os.path.join(td, "locks")
                 jobs = [(f"Câu {i}", "Trúc Ly", 0.8, 25, os.path.join(td, f"j{i}.wav")) for i in range(5)]
                 self.m.presynth(jobs, workers=4, threads=4, batch_size=2)
                 self.assertEqual([len(c[0]) for c in calls], [2, 2, 1])
                 for _, _, _, _, p in jobs:
                     self.assertTrue(os.path.exists(p))
         finally:
+            if old_lock is None:
+                os.environ.pop("AICN_LOCK_DIR", None)
+            else:
+                os.environ["AICN_LOCK_DIR"] = old_lock
             self.m._tts_cuda_available = orig_cuda
             self.m._TTS = orig_tts
 

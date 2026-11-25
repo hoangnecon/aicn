@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.6.1 (2026-11-25)
+- **Stitched Pass 2B Pre-Chop Hallucination Guard, Bloated-Span Exposure & Acoustic Gate Alignment (`asr-3.2`, `wf-3.2`, `L-019`)**:
+  - **Stitched Pass 2B Anti-Hallucination Hardening (`run_asr_and_scan.py`, `asr-3.2`):**
+    - Removed `initial_prompt` from all `vad_filter=False` Pass 2B calls (`_probe_band_clip`, `_probe_band_gaps_stitched`, and `_MlxWhisper` when `vad_filter=False`) so `large-v3` never parrots prompt fragments (`"普通话的句子"`, `"体中文"`) over pure BGM.
+    - Checked `_is_hallucination(sg.text)` on the **full unchopped segment** *before* splitting `sg.words` across stitched gap slots (blocking chopped fragments like `"吝"` and `"镜与点点栏目"` from `"请不吝点赞 订阅 转发 打赏支持明镜与点点栏目"`), added word-probability (`>= 0.42`) + anti-bloat duration caps (`n_chars * 0.35 + 1.25s`), added a vocals-stem silence consensus guard against single-band BGM hallucinations, and recorded every probed gap in `verified_non_speech_gaps`.
+  - **Bloated Pass 1 Tail Clamping & Smart Acoustic Gate Alignment (`analyze_voice_waveform.py`, `wf-3.2`):**
+    - Clamped bloated Pass 1 spans inside `detect_uncovered_multiband_gaps()` to their densest `<= n_chars * 0.35 + 1.35s` window (and widened `is_full` ZCR up to `0.58` for loud `voc_rms > 0.035` high-pitched child vocals) so Pass 1 silence tails never hide adjacent dialogue before `--snap-and-split` shrinks them.
+    - Aligned `analyze_waveform_and_clauses()` with Pass 2B's `< 1.0s` BGM breath-tick filter and wide steady-BGM-bridged bursts by checking active `voice_mask` hop coverage (`v_cov_ratio >= 0.65`) alongside `ov_ratio + non_speech_ratio`.
+  - **Tests (`tests/test_stage1_multiband_asr.py`):** Added regression test verifying pre-chop stitched hallucination rejection, `no_prompt` enforcement on `vad_filter=False`, and bloated Pass 1 tail exposure (`68/68` unit tests passing).
+
 ## 2.6.0 (2026-11-25)
 - **Machine-Wide GPU Lock, Persistent Global SHA-256 Caches, Stitched Multi-Gap Pass 2B (~15× Faster) & -50% WAV Disk Footprint (`L-018`)**:
   - **Machine-Wide Re-Entrant GPU Lock & Single-Process Stage 3 (`scripts/aicn_platform.py`, `scripts/aicn.py`, `scripts/aicn_audio.py`, `run_asr_and_scan.py`):**

@@ -335,11 +335,12 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
 
 
 
-ASR_PIPELINE_VERSION = "asr-3.1"
+ASR_PIPELINE_VERSION = "asr-3.2"
 HALLUCINATION_SUBSTRINGS = (
-    "索兰娅", "谢谢观看", "感谢观看", "感谢收看", "请不吝点赞", "点赞订阅",
-    "字幕由", "优优独播剧场", "Amara.org", "Thank you for watching", "Thanks for watching",
-    "Please subscribe", "Subtitles by", "以下是普通话的句子", "使用简体中文",
+    "索兰娅", "明镜", "点点栏目", "打赏支持", "不吝点赞", "请不吝", "点赞订阅", "订阅转发", "欢迎订阅",
+    "谢谢观看", "感谢观看", "感谢收看", "字幕由", "字幕制作", "中文字幕", "优优独播", "Amara",
+    "普通话的句子", "简体中文", "体中文", "Thank you for watching", "Thanks for watching",
+    "Please subscribe", "Subtitles by", "以下是普通话",
 )
 
 
@@ -378,7 +379,9 @@ class _MlxWhisper:
                    vad_parameters=None, condition_on_previous_text=False, temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
                    initial_prompt=None):
         import mlx_whisper
-        prompt = initial_prompt if initial_prompt is not None else ("以下是普通话的句子，使用简体中文。" if language == "zh" else None)
+        prompt = initial_prompt if initial_prompt is not None else (
+            "以下是普通话的句子，使用简体中文。" if (language == "zh" and vad_filter is not False) else None
+        )
         r = mlx_whisper.transcribe(np.asarray(audio, np.float32), path_or_hf_repo=self.repo, language=language,
                                    word_timestamps=word_timestamps, condition_on_previous_text=condition_on_previous_text,
                                    temperature=temperature, verbose=None,
@@ -752,7 +755,8 @@ def _probe_band_clip(
         return []
     clip = (clip / mx * 0.85).astype(np.float32)
 
-    prompt = _initial_prompt_for(source_lang)
+    # Never pass initial_prompt in Pass 2B (vad_filter=False): prompt text causes large-v3 to parrot
+    # prompt fragments ("普通话的句子" / "体中文") or YouTube outro loops over pure BGM!
     kwargs = dict(
         language=whisper_lang,
         beam_size=3 if band_name in ("full_vocal", "raw_clean") else 2,
@@ -761,13 +765,7 @@ def _probe_band_clip(
         condition_on_previous_text=False,
         temperature=0.0,
     )
-    if prompt:
-        kwargs["initial_prompt"] = prompt
-    try:
-        sub_gen, _ = model.transcribe(clip, **kwargs)
-    except TypeError:
-        kwargs.pop("initial_prompt", None)
-        sub_gen, _ = model.transcribe(clip, **kwargs)
+    sub_gen, _ = model.transcribe(clip, **kwargs)
 
     cands = []
     for sg in list(sub_gen):
@@ -778,16 +776,20 @@ def _probe_band_clip(
         no_sp = float(getattr(sg, "no_speech_prob", 0.0))
         comp_r = float(getattr(sg, "compression_ratio", 1.0))
         n_cjk = len([c for c in rec_text if "\u4e00" <= c <= "\u9fff"])
+        n_chars = max(1, len([c for c in rec_text if ("\u4e00" <= c <= "\u9fff") or c.isalnum()]))
         if source_lang == "zh":
             # Allow crisp 1-char exclamations (e.g. "嗯", "啊", "走", "停") only when high-confidence & loud vocal
             has_words = (n_cjk >= 2) or (n_cjk == 1 and rec_prob > -0.45 and no_sp < 0.25 and peak_voc_rms >= 0.035)
         else:
             has_words = len(rec_text.strip()) >= 3
-        if not (rec_prob > -0.95 and no_sp < 0.65 and comp_r <= 2.2 and has_words):
+        if not (rec_prob > -0.78 and no_sp < 0.50 and comp_r <= 2.2 and has_words):
             continue
 
         seg_st = round(max(gst, pad_s + float(getattr(sg, "start", 0.0))), 3)
         seg_et = round(min(get, pad_s + float(getattr(sg, "end", get - pad_s))), 3)
+        max_ok_dur = n_chars * 0.35 + 1.25
+        if (seg_et - seg_st) > max_ok_dur:
+            seg_et = round(seg_st + max_ok_dur, 3)
         if seg_et - seg_st < 0.18:
             continue
         base_score = round(rec_prob - 0.80 * no_sp - max(0.0, comp_r - 1.8) * 0.40, 4)
@@ -941,9 +943,17 @@ def fuse_and_refine_multiband_candidates(
             continue
         win, agreed_bands, win_score = best_item
 
-        # Reject unconfirmed single-band low-confidence detections (anti-hallucination guard)
+        # Reject unconfirmed single-band low-confidence or pure-BGM hallucinations
+        s0_v = max(0, int(round(win["start"] * sr)))
+        s1_v = min(len(voc_raw), int(round(win["end"] * sr))) if voc_raw is not None else 0
+        seg_voc_rms = float(np.sqrt(np.mean(voc_raw[s0_v:s1_v] ** 2) + 1e-12)) if s1_v > s0_v else 0.0
+        is_phone_gap = (gap_meta.get("kind") == "phone_call") or (win["band"] == "mid" and float(gap_meta.get("peak_mid_rms", 0.0)) > 0.025)
+        # If Demucs vocals stem is near-silent (<0.004) and NOT a phone call, require >=2-band consensus & high confidence
+        if voc_raw is not None and float(np.max(np.abs(voc_raw))) > 0.02 and seg_voc_rms < 0.0040 and not is_phone_gap:
+            if not (len(agreed_bands) >= 2 and win["avg_logprob"] > -0.50 and win["no_speech_prob"] < 0.25):
+                continue
         if len(agreed_bands) == 1:
-            if not (win["avg_logprob"] > -0.78 and win["no_speech_prob"] < 0.50):
+            if not (win["avg_logprob"] > -0.72 and win["no_speech_prob"] < 0.45):
                 continue
             # Acoustic energy confirmation on winning band raw waveform
             b_raw = streams.get(f"{win['band']}_raw")
@@ -958,6 +968,9 @@ def fuse_and_refine_multiband_candidates(
         ref_st, ref_et = _refine_span_to_band_energy(
             win["start"], win["end"], streams.get(f"{win['band']}_raw"), sr=sr
         )
+        n_chars = max(1, len([c for c in win["text"] if ("\u4e00" <= c <= "\u9fff") or c.isalnum()]))
+        if (ref_et - ref_st) > (n_chars * 0.35 + 1.25):
+            ref_et = round(ref_st + n_chars * 0.35 + 1.25, 3)
         fused.append({
             "id": -1,
             "start": ref_st,
@@ -1057,8 +1070,8 @@ def _probe_band_gaps_stitched(
     if cur_pieces:
         batches.append((np.concatenate(cur_pieces), cur_slots))
 
-    prompt = _initial_prompt_for(source_lang)
     for buf, slots in batches:
+        # Never pass initial_prompt on stitched vad_filter=False buffers (prevents prompt-echo hallucinations)
         kwargs = dict(
             language=whisper_lang,
             beam_size=2,
@@ -1067,18 +1080,18 @@ def _probe_band_gaps_stitched(
             condition_on_previous_text=False,
             temperature=0.0,
         )
-        if prompt:
-            kwargs["initial_prompt"] = prompt
-        try:
-            sub_gen, _ = model.transcribe(buf, **kwargs)
-        except TypeError:
-            kwargs.pop("initial_prompt", None)
-            sub_gen, _ = model.transcribe(buf, **kwargs)
+        sub_gen, _ = model.transcribe(buf, **kwargs)
 
         for sg in list(sub_gen):
+            full_sg_txt = (sg.text or "").strip()
+            # CRITICAL: Check hallucination on FULL unchopped segment text BEFORE splitting across stitched slots!
+            if not full_sg_txt or _is_hallucination(full_sg_txt):
+                continue
             rec_prob = round(float(getattr(sg, "avg_logprob", -0.6)), 3)
             no_sp = float(getattr(sg, "no_speech_prob", 0.0))
             comp_r = float(getattr(sg, "compression_ratio", 1.0))
+            if rec_prob <= -0.78 or no_sp >= 0.48 or comp_r > 2.2:
+                continue
             words = list(getattr(sg, "words", None) or [])
 
             if words:
@@ -1104,17 +1117,24 @@ def _probe_band_gaps_stitched(
                         txt = "".join(x.word for x in ch).strip()
                         if not txt or _is_hallucination(txt):
                             continue
+                        w_probs = [float(getattr(x, "probability", 0.85)) for x in ch]
+                        if w_probs and (sum(w_probs) / len(w_probs)) < 0.42:
+                            continue
                         n_cjk = len([c for c in txt if "\u4e00" <= c <= "\u9fff"])
+                        n_chars = max(1, len([c for c in txt if ("\u4e00" <= c <= "\u9fff") or c.isalnum()]))
                         has_words = (
                             (n_cjk >= 2) or (n_cjk == 1 and rec_prob > -0.45 and no_sp < 0.25 and p_voc >= 0.035)
                             if source_lang == "zh" else (len(txt) >= 3)
                         )
-                        if not (rec_prob > -0.95 and no_sp < 0.65 and comp_r <= 2.2 and has_words):
+                        if not has_words:
                             continue
                         loc_s = max(0.0, float(ch[0].start) - bst)
                         loc_e = min(bet - bst, max(loc_s + 0.18, float(ch[-1].end) - bst))
                         seg_st = round(max(gst, pad_s + loc_s), 3)
                         seg_et = round(min(get, pad_s + loc_e), 3)
+                        max_ok_dur = n_chars * 0.35 + 1.25
+                        if (seg_et - seg_st) > max_ok_dur:
+                            seg_et = round(seg_st + max_ok_dur, 3)
                         if seg_et - seg_st < 0.18:
                             continue
                         base_score = round(rec_prob - 0.80 * no_sp - max(0.0, comp_r - 1.8) * 0.40, 4)
@@ -1138,16 +1158,20 @@ def _probe_band_gaps_stitched(
                     continue
                 bst, bet, g_idx, pad_s, gst, get, p_voc = slots[best_si]
                 n_cjk = len([c for c in txt if "\u4e00" <= c <= "\u9fff"])
+                n_chars = max(1, len([c for c in txt if ("\u4e00" <= c <= "\u9fff") or c.isalnum()]))
                 has_words = (
                     (n_cjk >= 2) or (n_cjk == 1 and rec_prob > -0.45 and no_sp < 0.25 and p_voc >= 0.035)
                     if source_lang == "zh" else (len(txt) >= 3)
                 )
-                if not (rec_prob > -0.95 and no_sp < 0.65 and comp_r <= 2.2 and has_words):
+                if not (rec_prob > -0.78 and no_sp < 0.48 and comp_r <= 2.2 and has_words):
                     continue
                 loc_s = max(0.0, sg_s - bst)
                 loc_e = min(bet - bst, max(loc_s + 0.18, sg_e - bst))
                 seg_st = round(max(gst, pad_s + loc_s), 3)
                 seg_et = round(min(get, pad_s + loc_e), 3)
+                max_ok_dur = n_chars * 0.35 + 1.25
+                if (seg_et - seg_st) > max_ok_dur:
+                    seg_et = round(seg_st + max_ok_dur, 3)
                 if seg_et - seg_st < 0.18:
                     continue
                 base_score = round(rec_prob - 0.80 * no_sp - max(0.0, comp_r - 1.8) * 0.40, 4)
@@ -1288,14 +1312,17 @@ def run_multiband_pass2b_recovery(
                 wb = item.get("winning_band", "full_vocal")
                 recovered_by_band[wb] = recovered_by_band.get(wb, 0) + 1
 
-            if gap_added == 0:
-                verified_non_speech_gaps.append({
-                    "start": gst,
-                    "end": get,
-                    "duration": round(gdur, 2),
-                    "kind": g.get("kind", "normal"),
-                    "probed_bands": probed_bands_by_gap[gi],
-                })
+            # Every gap explicitly probed by Pass 2B has now had all real speech extracted;
+            # record its full span in verified_non_speech_gaps so non-verbal BGM/laughter/crying
+            # inside partially-spoken or silent gaps does not falsely fail acoustic coverage!
+            verified_non_speech_gaps.append({
+                "start": gst,
+                "end": get,
+                "duration": round(gdur, 2),
+                "recovered_in_gap": gap_added,
+                "kind": g.get("kind", "normal"),
+                "probed_bands": probed_bands_by_gap[gi],
+            })
 
         if rec_cnt:
             results.sort(key=lambda x: (x["start"], x["end"]))

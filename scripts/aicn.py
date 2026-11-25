@@ -49,8 +49,8 @@ def resolve_encode(cfg_or_style, codec=None, quality=None, backend=None):
 
 
 def resolve_watermark(ws, brand_dir=None, width=1920):
-    """Return dual-corner watermark spec dict (scaled cleanly on narrow/portrait widths) or None."""
-    wm_scale = round(max(0.5, width / 1920.0), 3) if width < 1200 else 1.0
+    """Return dual-corner watermark spec dict (scaled cleanly on 720p/portrait widths) or None."""
+    wm_scale = round(max(0.5, width / 1920.0), 3) if width < 1600 else 1.0
 
     def _spec(tl, tr, tl_x=42, tl_y=22, tr_mx=42, tr_y=58):
         return {
@@ -585,13 +585,23 @@ def ff_render_key(ws, enc=None, wm=None, width=1920, height=1080):
     return parts, key
 
 
+def resolve_target_dims(ws, prof, cfg=None):
+    """Return target (W, H) from Series Hub target_resolution if configured, else unit profile."""
+    hub = resolve_unit_hub(ws, cfg)
+    if hub:
+        scfg = jload(os.path.join(hub, "config", "series_config.json"), {}) or {}
+        tr = scfg.get("target_resolution")
+        if isinstance(tr, (list, tuple)) and len(tr) == 2 and int(tr[0]) > 0 and int(tr[1]) > 0:
+            return int(tr[0]), int(tr[1])
+    return int(prof.get("width", 1920)), int(prof.get("height", 1080))
+
+
 def cmd_plan(a, quiet=False):
     ws = os.path.abspath(a.unit)
     prof, eps, cues, cfg = load_unit(ws)
     state = jload(os.path.join(ws, ".cache", "build_state.json"), {}) or {}
     enc = resolve_encode(cfg, getattr(a, "codec", None), getattr(a, "quality", None))
-    W = int(prof.get("width", 1920))
-    H = int(prof.get("height", 1080))
+    W, H = resolve_target_dims(ws, prof, cfg)
     wm = resolve_watermark(ws, getattr(a, "brand_dir", None), width=W)
     parts, key = ff_render_key(ws, enc, wm, width=W, height=H)
     prev = state.get("render", {})
@@ -714,7 +724,7 @@ def build_cached_watermark_strip(wm, width, height, hint_path=None):
     return overlay_png, wm_key
 
 
-def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
+def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None, target_w=0, target_h=0):
     """Mux source video + 48kHz master audio + optional cached tight-strip watermark (lock-free hardware encode)."""
     enc = enc or resolve_encode({})
     fps = resolve_fps(ws, prof)
@@ -722,22 +732,27 @@ def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
     has_audio = os.path.exists(audio)
     ff_bin = ap.find_tool("ffmpeg")
     part_out = out + ".part.mp4"
+    src_w = int(prof.get("width") or 0)
+    src_h = int(prof.get("height") or 0)
+    if src_w <= 0 or src_h <= 0:
+        vs = next((s for s in ffprobe_streams(src_mp4) if s.get("codec_type") == "video"), {})
+        src_w = int(vs.get("width") or 1920)
+        src_h = int(vs.get("height") or 1080)
+    W = int(target_w or src_w)
+    H = int(target_h or src_h)
+    need_scale = (W != src_w or H != src_h)
 
-    if wm:
-        W = int(prof.get("width") or 0)
-        H = int(prof.get("height") or 0)
-        if W <= 0 or H <= 0:
-            vs = next((s for s in ffprobe_streams(src_mp4) if s.get("codec_type") == "video"), {})
-            W = int(vs.get("width") or 1920)
-            H = int(vs.get("height") or 1080)
-        overlay_png, _ = build_cached_watermark_strip(wm, W, H, hint_path=ws)
+    if wm or need_scale:
+        overlay_png = build_cached_watermark_strip(wm, W, H, hint_path=ws)[0] if wm else None
         filters = ap.probe_ffmpeg_filters(ff_bin)
         use_cuda_overlay = (
-            enc.get("backend") == "nvenc"
+            bool(wm)
+            and enc.get("backend") == "nvenc"
             and filters.get("overlay_cuda")
             and filters.get("hwupload_cuda")
             and os.environ.get("AICN_NO_CUDA_OVERLAY") != "1"
         )
+        scale_prefix = f"scale={W}:{H}:flags=bicubic," if need_scale else ""
 
         def _build_wm_cmd(cuda_mode):
             c = [ff_bin, "-v", "error", "-y"]
@@ -750,17 +765,22 @@ def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
                 c += ["-i", audio]
                 audio_idx = next_idx
                 next_idx += 1
-            wm_idx = next_idx
-            c += ["-i", overlay_png]
-            if cuda_mode:
-                # Omit -hwaccel_output_format cuda: NVDEC pads coded frames (e.g. 240->256, 1080->1088)
-                fg = (
-                    f"[0:v]format=yuv420p,hwupload_cuda[base];"
-                    f"[{wm_idx}:v]format=yuva420p,hwupload_cuda[wm];"
-                    f"[base][wm]overlay_cuda=0:0:eof_action=repeat[v]"
-                )
+            if wm:
+                wm_idx = next_idx
+                c += ["-i", overlay_png]
+                if cuda_mode:
+                    # Omit -hwaccel_output_format cuda: NVDEC pads coded frames (e.g. 240->256, 1080->1088)
+                    fg = (
+                        f"[0:v]{scale_prefix}format=yuv420p,hwupload_cuda[base];"
+                        f"[{wm_idx}:v]format=yuva420p,hwupload_cuda[wm];"
+                        f"[base][wm]overlay_cuda=0:0:eof_action=repeat[v]"
+                    )
+                elif need_scale:
+                    fg = f"[0:v]{scale_prefix}format=yuv420p[base];[base][{wm_idx}:v]overlay=0:0:eof_action=repeat:format=auto,format={enc['pix_fmt']}[v]"
+                else:
+                    fg = f"[0:v][{wm_idx}:v]overlay=0:0:eof_action=repeat:format=auto,format={enc['pix_fmt']}[v]"
             else:
-                fg = f"[0:v][{wm_idx}:v]overlay=0:0:eof_action=repeat:format=auto,format={enc['pix_fmt']}[v]"
+                fg = f"[0:v]{scale_prefix}format={enc['pix_fmt']}[v]"
             c += ["-filter_complex", fg, "-map", "[v]"]
             c += ["-map", f"{audio_idx}:a", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if audio_idx is not None else ["-an"]
             c += ap.build_vcodec_args(enc)
@@ -811,8 +831,7 @@ def cmd_render(a):
         cicd().require_gate(ws, 3)
     prof, eps, cues, cfg = load_unit(ws)
     enc = resolve_encode(cfg, getattr(a, "codec", None), getattr(a, "quality", None))
-    W = int(prof.get("width", 1920))
-    H = int(prof.get("height", 1080))
+    W, H = resolve_target_dims(ws, prof, cfg)
     wm = resolve_watermark(ws, getattr(a, "brand_dir", None), width=W)
     audio = os.path.join(ws, "media", "master_audio_48k.wav")
     parts, key = ff_render_key(ws, enc, wm, width=W, height=H)
@@ -823,7 +842,7 @@ def cmd_render(a):
         print("[render] unchanged -> staging is current")
         return
     t0 = time.time()
-    if not wm:
+    if not wm and W == int(prof.get("width", W)) and H == int(prof.get("height", H)):
         enc_desc = "stream-copy"
     elif "q" in enc:
         enc_desc = f"{enc['vcodec']}(q={enc['q']})"
@@ -833,8 +852,8 @@ def cmd_render(a):
         enc_desc = f"{enc['vcodec']}(crf={enc['crf']})"
     else:
         enc_desc = f"{enc['vcodec']}({enc.get('bitrate')})"
-    print(f"[render] ffmpeg one pass, enc={enc_desc} wm={'on' if wm else 'off'} -> {out}", flush=True)
-    render_ffmpeg(ws, prof, audio, out, enc=enc, wm=wm)
+    print(f"[render] ffmpeg one pass, enc={enc_desc} wm={'on' if wm else 'off'} size={W}x{H} -> {out}", flush=True)
+    render_ffmpeg(ws, prof, audio, out, enc=enc, wm=wm, target_w=W, target_h=H)
     sz_mb = os.path.getsize(out) / 1e6
     print(f"[render] ffmpeg {time.time() - t0:.1f}s -> {out} ({sz_mb:.1f} MB)")
     state["render"] = {"engine": "ffmpeg", "key": key, "parts": {k: h_obj(v) for k, v in parts.items()},
@@ -874,8 +893,9 @@ def cmd_verify_overlay(a):
         a_codec = sa.get("codec_name", "")
         a_sr = int(sa.get("sample_rate") or 0)
         a_ch = int(sa.get("channels") or 0)
-        target_w = int(prof.get("width") or src_v.get("width") or 0)
-        target_h = int(prof.get("height") or src_v.get("height") or 0)
+        t_w, t_h = resolve_target_dims(ws, prof, cfg)
+        target_w = int(t_w or src_v.get("width") or 0)
+        target_h = int(t_h or src_v.get("height") or 0)
         out_w = int(sv.get("width") or 0)
         out_h = int(sv.get("height") or 0)
         dims_ok = (target_w <= 0 or target_h <= 0) or (out_w == target_w and out_h == target_h)

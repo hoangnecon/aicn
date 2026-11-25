@@ -66,6 +66,15 @@ def main():
             pass
     width = int(profile.get("width", 1920))
     height = int(profile.get("height", 1080))
+    hub_scfg = os.path.join(os.path.dirname(os.path.dirname(ws)), "config", "series_config.json")
+    if os.path.exists(hub_scfg):
+        try:
+            with open(hub_scfg, "r", encoding="utf-8") as f:
+                tr = (json.load(f) or {}).get("target_resolution")
+            if isinstance(tr, (list, tuple)) and len(tr) == 2 and int(tr[0]) > 0 and int(tr[1]) > 0:
+                width, height = int(tr[0]), int(tr[1])
+        except Exception:
+            pass
 
     staging_mp4 = os.path.join(ws, "media", ".staging_final.mp4")
     final_mp4 = os.path.join(ws, "media", f"final_{slug}_vi.mp4")

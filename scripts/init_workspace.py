@@ -163,7 +163,8 @@ def ingest_and_build_episodes_manifest(
                 )
                 need_norm = True
         if need_norm:
-            w0, h0 = specs[0][0], specs[0][1]
+            wh_list = [(sp[0], sp[1]) for sp in specs]
+            w0, h0 = max(set(wh_list), key=wh_list.count)
             fps_list = [sp[6] for sp in specs if sp[6] > 1.0]
             target_fps = max(set(fps_list), key=fps_list.count) if fps_list else 30.0
             fps_str = str(int(round(target_fps))) if abs(target_fps - round(target_fps)) < 1e-2 else f"{target_fps:.3f}"
@@ -445,6 +446,8 @@ def provision_series_hub(workspace_root: str, series_slug: str, genre: str, loca
         "localization_mode": "voice_dub",
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if existing_cfg.get("target_resolution"):
+        series_cfg["target_resolution"] = existing_cfg["target_resolution"]
     with open(series_cfg_path, "w", encoding="utf-8") as f:
         json.dump(series_cfg, f, ensure_ascii=False, indent=2)
 

@@ -32,9 +32,9 @@ Append a numbered entry (`L-NNN`) to `<skill>/LESSONS.md` containing:
 
 ### Step 3 — Codify into Executable Guardrails
 A lesson is **NOT closed** until it is encoded into at least one durable mechanism so the agent cannot repeat the mistake:
-- **Script / CLI fix:** Patch `scripts/aicn_platform.py`, `scripts/aicn.py`, `scripts/aicn_audio.py`, `scripts/hg_tool.cjs`, or `vendor/*/scripts/`.
+- **Script / CLI fix:** Patch `scripts/aicn_platform.py`, `scripts/aicn.py`, `scripts/aicn_audio.py`, `scripts/hg_tool.cjs`, or stage validators under `scripts/`.
 - **Automated test:** Add a regression test in `tests/` (`unittest`) covering the exact edge case.
-- **Hard contract / Red Flag:** Update `SKILL.md` and the relevant file under `references/` or `vendor/`.
+- **Hard contract / Red Flag:** Update `rules/AGENTS.md`, `skills/aicn-*/SKILL.md`, and the relevant manual under `references/`.
 
 ### Step 4 — Verify, Commit & Version Bump
 1. Run the full unit test suite:

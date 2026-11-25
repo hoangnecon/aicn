@@ -260,12 +260,8 @@ class CLI(unittest.TestCase):
             self.assertEqual(wm_port["tl_x"], 21)
 
     def test_init_workspace_decoupled_series_bible(self):
-        init_path = os.path.join(
-            os.path.dirname(HERE), "vendor", "video-localization-orchestrator", "scripts", "init_workspace.py"
-        )
-        gate_path = os.path.join(
-            os.path.dirname(HERE), "vendor", "video-localization-orchestrator", "scripts", "cicd_gate.py"
-        )
+        init_path = os.path.join(ROOT, "scripts", "init_workspace.py")
+        gate_path = os.path.join(ROOT, "scripts", "cicd_gate.py")
         gp_mod = importlib.util.spec_from_file_location("cicd_gate", gate_path)
         cg = importlib.util.module_from_spec(gp_mod)
         gp_mod.loader.exec_module(cg)
@@ -445,7 +441,7 @@ class CLI(unittest.TestCase):
                 aicn.cmd_verify_overlay(type("A", (), {"unit": u, "no_gate": True})())
 
     def test_moving_unit_and_hub_preserves_caches_and_gates(self):
-        init_path = os.path.join(ROOT, "vendor", "video-localization-orchestrator", "scripts", "init_workspace.py")
+        init_path = os.path.join(ROOT, "scripts", "init_workspace.py")
         cg = aicn.cicd()
         ff = aicn.ap.find_tool("ffmpeg")
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"AICN_CACHE_DIR": os.path.join(td, "gcache")}):
@@ -498,7 +494,7 @@ class CLI(unittest.TestCase):
             self.assertEqual(os.path.normcase(aicn.resolve_unit_hub(new_unit)), os.path.normcase(new_hub))
 
     def test_init_workspace_rejects_sub_only_and_uses_relative_posix_paths(self):
-        init_path = os.path.join(ROOT, "vendor", "video-localization-orchestrator", "scripts", "init_workspace.py")
+        init_path = os.path.join(ROOT, "scripts", "init_workspace.py")
         ff = aicn.ap.find_tool("ffmpeg")
         with tempfile.TemporaryDirectory() as td:
             vid = os.path.join(td, "ep01.mp4")
@@ -588,7 +584,7 @@ class CLI(unittest.TestCase):
             self.assertIn("unit_01:render", r_prod.stdout)
 
     def test_retired_qa_scripts_deleted_and_stage5_promotes_unit_only_and_merges(self):
-        qa_dir = os.path.join(ROOT, "vendor", "video-localization-qa-review", "scripts")
+        qa_dir = os.path.join(ROOT, "scripts")
         for dead_py in ("apply_channel_branding.py", "render_vertical_9x16.py", "split_compiled_episodes.py"):
             self.assertFalse(os.path.exists(os.path.join(qa_dir, dead_py)), f"Retired script still present: {dead_py}")
 
@@ -668,9 +664,16 @@ class CLI(unittest.TestCase):
                 "split_compiled_episodes.py",
                 "assemble_master_audio.py",
                 "synthesize_and_audit_pacing.py",
+                "video-localization-orchestrator",
+                "video-asr-visual-audit",
+                "zh-vi-script-adapter",
+                "vieneu-voice-pacing-mixer",
+                "video-localization-qa-review",
             ):
                 self.assertIn(retired, txt)
         self.assertIn("retired legacy file still present", ps1)
+        self.assertIn(".gemini\\config\\plugins", ps1)
+        self.assertIn(".gemini/config/plugins/aicn", sh)
 
     def test_doctor_writes_machine_json(self):
         with tempfile.TemporaryDirectory() as td:
@@ -792,7 +795,7 @@ class CLI(unittest.TestCase):
         self.assertLess(sh_txt.index('if [ "$src_real" = "$dst_real" ]; then'), sh_txt.index('copy_clean_tree "$src" "$dst"'))
 
         cg = aicn.cicd()
-        ext_py = os.path.join(ROOT, "vendor", "video-asr-visual-audit", "scripts", "extract_audit_frames.py")
+        ext_py = os.path.join(ROOT, "scripts", "extract_audit_frames.py")
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"AICN_CACHE_DIR": os.path.join(td, "gcache")}):
             ws = os.path.join(td, "u_frames")
             for sub in ("source", "data", ".cicd"):
@@ -813,6 +816,84 @@ class CLI(unittest.TestCase):
             for it in man["frames"]:
                 fp = os.path.join(ws, it["rel_path"])
                 self.assertEqual(aicn.ap.content_sha256(fp), it["sha256"])
+
+    def test_locate_and_readonly_audit_cli(self):
+        cg = aicn.cicd()
+        ff = aicn.ap.find_tool("ffmpeg")
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"AICN_CACHE_DIR": os.path.join(td, "gcache")}):
+            hub = os.path.join(td, "workspace", "su-phu-series")
+            subprocess.run([
+                sys.executable, SCRIPT, "init-series",
+                "--workspace-root", os.path.join(td, "workspace"),
+                "--series-slug", "su-phu-series", "--rights", "own",
+            ], check=True, stdout=subprocess.DEVNULL)
+
+            # Create two 10-minute (600s) logical units so full-series 14:25 (865s) maps to unit_02 local 04:25 (265s)
+            for idx_u, (uname, dur_u) in enumerate([("unit_01", 600.0), ("unit_02", 600.0)], start=1):
+                u = os.path.join(hub, "units", uname)
+                for sub in ("config", "data", ".cicd", "source", "media", "frames/qa"):
+                    os.makedirs(os.path.join(u, sub), exist_ok=True)
+                aicn.jdump(os.path.join(u, "config/project_config.json"), {"slug": uname, "series_hub_rel": "../.."})
+                aicn.jdump(os.path.join(u, "data/00_video_profile.json"), {"duration": dur_u, "localization_mode": "voice_dub"})
+                aicn.jdump(os.path.join(u, "data/00_episodes_manifest.json"), {
+                    "episodes": [
+                        {"episode_number": (idx_u - 1) * 2 + 1, "start_s": 0.0, "end_s": 200.0, "duration": 200.0},
+                        {"episode_number": (idx_u - 1) * 2 + 2, "start_s": 200.0, "end_s": 600.0, "duration": 400.0},
+                    ]
+                })
+                cues = [
+                    {"id": 0, "start": 10.0, "end": 12.0, "speaker": "M1", "zh_text": "你好。", "sub_text": "Xin chào.", "tts_text": "Xin chào."},
+                    {
+                        "id": 1, "start": 264.2, "end": 266.5, "speaker": "F1",
+                        "zh_text": "师父去哪儿？",
+                        "sub_text": "Sư phụ đi đâu?" if idx_u == 2 else "Đồ nhi ở đây.",
+                        "tts_text": "Sư phụ đi đâu?" if idx_u == 2 else "Đồ nhi ở đây.",
+                    },
+                ]
+                aicn.jdump(os.path.join(u, "data/02_bilingual_script.json"), cues)
+                aicn.jdump(os.path.join(u, "data/03_dub_sentences.json"), [
+                    {"utt_id": "utt_0000", "seg_indices": [0], "slot_start": 10.0, "slot_end": 12.0, "voice": "Hải Đăng", "tempo": 1.08, "required_tempo": 1.08, "overflow_s": 0.0},
+                    {"utt_id": "utt_0001", "seg_indices": [1], "slot_start": 264.2, "slot_end": 266.5, "voice": "Trúc Ly", "tempo": 1.24, "required_tempo": 1.24, "overflow_s": 0.0},
+                ])
+                aicn.jdump(os.path.join(u, "data/03_mix_report.json"), {"passed": True, "checks": [{"id": "lufs", "passed": True}]})
+                for s in range(6):
+                    cg.write_gate_token(u, s, f"S{s}", [{"id": "ok", "weight": 100, "passed": True}], {}, ["data/02_bilingual_script.json"])
+
+            # 1) Locate by full-series timestamp 14:25 + accent-insensitive query
+            loc_res = self.run_cli("locate", "--hub", hub, "--full-at", "14:25", "--query", "su phu di dau", "--json")
+            self.assertEqual(loc_res.returncode, 0, loc_res.stderr)
+            loc = json.loads(loc_res.stdout)
+            self.assertEqual(loc["matches_count"], 1)
+            hit = loc["matches"][0]
+            self.assertEqual(hit["unit"], "unit_02")
+            self.assertEqual(hit["target_cue_index"], 1)
+            self.assertEqual(hit["episode"]["episode"], 4)
+            target_ctx = [c for c in hit["context_cues"] if c["is_target"]][0]
+            self.assertEqual(target_ctx["utterance"]["utt_id"], "utt_0001")
+            self.assertEqual(target_ctx["utterance"]["tempo"], 1.24)
+
+            # 2) Audit passes when full release is fresh, then catches stale_merge when unit MP4 is newer
+            os.makedirs(os.path.join(hub, "deliverables", "subtitles"), exist_ok=True)
+            full_mp4 = os.path.join(hub, "deliverables", "final_su-phu-series_full_vi.mp4")
+            subprocess.run([
+                ff, "-v", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=160x120:d=1.0:r=25",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=1.0",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", full_mp4,
+            ], check=True)
+            aud_ok = self.run_cli("audit", "--hub", hub, "--strict", "--json")
+            self.assertEqual(aud_ok.returncode, 0, aud_ok.stdout + aud_ok.stderr)
+            self.assertTrue(json.loads(aud_ok.stdout)["ok"])
+
+            # Make unit_02 MP4 newer than full_mp4 -> audit MUST catch stale_merge with exit code 2
+            u2_mp4 = os.path.join(hub, "units", "unit_02", "media", "final_unit_02_vi.mp4")
+            shutil.copy2(full_mp4, u2_mp4)
+            future_t = os.path.getmtime(full_mp4) + 10.0
+            os.utime(u2_mp4, (future_t, future_t))
+            aud_stale = self.run_cli("audit", "--hub", hub, "--strict", "--json")
+            self.assertEqual(aud_stale.returncode, 2)
+            rep_stale = json.loads(aud_stale.stdout)
+            self.assertTrue(rep_stale["release"]["stale_merge"])
 
 
 if __name__ == "__main__":

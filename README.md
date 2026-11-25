@@ -1,75 +1,60 @@
-# aicn (`v3.0.0`)
+# AICN Drama Localization Plugin (`aicn` · `v3.1.0`)
 
-Agent skill for full-series Vietnamese dubbing + Vietsub production of Chinese and English short dramas / AI dramas.
-**Every published release is 1 full series** (`deliverables/final_<series>_full_vi.mp4` + `deliverables/subtitles/final_<series>_full_vi.srt`) in mandatory **`voice_dub`** mode (full Vietnamese dubbing + dual-corner branding watermark + external `.srt`). Internally, a series is split into working batches (`units/*`) so pure content-addressed SHA-256 caches (`<project_root>/.cache/content_hash.db` across `asr/`, `stems/`, `tts_sent/`, `rb_stretch/`, `wm_overlay/`) survive unit/hub renames and cleanups. Stage 1 & 3 warm batch CLIs load Whisper, Demucs, and VieNeu-TTS CUDA once per multi-unit batch, VRAM-aware `gpu_slot` pooling runs compatible GPU jobs concurrently (replacing single-lock GPU serialization), Stage 4 composites a cached top-band watermark PNG via hardware `overlay_cuda` / VideoToolbox in parallel lock-free passes, and `merge-series` stream-copies all verified batches into the final full-series master.
+Standard multi-provider plugin (**Google Antigravity**, **Anthropic Claude Code**, **Google Gemini CLI**, **Cursor**, and **OpenAI Codex**) for full-series Vietnamese dubbing + Vietsub localization of Chinese (`红果`/`抖音`/`B站`) and English (`DramaDunyam`) short dramas.
 
-- `SKILL.md`: agent entry point (full-series contract, sourcing/analytics, stages, edit loop, RSI protocol, rules).
-- `scripts/aicn_platform.py`: cross-platform runtime, SQLite-WAL `content_hash.db`, unified cache key builders, crash-safe 512 MB-unit `gpu_slot` VRAM pool, encoder & `overlay_cuda` filter probing, atomic JSON writes.
-- `scripts/aicn.py`: core engine (`doctor`, `discover`, `init-series`, `update-series`, `adopt`, `plan`, `render`, `verify-render`, `run-series`, `merge-series`, `brand-poster`, `clean`, `log`, `progress`).
-- `scripts/aicn_audio.py`: Stage 3 audio (`separate`, `dub`, `analyze`, `mix`, `master`, `verify`, `all`, plus warm multi-unit `batch-separate`, `batch-dub`, `batch-all`) — Demucs `htdemucs` stems (`PCM_16`), indivisible utterance grouping (zero mid-word slicing), CUDA `infer_batch(16)` VieNeu-TTS + parallel `rubberband` R3 with fail-fast overflow detection before `mix`, single-STFT + C-speed vectorized `follow_hold()` mixer (`<12s`/unit), native 48 kHz `-14 LUFS` master, and active-speech SNR/continuity gate.
-- `scripts/hg_tool.cjs`: thin dynamic wrapper around upstream `jackotom/hongguo-drama` (`check-upstream [--sync]`, `rank`, `new`, `search`, `details`, `album`, `episodes`, `fetch-covers`, `download`).
-- `scripts/dy_tool.py`: Douyin detail, mix/collection, hot boards, and watermark-free MP4 downloader (`Evil0ctal/Douyin_TikTok_Download_API` + `tools/.venv-dy`).
-- `scripts/dd_tool.py`: DramaDunyam clean `lang=en`, non-adult AI/short-drama API client and downloader (`dramadunyam.com`).
-- `scripts/aicn_radar.py`: Unified Hongguo + Douyin + Bilibili + DramaDunyam SQLite FTS5 analytics & search index (`data/drama_index.db`).
-- `vendor/`: the five stage skills (`video-localization-orchestrator`, `video-asr-visual-audit`, `zh-vi-script-adapter`, `vieneu-voice-pacing-mixer`, `video-localization-qa-review`). See `vendor/README.md`.
-- `references/`: `stages.md`, `audio_mix.md`, `folder_contract.md`, `incremental_build.md`, `production_time.md`, `sourcing_and_analytics.md`, `poster_and_caption_guide.md`, `recursive_self_improvement.md`.
-- `LESSONS.md`: live RSI ledger of measured incidents and codified guardrails.
-- `templates/`: hub and unit `CHANGELOG.md`, `PROGRESS.md`, `CHECKLIST.md`, `UNIT_CHANGELOG.md`.
-- `tests/`: unit, concurrency, hash-portability, ASR, audio DSP, and sourcing regression tests.
+**Every published release is 1 full series** (`deliverables/final_<series>_full_vi.mp4` + `deliverables/subtitles/final_<series>_full_vi.srt`) in mandatory **`voice_dub`** mode (full Vietnamese dubbing + dual-corner channel watermark + external `.srt`). Internally, series are split into working batches (`units/*`) backed by pure content-addressed SHA-256 caches (`<project_root>/.cache/content_hash.db` across `asr/`, `stems/`, `tts_sent/`, `rb_stretch/`, `wm_overlay/`), VRAM-aware `gpu_slot` concurrency, single-STFT C-speed vocal-carved mixing, and hardware `overlay_cuda` / VideoToolbox rendering.
+
+---
+
+## User-Invocable Slash Commands (`skills/aicn-*`)
+
+Type `/aicn` in the chat input to open the intent-driven command menu:
+
+| Command | When to Invoke | Core Action |
+| :--- | :--- | :--- |
+| **`/aicn-scout`** | Finding or pitching new dramas | Checks upstream `hongguo-drama`, queries original Chinese/English feeds (zero YouTube), fetches `.jpg` covers, and writes a Candidate Shortlist artifact. |
+| **`/aicn-create`** | Starting a new series project | Validates unaccented Vietnamese `--series-slug` & `--rights`, downloads raw episodes into `source_inbox/`, scaffolds ~10-ep `units/*`, and signs Stage 0. |
+| **`/aicn-script`** | Transcribing & writing VI dub scripts | Runs warm Demucs + Whisper `large-v3` (`asr-4.0`/`wf-4.0`), inspects audit frames, locks `series_bible.json` voices/pronouns, and validates `02_bilingual_script.json` (`100/100`). |
+| **`/aicn-produce`** | Dubbing, rendering & releasing | Streams Stage 3→6: warm CUDA `VieNeu v3 Turbo` `infer_batch(16)`, intact `rubberband` R3, `-16 LUFS` mix, NVENC watermark render, visual QA, `merge-series`, and `brand-poster`. |
+| **`/aicn-audit`** | Read-only quality inspection | Runs `aicn.py audit --strict` across chained gate signatures, script, TTS tempo/overflows, LUFS, `stale_merge`, and visual QA frames without mutating files. |
+| **`/aicn-fix`** | Repairing a reported defect | Runs `aicn.py locate` (maps full-series `HH:MM:SS`, episode time, or phrase to exact unit/cue/utterance), patches only the broken layer, and rebuilds with `100%` cache reuse on unchanged lines. |
+| **`/aicn-clean`** | Progress, time estimate & cleanup | Runs `discover`, `doctor`, turnaround estimation, `clean [--deep]` after release, or raw-preserving unit reset. |
+
+---
+
+## Multi-Provider Plugin Layout
+
+```text
+aicn/
+├── plugin.json · .claude-plugin/plugin.json · .cursor-plugin/plugin.json · .codex-plugin/plugin.json · gemini-extension.json
+├── assets/logo.svg            High-contrast plugin icon
+├── rules/AGENTS.md            Lean workspace-scoped routing & production guardrails (linked via AGENTS.md & GEMINI.md)
+├── skills/                    7 intent-driven user-invocable skills (aicn-scout .. aicn-clean)
+├── scripts/                   Unified Python/Node engine (aicn.py, aicn_audio.py, aicn_platform.py, stage gates & sourcing CLIs)
+├── references/                16 deep technical manuals, glossaries & playbooks
+├── templates/                 Series Hub & working batch Markdown templates
+└── tests/                     105+ deterministic unit, DSP, concurrency, cache & plugin contract tests
+```
+
+---
 
 ## Install
 
 **Windows 10/11 (NVIDIA CUDA / CPU):**
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -InstallTools
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Force
+# Add -InstallTools on a fresh machine to install portable ffmpeg, rubberband, and node
 ```
 
 **macOS / Linux (Apple Silicon / CPU):**
 ```bash
-git clone <this repo> ~/Work/AICN/skills/aicn
-bash ~/Work/AICN/skills/aicn/install.sh
+bash ./install.sh --sync --force
 ```
 
-- `install.ps1` installs **real directory copies** (not NTFS Junctions) into `%USERPROFILE%\.gemini\config\skills\` and `%USERPROFILE%\.claude\skills\` for all 6 skills (`aicn` + 5 vendored stage skills), cleans deleted legacy files on re-sync via `.aicn-managed`, excludes dev files (`SPEC_V3.md`, `.git`, `__pycache__`, `.cache`), and auto-configures `AICN_PY`.
-- `install.sh` symlinks (or refreshes with `--sync`) all 6 skills into `$HOME/.claude/skills` and `$HOME/.gemini/config/skills`.
-
-## Requirements
-
-| Tool | Used for |
-|---|---|
-| Windows/Linux + NVIDIA CUDA **or** macOS Apple Silicon | `nvenc` (`overlay_cuda` when available) / `videotoolbox` / `libx264` fallback |
-| `ffmpeg`, `ffprobe` | one-pass render, mux, `ebur128` loudness, stream probing (`install.ps1 -InstallTools` on Windows) |
-| `faster-whisper` CUDA/CPU **or** `mlx-whisper` (macOS) in `$AICN_PY` | Stage 1 `large-v3` ASR (`int8_float16` on CUDA, Metal on Apple Silicon) |
-| Python 3.10+ with `numpy`, `Pillow`, `scipy`, `soundfile` | `aicn.py`, `aicn_audio.py`, stage validators |
-| VieNeu-TTS venv (`$AICN_PY`, Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`, macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`) | CUDA `infer_batch` / ONNX VieNeu-TTS, Demucs, Whisper, stage scripts |
-| `rubberband` (`install.ps1 -InstallTools` / `brew install rubberband`) | Formant-preserved R3 time-stretching of intact utterances |
-| `demucs` in `$AICN_PY` **or** `uvx` (`demucs-mlx` on macOS) | Warm `htdemucs` vocal/accompaniment separation |
-| `node` (v20+) | `hg_tool.cjs` Hongguo sourcing CLI |
-
-## Quick start
-
-```bash
-$AICN_PY scripts/aicn.py doctor --root <project-root>
-$AICN_PY scripts/aicn.py discover --root <project-root>
-$AICN_PY scripts/aicn.py run-series --hub workspace/<series> --phase prep
-$AICN_PY scripts/aicn.py run-series --hub workspace/<series> --phase produce --brand-dir <brand_dir>
-$AICN_PY scripts/aicn.py merge-series --hub workspace/<series>
-```
-
-Full stage-by-stage commands: `references/stages.md`.
-How long a finished unit takes: `references/production_time.md`.
+- Installs the full plugin bundle into `~/.gemini/config/plugins/aicn` (`AICN_HOME`), syncs the 7 `aicn-*` skills into `~/.claude/skills/`, and automatically retires the legacy 6 loose skill folders.
 
 ## Test
 
 ```powershell
-# Windows:
 & $env:AICN_PY -m unittest discover -s tests -v
 ```
-```bash
-# macOS / Linux:
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python -m unittest discover -s tests -v
-```
-
-## Rights
-
-`init-series` requires a valid rights basis (`own`, `licensed:<contract>`, `cps:<platform>`, `mcn:<name>`). Re-uploading a series without a rights basis is rejected.

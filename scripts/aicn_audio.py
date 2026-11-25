@@ -52,7 +52,6 @@ AUDIO_VERSION = "aicn-audio-3.0"
 STEMS_VERSION = getattr(ap, "STEMS_VERSION", "aicn-audio-1.0")
 TTS_ENGINE_TAG = getattr(ap, "TTS_ENGINE_TAG", "vieneu-v3-turbo-48k")
 RB_STRETCH_VERSION = getattr(ap, "RB_STRETCH_VERSION", "rb3-f-3.0")
-VENDOR = os.path.normpath(os.path.join(HERE, "..", "vendor"))
 
 DEFAULTS = {
     "voice": "Trúc Ly",
@@ -1993,9 +1992,6 @@ def cmd_verify(ws, c, fh=None):
         print(f"  [{'PASS' if x['passed'] else 'FAIL'}] {x['id']}: {x['detail']}")
     if not passed:
         sys.exit("[aicn-audio] audio gate FAILED: Stage 3 not signed")
-    for p in (os.path.join(VENDOR, "vieneu-voice-pacing-mixer", "scripts"), os.path.join(VENDOR, "video-localization-orchestrator", "scripts")):
-        if p not in sys.path:
-            sys.path.insert(0, p)
     from verify_stage_3 import run_stage_3_verification
     run_stage_3_verification(ws)
 

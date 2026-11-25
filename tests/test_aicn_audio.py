@@ -24,8 +24,8 @@ except ImportError:
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 SCRIPTS = os.path.join(ROOT, "scripts")
-V3_SCRIPTS = os.path.join(ROOT, "vendor", "vieneu-voice-pacing-mixer", "scripts")
-ORCH_SCRIPTS = os.path.join(ROOT, "vendor", "video-localization-orchestrator", "scripts")
+V3_SCRIPTS = SCRIPTS
+ORCH_SCRIPTS = SCRIPTS
 
 
 def load_audio():
@@ -745,9 +745,8 @@ class WarmBatchAndStage3Gates(unittest.TestCase, _TempEnvMixin):
                 self._exit_cache_env()
 
     def test_stage1_detects_modulated_whisper_and_phone_with_bass_and_rejects_steady_instrument(self):
-        v1_dir = os.path.join(ROOT, "vendor", "video-asr-visual-audit", "scripts")
-        if v1_dir not in sys.path:
-            sys.path.insert(0, v1_dir)
+        if SCRIPTS not in sys.path:
+            sys.path.insert(0, SCRIPTS)
         import analyze_voice_waveform as avw
         sr16 = 16000
         t1 = np.arange(sr16 * 1) / sr16
@@ -770,9 +769,8 @@ class WarmBatchAndStage3Gates(unittest.TestCase, _TempEnvMixin):
         self.assertFalse(any(4.8 <= s <= 6.0 for _, s in kinds), f"Steady solo instrument falsely detected: {kinds}")
 
     def test_stage2_overflow_predictor_catches_tight_tts(self):
-        v2_dir = os.path.join(ROOT, "vendor", "zh-vi-script-adapter", "scripts")
-        if v2_dir not in sys.path:
-            sys.path.insert(0, v2_dir)
+        if SCRIPTS not in sys.path:
+            sys.path.insert(0, SCRIPTS)
         import validate_bilingual_script as vbs
         short_s = vbs.estimate_vieneu_tts_seconds("Đi thôi.")
         long_s = vbs.estimate_vieneu_tts_seconds("Đây là một câu tiếng Việt rất dài, nhiều âm tiết, có <en>GPU</en> nữa.")
@@ -888,8 +886,8 @@ class WarmBatchAndStage3Gates(unittest.TestCase, _TempEnvMixin):
                 self._exit_cache_env()
 
     def test_stage2_elastic_short_burst_syl_rate_passes(self):
-        v2_py = os.path.join(ROOT, "vendor", "zh-vi-script-adapter", "scripts", "validate_bilingual_script.py")
-        cg_py = os.path.join(ROOT, "vendor", "video-localization-orchestrator", "scripts", "cicd_gate.py")
+        v2_py = os.path.join(SCRIPTS, "validate_bilingual_script.py")
+        cg_py = os.path.join(SCRIPTS, "cicd_gate.py")
         spec_cg = importlib.util.spec_from_file_location("cg_mod2", cg_py)
         cg = importlib.util.module_from_spec(spec_cg)
         spec_cg.loader.exec_module(cg)

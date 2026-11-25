@@ -113,13 +113,7 @@ class TestHgToolAndRsi(unittest.TestCase):
             self.assertIn("7707844707132476726", q.stdout)
 
     def test_init_workspace_normalizes_timebase_and_stream_order(self):
-        init_ws = (
-            SKILL_DIR
-            / "vendor"
-            / "video-localization-orchestrator"
-            / "scripts"
-            / "init_workspace.py"
-        )
+        init_ws = SKILL_DIR / "scripts" / "init_workspace.py"
         src = init_ws.read_text(encoding="utf-8")
         self.assertIn('vs.get("time_base"', src)
         self.assertIn('vs.get("index"', src)

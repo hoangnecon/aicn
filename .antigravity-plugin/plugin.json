@@ -1,0 +1,17 @@
+{
+  "name": "aicn",
+  "displayName": "AICN Drama Localization",
+  "version": "3.1.0",
+  "description": "End-to-end Chinese and English short-drama Vietnamese dubbing plugin: original-source radar (/aicn-scout), series hub setup (/aicn-create), dual-layer script adaptation (/aicn-script), VieNeu CUDA voice and NVENC watermark production (/aicn-produce), read-only QA (/aicn-audit), surgical defect repair (/aicn-fix), and workspace management (/aicn-clean).",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/aicn-scout Tìm 10 bộ phim ngắn AI mới nhất tuần này trên Hồng Quả kèm ảnh bìa",
+    "/aicn-produce Chạy lồng tiếng CUDA, ghép watermark 2 góc và xuất bản full bộ",
+    "/aicn-fix Kiểm tra và sửa câu thoại bị lệch nhịp hoặc sai xưng hô ở tập đang làm"
+  ],
+  "author": {
+    "name": "AICN"
+  },
+  "homepage": "https://github.com/hoangnecon/aicn",
+  "repository": "https://github.com/hoangnecon/aicn"
+}

@@ -379,37 +379,86 @@ class PlatformBackends(unittest.TestCase):
                 self.assertEqual(res["engine"], exp_eng)
                 self.assertEqual(res["device"], exp_dev)
 
-    def test_vendor_scripts_support_sibling_aicn_import(self):
-        """Copied standalone vendor skills (e.g. ~/.gemini/config/skills/<stage>/) must still import aicn_platform."""
-        import shutil
+    def test_plugin_manifests_unified_scripts_and_skills_sdo_contract(self):
+        """Verify multi-provider plugin manifests, unified scripts/ imports, and all 7 aicn-* skills SDO rules."""
+        import json
+        import py_compile
+        import re
         import subprocess
         import tempfile
 
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        vendor_root = os.path.join(root, "vendor")
-        checked = 0
-        for skill in os.listdir(vendor_root):
-            sdir = os.path.join(vendor_root, skill, "scripts")
-            if not os.path.isdir(sdir):
-                continue
-            for fn in os.listdir(sdir):
-                if not fn.endswith(".py"):
-                    continue
-                p = os.path.join(sdir, fn)
-                with open(p, encoding="utf-8") as fh:
-                    src = fh.read()
-                if "import aicn_platform" in src:
-                    checked += 1
-                    self.assertIn('"aicn", "scripts"', src, f"{p} missing sibling aicn/scripts fallback")
-        self.assertGreaterEqual(checked, 9)
+        self.assertFalse(os.path.exists(os.path.join(root, "vendor")), "Legacy vendor/ directory must not exist")
+
+        # 1. Antigravity plugin.json strict top-level schema check
+        allowed_agy_keys = {
+            "name", "description", "logo", "suggestedPrompts", "displayName",
+            "version", "author", "homepage", "repository", "disabled",
+        }
+        with open(os.path.join(root, "plugin.json"), encoding="utf-8") as fh:
+            agy_manifest = json.load(fh)
+        self.assertEqual(agy_manifest["name"], "aicn")
+        self.assertTrue(set(agy_manifest.keys()).issubset(allowed_agy_keys), set(agy_manifest.keys()) - allowed_agy_keys)
+        self.assertTrue(os.path.isfile(os.path.join(root, agy_manifest["logo"])))
+        self.assertEqual(len(agy_manifest.get("suggestedPrompts", [])), 3)
+
+        # 2. Multi-provider manifests (Claude Code, Cursor, Codex, Gemini CLI)
+        for rel in (
+            ".claude-plugin/plugin.json",
+            ".cursor-plugin/plugin.json",
+            ".codex-plugin/plugin.json",
+            "gemini-extension.json",
+        ):
+            mp = os.path.join(root, rel)
+            self.assertTrue(os.path.isfile(mp), f"Missing provider manifest: {rel}")
+            with open(mp, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertEqual(data["name"], "aicn")
+            self.assertEqual(data["version"], agy_manifest["version"])
+        self.assertTrue(os.path.isfile(os.path.join(root, "rules", "AGENTS.md")))
+        self.assertTrue(os.path.isfile(os.path.join(root, "GEMINI.md")))
+
+        # 3. All 7 user-invocable aicn-* skills SDO & path reference checks
+        expected_skills = {
+            "aicn-scout", "aicn-create", "aicn-script", "aicn-produce",
+            "aicn-audit", "aicn-fix", "aicn-clean",
+        }
+        skills_root = os.path.join(root, "skills")
+        actual_skills = {d for d in os.listdir(skills_root) if os.path.isdir(os.path.join(skills_root, d))}
+        self.assertEqual(actual_skills, expected_skills)
+
+        ref_pat = re.compile(r"<aicn>/(scripts|references)/([A-Za-z0-9_.-]+)")
+        for sname in sorted(expected_skills):
+            smd = os.path.join(skills_root, sname, "SKILL.md")
+            self.assertTrue(os.path.isfile(smd))
+            txt = open(smd, encoding="utf-8").read()
+            self.assertTrue(txt.startswith("---\n"), f"{sname} missing YAML frontmatter")
+            fm = txt.split("---\n", 2)[1]
+            self.assertLessEqual(len(fm), 1024, f"{sname} frontmatter > 1024 chars")
+            m_name = re.search(r"^name:\s*(.+)$", fm, re.M)
+            m_desc = re.search(r"^description:\s*(.+)$", fm, re.M)
+            self.assertIsNotNone(m_name)
+            self.assertIsNotNone(m_desc)
+            self.assertEqual(m_name.group(1).strip(), sname)
+            desc = m_desc.group(1).strip()
+            self.assertTrue(desc.startswith("Use when "), f"{sname} description must start with 'Use when ': {desc}")
+            self.assertLessEqual(len(desc), 500, f"{sname} description > 500 chars ({len(desc)})")
+            self.assertNotIn("vendor/", txt, f"{sname} still references retired vendor/")
+            for folder, fn in ref_pat.findall(txt):
+                target = os.path.join(root, folder, fn)
+                self.assertTrue(os.path.isfile(target), f"{sname} references missing {folder}/{fn}")
+
+        # 4. Unified scripts/ compile & standalone import check
+        scripts_dir = os.path.join(root, "scripts")
+        py_files = [fn for fn in sorted(os.listdir(scripts_dir)) if fn.endswith(".py")]
+        self.assertGreaterEqual(len(py_files), 15)
+        for fn in py_files:
+            py_compile.compile(os.path.join(scripts_dir, fn), doraise=True)
 
         with tempfile.TemporaryDirectory() as td:
-            shutil.copytree(os.path.join(root, "scripts"), os.path.join(td, "aicn", "scripts"))
-            shutil.copytree(
-                os.path.join(vendor_root, "video-localization-orchestrator"),
-                os.path.join(td, "video-localization-orchestrator"),
-            )
-            script = os.path.join(td, "video-localization-orchestrator", "scripts", "init_workspace.py")
+            copied_scripts = os.path.join(td, "plugin", "scripts")
+            shutil.copytree(scripts_dir, copied_scripts)
+            script = os.path.join(copied_scripts, "init_workspace.py")
             res = subprocess.run(
                 [
                     sys.executable, "-c",

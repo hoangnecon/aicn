@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Link or sync aicn (and vendored stage skills) into agent skill folders.
-# Pass --sync [--force] to refresh managed directory copies and prune retired v1.x/v2.x files;
-# default mode links missing folders without overwriting existing directories/links.
+# Install AICN v3.1+ as a native Antigravity plugin (~/.gemini/config/plugins/aicn),
+# sync the 7 user-invocable aicn-* skills into ~/.claude/skills/, and retire legacy loose skill folders.
 set -euo pipefail
-SK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 MODE="link"
 FORCE=0
 for arg in "$@"; do
@@ -25,14 +24,14 @@ copy_clean_tree() {
   local src="$1" dst="$2"
   rm -rf "$dst"
   mkdir -p "$dst"
-  (cd "$src" && tar --exclude='.git' --exclude='__pycache__' --exclude='.cache' --exclude='*.pyc' --exclude='.aicn-managed' --exclude='SPEC_V3.md' -cf - .) | (cd "$dst" && tar -xf -)
+  (cd "$src" && tar --exclude='.git' --exclude='__pycache__' --exclude='.cache' --exclude='.pytest_cache' --exclude='*.pyc' --exclude='.aicn-managed' --exclude='SPEC_V3.md' -cf - .) | (cd "$dst" && tar -xf -)
   for rf in "${RETIRED_FILES[@]}"; do
     find "$dst" -type f -name "$rf" -delete 2>/dev/null || true
   done
   printf '%s\n' "$src" > "$dst/.aicn-managed"
 }
 
-sync_skill() {
+sync_dir() {
   local src="$1" dst="$2"
   local src_real dst_real=""
   src_real="$(cd "$src" && pwd -P)"
@@ -70,12 +69,49 @@ sync_skill() {
   fi
 }
 
-for dest in "$HOME/.claude/skills" "$HOME/.gemini/config/skills"; do
-  mkdir -p "$dest"
-  sync_skill "$SK" "$dest/aicn"
-  for v in "$SK"/vendor/*/; do
-    name="$(basename "$v")"
-    sync_skill "${v%/}" "$dest/$name"
+retire_legacy_dir() {
+  local d="$1"
+  [ -e "$d" ] || [ -L "$d" ] || return 0
+  if [ -L "$d" ]; then
+    rm -f "$d"
+    echo "retire $d (unlinked legacy symlink)"
+    return 0
+  fi
+  local d_real
+  d_real="$(cd "$d" && pwd -P)"
+  if [ "$d_real" = "$SK" ]; then
+    echo "skip   $d (active source repo)"
+    return 0
+  fi
+  if [ -f "$d/.aicn-managed" ] || [ "$FORCE" -eq 1 ]; then
+    rm -rf "$d"
+    echo "retire $d"
+  fi
+}
+
+AGY_PLUGIN="$HOME/.gemini/config/plugins/aicn"
+mkdir -p "$(dirname "$AGY_PLUGIN")"
+sync_dir "$SK" "$AGY_PLUGIN"
+
+RETIRED_LOOSE=(
+  "aicn"
+  "video-localization-orchestrator"
+  "video-asr-visual-audit"
+  "zh-vi-script-adapter"
+  "vieneu-voice-pacing-mixer"
+  "video-localization-qa-review"
+)
+for root in "$HOME/.gemini/config/skills" "$HOME/.claude/skills"; do
+  for old in "${RETIRED_LOOSE[@]}"; do
+    retire_legacy_dir "$root/$old"
   done
 done
-python3 "$SK/scripts/aicn.py" --help >/dev/null && echo "ok     aicn.py runs"
+
+mkdir -p "$HOME/.claude/skills"
+for s in "$AGY_PLUGIN"/skills/*/; do
+  name="$(basename "$s")"
+  sync_dir "${s%/}" "$HOME/.claude/skills/$name"
+done
+
+PY_BIN="${AICN_PY:-python3}"
+"$PY_BIN" "$AGY_PLUGIN/scripts/aicn.py" --help >/dev/null && echo "ok     aicn.py runs"

@@ -1,19 +1,17 @@
-# Stage Commands (`v3.0.0`, Copy-Paste Reference)
+# Stage Commands (`v3.1.0`, Copy-Paste Reference)
 
 Set once per shell:
 
 ```powershell
 # Windows PowerShell
-$SK = "<skill>"                               # folder holding SKILL.md
-$V  = "$SK\vendor"
+$SK = if ($env:AICN_HOME) { $env:AICN_HOME } else { "$env:USERPROFILE\.gemini\config\plugins\aicn" }
 $PY = $env:AICN_PY                            # C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe
 $U  = "workspace\<series>\units\<unit>"       # internal working batch
 ```
 
 ```bash
 # macOS / Linux
-SK=<skill>                                    # folder holding SKILL.md
-V=$SK/vendor
+SK=${AICN_HOME:-$HOME/.gemini/config/plugins/aicn}
 PY=${AICN_PY:-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python}
 U=workspace/<series>/units/<unit>             # internal working batch
 ```
@@ -37,7 +35,7 @@ $PY $SK/scripts/aicn.py update-series --hub workspace/<series> \
   [--series-slug <new-slug>] [--title-vi "<Tên VI>"] [--title-zh "<Tên ZH>"]
 
 # Place episode batches in workspace/<series>/source_inbox/<batch>/, then initialize each unit:
-$PY $V/video-localization-orchestrator/scripts/init_workspace.py \
+$PY $SK/scripts/init_workspace.py \
   --topology series_episodic \
   --series-slug <series> \
   --unit-slug <unit> \
@@ -66,11 +64,11 @@ $PY $SK/scripts/aicn.py run-series --hub workspace/<series> --phase prep [--unit
 ### Single-Unit Commands
 ```bash
 $PY $SK/scripts/aicn_audio.py separate --unit $U
-$PY $V/video-asr-visual-audit/scripts/run_asr_and_scan.py --video $U/source/master_source.mp4 --workspace $U [--source-lang zh|en|auto] [--model large-v3] [--force]
-$PY $V/video-asr-visual-audit/scripts/analyze_voice_waveform.py --workspace $U --snap-and-split
-$PY $V/video-asr-visual-audit/scripts/extract_audit_frames.py --video $U/source/master_source.mp4 --workspace $U
+$PY $SK/scripts/run_asr_and_scan.py --video $U/source/master_source.mp4 --workspace $U [--source-lang zh|en|auto] [--model large-v3] [--force]
+$PY $SK/scripts/analyze_voice_waveform.py --workspace $U --snap-and-split
+$PY $SK/scripts/extract_audit_frames.py --video $U/source/master_source.mp4 --workspace $U
 # Mandatory: view every JPG in data/01_extracted_audit_manifest.json via read_file and log in 01_visual_audit_notes.md
-$PY $V/video-asr-visual-audit/scripts/verify_stage_1.py --workspace $U
+$PY $SK/scripts/verify_stage_1.py --workspace $U
 ```
 
 Outputs: `media/stems/{vocals,accomp}.wav` (`PCM_16`, globally cached in `<global_cache>/stems/`), `data/01_asr_raw_segments.json` (globally cached in `<global_cache>/asr/`), `data/01_pass2b_recovery_report.json`, `data/01_waveform_voice_audit.json`, `data/01_extracted_audit_manifest.json`.
@@ -82,7 +80,7 @@ Outputs: `media/stems/{vocals,accomp}.wav` (`PCM_16`, globally cached in `<globa
 Write `data/02_bilingual_script.json`: one clause object per item with `id`, `ep_id`, `speaker`, `raw_ids`, `start`, `end`, `zh_text`, `sub_text`, and `tts_text` (`<en>...</en>` tags for foreign acronyms/names). Maintain `config/series_bible.json` + `02_glossary_and_pronunciation.md`.
 
 ```bash
-$PY $V/zh-vi-script-adapter/scripts/validate_bilingual_script.py --workspace $U
+$PY $SK/scripts/validate_bilingual_script.py --workspace $U
 ```
 
 Checks strict monotonic non-overlapping timing (`0.0 <= start[i] < end[i] <= start[i+1] - 0.02`, `dur >= 0.15s`), `100%` raw coverage, `0` CJK/Korean chars, `0` unwrapped alphanumeric tokens, `sea-g2p` compilation, and calibrated VieNeu duration budgets (`<= 1.26x` / `<= 1.30x` for `<= 2`-syl interjections).
@@ -127,14 +125,14 @@ $PY $SK/scripts/aicn.py verify-render --unit $U
 ## Stage 5: Staging Hardlink, Parallel QA Extraction & Visual Verification
 
 ```bash
-$PY $V/video-localization-qa-review/scripts/composite_and_verify.py \
+$PY $SK/scripts/composite_and_verify.py \
   --video $U/source/master_source.mp4 \
   --workspace $U \
   --slug <unit>
 # (--import-existing-mp4 defaults to $U/media/.staging_render.mp4; extracts 12 stratified frames with 4 workers)
 
 # Mandatory: view EVERY frame in data/04_qa_frames_manifest.json via read_file; log PASS rows in 04_qa_review_report.md
-$PY $V/video-localization-qa-review/scripts/verify_stage_5.py --workspace $U
+$PY $SK/scripts/verify_stage_5.py --workspace $U
 $PY $SK/scripts/aicn.py log --unit $U --kind release --message "Stage 5 PASS -> media/final_<unit>_vi.mp4"
 ```
 

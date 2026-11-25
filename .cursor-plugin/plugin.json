@@ -1,0 +1,8 @@
+{
+  "name": "aicn",
+  "displayName": "AICN Drama Localization",
+  "version": "3.1.0",
+  "description": "End-to-end Chinese and English short-drama Vietnamese dubbing plugin: original-source radar, series hub setup, dual-layer script adaptation, VieNeu CUDA voice and NVENC watermark production, read-only QA, and surgical defect repair.",
+  "skills": "./skills",
+  "rules": "./rules"
+}

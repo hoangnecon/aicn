@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-aicn.py - incremental build engine for the AICN v3.0.0 drama re-up / dub + watermark pipeline.
+aicn.py - incremental build & localization engine for the AICN v3.1.0 multi-provider plugin.
 
-Wraps the Antigravity stage skills (video-localization-orchestrator,
-video-asr-visual-audit, zh-vi-script-adapter, vieneu-voice-pacing-mixer,
-video-localization-qa-review) and provides:
+Provides unified CLI subcommands across all pipeline stages and user intents:
 
   doctor          probe local hardware (CUDA/Metal/CPU, NVENC/VideoToolbox, tools) -> config/machine.json
   discover        read a root folder: series hubs, units, gate status, progress
+  locate          pinpoint exact unit, episode, cue, and utterance from full-series/unit timestamp or text query
+  audit           strict read-only forensic QA across chained gates, script, TTS pacing, LUFS mix, frames & merge
   init-series     scaffold a Series Hub (CHANGELOG, PROGRESS, bible, inbox, units)
   update-series   update series_slug, title_vi, title_zh in a Series Hub
   adopt           add the incremental layer to a unit made by init_workspace.py
@@ -38,7 +38,6 @@ if HERE not in sys.path:
 import aicn_platform as ap  # noqa: E402
 
 SKILL_DIR = os.path.normpath(os.path.join(HERE, ".."))
-VENDOR = os.path.join(SKILL_DIR, "vendor")
 
 FF_RENDERER_VERSION = ap.FF_RENDERER_VERSION
 TTS_ENGINE_TAG = ap.TTS_ENGINE_TAG
@@ -135,11 +134,8 @@ h_obj = ap.hash_obj
 
 
 def cicd():
-    """Import the existing cicd_gate.py so gate tokens stay format-compatible."""
-    cands = [os.environ.get("AICN_CICD_DIR", ""),
-             os.path.join(SKILL_DIR, "vendor", "video-localization-orchestrator", "scripts"),
-             os.path.expanduser("~/.gemini/config/skills/video-localization-orchestrator/scripts"),
-             os.path.expanduser("~/.claude/skills/video-localization-orchestrator/scripts")]
+    """Import cicd_gate.py from the unified scripts/ directory (or AICN_CICD_DIR override)."""
+    cands = [os.environ.get("AICN_CICD_DIR", ""), HERE]
     for c in cands:
         if c and os.path.exists(os.path.join(c, "cicd_gate.py")):
             if c not in sys.path:
@@ -1145,10 +1141,10 @@ def cmd_run_series(a):
     if not units:
         sys.exit(f"[run-series] no matching working batches under {hub}/units/")
     py = ap.find_python()
-    audio_py = os.path.join(SKILL_DIR, "scripts", "aicn_audio.py")
-    aicn_py = os.path.join(SKILL_DIR, "scripts", "aicn.py")
-    s1_dir = os.path.join(VENDOR, "video-asr-visual-audit", "scripts")
-    s5_dir = os.path.join(VENDOR, "video-localization-qa-review", "scripts")
+    audio_py = os.path.join(HERE, "aicn_audio.py")
+    aicn_py = os.path.join(HERE, "aicn.py")
+    s1_dir = HERE
+    s5_dir = HERE
 
     gpu_info = ap.get_gpu_info(py)
     demucs_tag = "Metal" if ap.detect_demucs_backend(py, gpu_info)["device"] == "mps" else ("CUDA" if gpu_info.get("cuda") else "CPU")
@@ -1542,12 +1538,456 @@ def cmd_brand_poster(a):
     return result
 
 
+# ----------------------------------------------------------------- locate & audit
+def _parse_ts_sec(val):
+    if val is None or str(val).strip() == "":
+        return None
+    s = str(val).strip().replace(",", ".")
+    parts = s.split(":")
+    try:
+        if len(parts) == 1:
+            return float(parts[0])
+        if len(parts) == 2:
+            return int(parts[0]) * 60.0 + float(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600.0 + int(parts[1]) * 60.0 + float(parts[2])
+    except ValueError:
+        pass
+    sys.exit(f"[locate] invalid timestamp '{val}' (use SS, MM:SS, or HH:MM:SS)")
+
+
+def _fmt_mmss(sec):
+    sec = max(0.0, float(sec))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec - (h * 3600 + m * 60)
+    return f"{h:02d}:{m:02d}:{s:05.2f}" if h else f"{m:02d}:{s:05.2f}"
+
+
+def _fold_vi_ascii(text):
+    import unicodedata
+    s = (text or "").replace("đ", "d").replace("Đ", "D").lower()
+    return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+
+
+def _unit_duration_s(u):
+    finals = [p for p in sorted(glob.glob(os.path.join(u, "media", "final_*_vi.mp4"))) if not os.path.basename(p).startswith(".")]
+    if finals:
+        try:
+            st = ffprobe_streams(finals[0])
+            vs = next((s for s in st if s.get("codec_type") == "video"), {})
+            d = float(vs.get("duration") or 0.0)
+            if d > 0:
+                return d
+        except Exception:
+            pass
+    prof = jload(os.path.join(u, "data", "00_video_profile.json"), {}) or {}
+    return float(prof.get("duration") or 0.0)
+
+
+def _unit_episode_spans(u):
+    man = jload(os.path.join(u, "data", "00_episodes_manifest.json"))
+    eps = man.get("episodes", []) if isinstance(man, dict) else (man if isinstance(man, list) else [])
+    spans = []
+    cur = 0.0
+    for idx, ep in enumerate(eps, 1):
+        if not isinstance(ep, dict):
+            continue
+        dur = float(ep.get("duration") or 0.0)
+        st = float(ep["start_s"]) if "start_s" in ep else (float(ep["start"]) if "start" in ep else cur)
+        et = float(ep["end_s"]) if "end_s" in ep else (float(ep["end"]) if "end" in ep else (st + dur))
+        ep_num = ep.get("episode_number") or ep.get("episode") or ep.get("index") or idx
+        spans.append({"episode": ep_num, "file": ep.get("filename") or ep.get("source") or "", "start_s": round(st, 3), "end_s": round(et, 3)})
+        cur = et
+    return spans
+
+
+def cmd_locate(a):
+    """Pinpoint exact unit, episode, cue(s), and Stage 3 utterance telemetry without mutating any files."""
+    if not a.hub and not a.unit:
+        sys.exit("[locate] provide --hub <series_hub> and/or --unit <unit_dir_or_name>")
+    hub = os.path.abspath(a.hub) if a.hub else ""
+    units = []
+    if a.unit and os.path.isdir(a.unit) and is_unit(a.unit):
+        u_abs = os.path.abspath(a.unit)
+        if not hub:
+            hub = resolve_unit_hub(u_abs)
+        units = [u_abs]
+    elif hub:
+        if not is_hub(hub):
+            sys.exit(f"[locate] {hub} is not a Series Hub")
+        all_u = [u for u in sorted(glob.glob(os.path.join(hub, "units", "*"))) if is_unit(u)]
+        if a.unit:
+            units = [u for u in all_u if os.path.basename(u) == a.unit]
+            if not units:
+                sys.exit(f"[locate] unit '{a.unit}' not found under {hub}/units/")
+        else:
+            units = all_u
+    else:
+        sys.exit(f"[locate] unit '{a.unit}' is not a valid unit workspace")
+
+    all_hub_units = (
+        [u for u in sorted(glob.glob(os.path.join(hub, "units", "*"))) if is_unit(u)]
+        if hub and is_hub(hub) else list(units)
+    )
+    cum_map = {}
+    cum = 0.0
+    for u in all_hub_units:
+        d = _unit_duration_s(u)
+        cum_map[os.path.abspath(u)] = (cum, cum + d, d)
+        cum += d
+
+    full_at = _parse_ts_sec(a.full_at)
+    local_at = _parse_ts_sec(a.at)
+    q_raw = (a.query or "").strip()
+    q_low = q_raw.lower()
+    q_fold = _fold_vi_ascii(q_raw)
+
+    if full_at is not None and not a.unit:
+        chosen = None
+        for u in all_hub_units:
+            c0, c1, _ = cum_map[os.path.abspath(u)]
+            if c0 <= full_at <= c1 + 0.05:
+                chosen = u
+                break
+        if chosen is None and all_hub_units:
+            chosen = all_hub_units[-1] if full_at > cum else all_hub_units[0]
+        units = [chosen] if chosen else units
+
+    matches = []
+    for u in units:
+        u_abs = os.path.abspath(u)
+        u_name = os.path.basename(u_abs)
+        c0, c1, u_dur = cum_map.get(u_abs, (0.0, _unit_duration_s(u_abs), _unit_duration_s(u_abs)))
+        target_local = (full_at - c0) if full_at is not None else local_at
+
+        ep_spans = _unit_episode_spans(u_abs)
+        if a.ep is not None and ep_spans:
+            ep_hit = next((es for es in ep_spans if str(es["episode"]) == str(a.ep)), None)
+            if not ep_hit:
+                continue
+            if local_at is not None:
+                target_local = ep_hit["start_s"] + local_at
+            elif full_at is None and not q_raw:
+                target_local = ep_hit["start_s"]
+
+        script_p = os.path.join(u_abs, "data", "02_bilingual_script.json")
+        cues = jload(script_p)
+        cue_source = "data/02_bilingual_script.json"
+        if not isinstance(cues, list):
+            cues = jload(os.path.join(u_abs, "data", "01_asr_clean.json"))
+            cue_source = "data/01_asr_clean.json"
+        if not isinstance(cues, list):
+            cues = jload(os.path.join(u_abs, "data", "01_asr_raw_segments.json"), [])
+            cue_source = "data/01_asr_raw_segments.json"
+
+        dub_sents = jload(os.path.join(u_abs, "data", "03_dub_sentences.json"), []) or []
+        seg_to_utt = {}
+        for utt in dub_sents:
+            if isinstance(utt, dict):
+                for sidx in (utt.get("seg_indices") or []):
+                    seg_to_utt[int(sidx)] = utt
+
+        hit_indices = []
+        for idx, c in enumerate(cues):
+            st = float(c.get("start", 0.0))
+            et = float(c.get("end", st))
+            ok_ts = True
+            if target_local is not None:
+                ok_ts = (st - 1.5 <= target_local <= et + 1.5)
+            ok_q = True
+            if q_raw:
+                blob = " | ".join(str(c.get(k, "")) for k in ("zh_text", "text", "sub_text", "tts_text", "speaker"))
+                ok_q = (q_low in blob.lower()) or (bool(q_fold) and q_fold in _fold_vi_ascii(blob))
+            if ok_ts and ok_q and (target_local is not None or q_raw):
+                hit_indices.append(idx)
+
+        if not hit_indices and target_local is not None and not q_raw and cues:
+            nearest_i = min(
+                range(len(cues)),
+                key=lambda i: min(abs(float(cues[i].get("start", 0.0)) - target_local), abs(float(cues[i].get("end", 0.0)) - target_local)),
+            )
+            hit_indices.append(nearest_i)
+
+        for idx in hit_indices[: max(1, int(a.limit))]:
+            w = max(0, int(a.window))
+            ctx = []
+            for j in range(max(0, idx - w), min(len(cues), idx + w + 1)):
+                cj = cues[j]
+                jst, jet = float(cj.get("start", 0.0)), float(cj.get("end", 0.0))
+                utt = seg_to_utt.get(j)
+                ctx.append({
+                    "cue_index": j,
+                    "is_target": j == idx,
+                    "local_start_s": round(jst, 3),
+                    "local_end_s": round(jet, 3),
+                    "local_span": f"{_fmt_mmss(jst)} -> {_fmt_mmss(jet)}",
+                    "full_start_s": round(c0 + jst, 3),
+                    "full_span": f"{_fmt_mmss(c0 + jst)} -> {_fmt_mmss(c0 + jet)}",
+                    "speaker": cj.get("speaker", ""),
+                    "zh_text": cj.get("zh_text", cj.get("text", "")),
+                    "sub_text": cj.get("sub_text", ""),
+                    "tts_text": cj.get("tts_text", ""),
+                    "utterance": (
+                        {
+                            "utt_id": utt.get("utt_id") or utt.get("id"),
+                            "seg_indices": utt.get("seg_indices"),
+                            "voice": utt.get("voice"),
+                            "tempo": utt.get("tempo"),
+                            "required_tempo": utt.get("required_tempo"),
+                            "overflow_s": utt.get("overflow_s", 0.0),
+                        }
+                        if utt else None
+                    ),
+                })
+            c_mid = 0.5 * (float(cues[idx].get("start", 0.0)) + float(cues[idx].get("end", 0.0)))
+            ep_info = next((es for es in ep_spans if es["start_s"] - 0.05 <= c_mid <= es["end_s"] + 0.05), None)
+            matches.append({
+                "unit": u_name,
+                "unit_dir": u_abs,
+                "gates": gate_status(u_abs),
+                "unit_full_offset_s": round(c0, 3),
+                "unit_duration_s": round(u_dur, 3),
+                "cue_source": cue_source,
+                "episode": (
+                    {
+                        "episode": ep_info["episode"],
+                        "ep_local_time": _fmt_mmss(max(0.0, c_mid - ep_info["start_s"])),
+                    }
+                    if ep_info else None
+                ),
+                "target_cue_index": idx,
+                "context_cues": ctx,
+                "surgical_rebuild": [
+                    f"$AICN_PY {os.path.join(HERE, 'validate_bilingual_script.py')} --workspace {u_abs}",
+                    f"$AICN_PY {os.path.join(HERE, 'aicn_audio.py')} all --unit {u_abs}",
+                    f"$AICN_PY {os.path.join(HERE, 'aicn.py')} render --unit {u_abs}",
+                    f"$AICN_PY {os.path.join(HERE, 'aicn.py')} verify-render --unit {u_abs}",
+                    f"$AICN_PY {os.path.join(HERE, 'composite_and_verify.py')} --video {os.path.join(u_abs, 'source', 'master_source.mp4')} --workspace {u_abs} --slug {u_name} --import-existing-mp4 {os.path.join(u_abs, 'media', '.staging_render.mp4')}",
+                    f"$AICN_PY {os.path.join(HERE, 'verify_stage_5.py')} --workspace {u_abs}",
+                ] + ([f"$AICN_PY {os.path.join(HERE, 'aicn.py')} merge-series --hub {hub}"] if hub else []),
+            })
+            if len(matches) >= max(1, int(a.limit)):
+                break
+        if len(matches) >= max(1, int(a.limit)):
+            break
+
+    payload = {
+        "hub": hub or None,
+        "query": q_raw or None,
+        "full_at_s": full_at,
+        "local_at_s": local_at,
+        "matches_count": len(matches),
+        "matches": matches,
+    }
+    if a.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return payload
+    if not matches:
+        print(f"[locate] 0 matches (hub={hub or '-'}, full_at={a.full_at}, at={a.at}, query={q_raw!r})")
+        return payload
+    print(f"[locate] Found {len(matches)} match(es):")
+    for m in matches:
+        ep_str = f" | ep={m['episode']['episode']} ({m['episode']['ep_local_time']})" if m["episode"] else ""
+        print(f"  UNIT {m['unit']} (gates={m['gates']}, full_offset={_fmt_mmss(m['unit_full_offset_s'])}{ep_str}) [{m['cue_source']}]")
+        for cc in m["context_cues"]:
+            mark = ">>" if cc["is_target"] else "  "
+            u_meta = ""
+            if cc["utterance"]:
+                ut = cc["utterance"]
+                u_meta = f" [utt={ut['utt_id']} tempo={ut['tempo']} req={ut['required_tempo']} over={ut['overflow_s']}s]"
+            print(f"    {mark} [#{cc['cue_index']}] local {cc['local_span']} (full {cc['full_span']}) ({cc['speaker'] or '-'}){u_meta}")
+            print(f"       ZH : {cc['zh_text']}")
+            if cc["sub_text"] or cc["tts_text"]:
+                print(f"       SUB: {cc['sub_text']}")
+                print(f"       TTS: {cc['tts_text']}")
+    return payload
+
+
+def cmd_audit(a):
+    """Strict read-only forensic quality audit across a Series Hub or single unit (never writes or mutates files)."""
+    import re
+    cjk_re = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+    if not a.hub and not a.unit:
+        sys.exit("[audit] provide --hub <series_hub> or --unit <unit_dir>")
+    hub = os.path.abspath(a.hub) if a.hub else ""
+    if a.unit:
+        u_abs = os.path.abspath(a.unit) if os.path.isdir(a.unit) else os.path.join(hub, "units", a.unit)
+        if not is_unit(u_abs):
+            sys.exit(f"[audit] {u_abs} is not a valid unit workspace")
+        if not hub:
+            hub = resolve_unit_hub(u_abs)
+        units = [u_abs]
+    else:
+        if not is_hub(hub):
+            sys.exit(f"[audit] {hub} is not a Series Hub")
+        units = [u for u in sorted(glob.glob(os.path.join(hub, "units", "*"))) if is_unit(u)]
+
+    critical = []
+    important = []
+    unit_reports = []
+    newest_unit_mp4_mtime = 0.0
+
+    for u in units:
+        bn = os.path.basename(u)
+        gs = gate_status(u)
+        if "F" in gs:
+            critical.append(f"{bn}: failed gate(s) in '{gs}'")
+        elif "x" in gs and gs[5] != "P":
+            important.append(f"{bn}: stale/broken gate chain '{gs}' (upstream modified or intermediate missing before Stage 5 PASS)")
+
+        script_issues = []
+        cues = jload(os.path.join(u, "data", "02_bilingual_script.json"))
+        if isinstance(cues, list):
+            prev_end = -1.0
+            for idx, c in enumerate(cues):
+                st, et = float(c.get("start", 0.0)), float(c.get("end", 0.0))
+                sub_t, tts_t = str(c.get("sub_text") or "").strip(), str(c.get("tts_text") or "").strip()
+                if not sub_t or not tts_t:
+                    script_issues.append(f"cue #{idx} empty sub_text/tts_text")
+                if cjk_re.search(sub_t) or cjk_re.search(tts_t):
+                    script_issues.append(f"cue #{idx} CJK/Hangul leak")
+                if prev_end >= 0 and st < prev_end + 0.019:
+                    script_issues.append(f"cue #{idx} monotonic/gap violation ({st:.3f}s vs prev_end {prev_end:.3f}s)")
+                prev_end = et
+            if script_issues:
+                critical.append(f"{bn}: {len(script_issues)} script defect(s) ({script_issues[0]})")
+
+        pacing_summary = None
+        dub_sents = jload(os.path.join(u, "data", "03_dub_sentences.json"))
+        if isinstance(dub_sents, list) and dub_sents:
+            acfg = jload(os.path.join(u, "config", "audio_mix.json"), {}) or {}
+            max_t = float(acfg.get("max_tempo", 1.28))
+            max_ts = float(acfg.get("max_tempo_short", max(max_t, 1.32)))
+            overs = [s for s in dub_sents if float(s.get("overflow_s", 0.0) or 0.0) > 0.005]
+            bad_tempo = []
+            runts = [s for s in dub_sents if s.get("runt")]
+            worst_tempo = 0.0
+            for s in dub_sents:
+                slot = float(s.get("slot_end", 0.0)) - float(s.get("slot_start", 0.0))
+                cap = max_ts if (int(s.get("n_clauses", 1)) == 1 and slot < 1.2) else max_t
+                eff_t = max(float(s.get("tempo", 1.0) or 1.0), float(s.get("required_tempo", 0.0) or 0.0))
+                worst_tempo = max(worst_tempo, eff_t)
+                if eff_t > cap + 0.005:
+                    bad_tempo.append(s.get("utt_id"))
+            pacing_summary = {
+                "utterances": len(dub_sents),
+                "overflows": len(overs),
+                "tempo_violations": len(bad_tempo),
+                "runts": len(runts),
+                "worst_tempo": round(worst_tempo, 3),
+            }
+            if overs or bad_tempo or runts:
+                critical.append(f"{bn}: Stage 3 pacing defects (overflows={len(overs)}, tempo_violations={len(bad_tempo)}, runts={len(runts)})")
+
+        mix_summary = None
+        mix_rep = jload(os.path.join(u, "data", "03_mix_report.json"))
+        if isinstance(mix_rep, dict):
+            failed_ids = [c.get("id") for c in (mix_rep.get("checks") or []) if not c.get("passed")]
+            mix_summary = {"passed": bool(mix_rep.get("passed")), "failed_checks": failed_ids}
+            if not mix_rep.get("passed") or failed_ids:
+                critical.append(f"{bn}: Stage 3 mix report failed ({failed_ids})")
+
+        qa_frames = sorted(glob.glob(os.path.join(u, "frames", "qa", "*.jpg")))
+        finals = [p for p in sorted(glob.glob(os.path.join(u, "media", "final_*_vi.mp4"))) if not os.path.basename(p).startswith(".")]
+        if finals:
+            newest_unit_mp4_mtime = max(newest_unit_mp4_mtime, os.path.getmtime(finals[0]))
+        if a.strict and gs != "PPPPPP" and not (gs[:3] == "PPP" and gs[5] == "P"):
+            important.append(f"{bn}: incomplete unit gates '{gs}'")
+
+        unit_reports.append({
+            "unit": bn,
+            "gates": gs,
+            "final_mp4": finals[0] if finals else None,
+            "qa_frame_count": len(qa_frames),
+            "sample_qa_frames": qa_frames[:: max(1, len(qa_frames) // 4)][:4] if qa_frames else [],
+            "script_defect_count": len(script_issues),
+            "pacing": pacing_summary,
+            "mix": mix_summary,
+        })
+
+    release_info = None
+    if hub and is_hub(hub) and not a.unit:
+        slug = os.path.basename(hub)
+        full_mp4 = os.path.join(hub, "deliverables", f"final_{slug}_full_vi.mp4")
+        full_srt = os.path.join(hub, "deliverables", "subtitles", f"final_{slug}_full_vi.srt")
+        posters = sorted(glob.glob(os.path.join(hub, "posters", "*_branded.png")))
+        release_info = {
+            "full_mp4": full_mp4 if os.path.exists(full_mp4) else None,
+            "full_srt": full_srt if os.path.exists(full_srt) else None,
+            "branded_posters": posters,
+            "stale_merge": False,
+            "av_sync_drift_s": None,
+        }
+        if os.path.exists(full_mp4):
+            if newest_unit_mp4_mtime > os.path.getmtime(full_mp4) + 1.0:
+                release_info["stale_merge"] = True
+                critical.append("hub: deliverables/final_*_full_vi.mp4 is OLDER than a re-rendered unit MP4 (re-run merge-series!)")
+            try:
+                st = ffprobe_streams(full_mp4)
+                vs = next((s for s in st if s.get("codec_type") == "video"), {})
+                as_ = next((s for s in st if s.get("codec_type") == "audio"), {})
+                drift = abs(float(vs.get("duration") or 0.0) - float(as_.get("duration") or 0.0))
+                release_info["av_sync_drift_s"] = round(drift, 3)
+                if drift > 0.50:
+                    critical.append(f"hub: full MP4 A/V duration drift {drift:.3f}s > 0.50s")
+            except Exception as exc:
+                important.append(f"hub: ffprobe failed on full MP4 ({exc})")
+        elif a.strict:
+            important.append("hub: deliverables/final_*_full_vi.mp4 missing")
+
+    ok = (len(critical) == 0) and (not a.strict or len(important) == 0)
+    report = {
+        "ok": ok,
+        "hub": hub or None,
+        "units_count": len(unit_reports),
+        "critical": critical,
+        "important": important,
+        "release": release_info,
+        "units": unit_reports,
+    }
+    if a.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        status_lbl = "PASS" if ok and not important else ("WARN" if ok else "FAIL")
+        print(f"[audit] Status={status_lbl} | units={len(unit_reports)} | critical={len(critical)} | important={len(important)}")
+        for u_rep in unit_reports:
+            p_str = f"utt={u_rep['pacing']['utterances']} max_tempo={u_rep['pacing']['worst_tempo']} over={u_rep['pacing']['overflows']}" if u_rep["pacing"] else "pacing=-"
+            print(f"  {u_rep['unit']:28s} gates={u_rep['gates']}  {p_str}  qa_frames={u_rep['qa_frame_count']}")
+        if release_info:
+            print(f"  full_mp4: {release_info['full_mp4'] or 'MISSING'} (stale_merge={release_info['stale_merge']}, av_drift={release_info['av_sync_drift_s']}s, branded_posters={len(release_info['branded_posters'])})")
+        for c in critical:
+            print(f"  [CRITICAL]  {c}")
+        for imp in important:
+            print(f"  [IMPORTANT] {imp}")
+    if not ok:
+        sys.exit(2)
+    return report
+
+
 # ----------------------------------------------------------------- main
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = parser.add_subparsers(dest="cmd", required=True)
     p = sp.add_parser("doctor"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_doctor)
     p = sp.add_parser("discover"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_discover)
+    p = sp.add_parser("locate", help="pinpoint unit, episode, cue, and TTS utterance by full-series/unit time or text")
+    p.add_argument("--hub", default=None, help="Series Hub directory")
+    p.add_argument("--unit", default=None, help="Unit workspace directory or unit folder name")
+    p.add_argument("--full-at", default=None, help="timestamp in merged full-series MP4 (SS, MM:SS, or HH:MM:SS)")
+    p.add_argument("--at", default=None, help="local timestamp inside unit or episode (SS or MM:SS)")
+    p.add_argument("--ep", type=int, default=None, help="episode number inside unit (if 00_episodes_manifest.json exists)")
+    p.add_argument("--query", default="", help="substring in zh_text, sub_text, tts_text, or speaker (accent-insensitive)")
+    p.add_argument("--window", type=int, default=1, help="context cues before/after each hit")
+    p.add_argument("--limit", type=int, default=10, help="max hits to return")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_locate)
+    p = sp.add_parser("audit", help="strict read-only forensic quality audit across gates, script, audio, frames & merge")
+    p.add_argument("--hub", default=None, help="Series Hub directory")
+    p.add_argument("--unit", default=None, help="Unit workspace directory or unit folder name")
+    p.add_argument("--strict", action="store_true", help="exit non-zero if any unit or full release is incomplete")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_audit)
     p = sp.add_parser("init-series"); p.add_argument("--series-slug", required=True); p.add_argument("--title", default="")
     p.add_argument("--title-vi", default="", help="Vietnamese series title (alias for --title)")
     p.add_argument("--title-zh", default="", help="Original Chinese/source series title")

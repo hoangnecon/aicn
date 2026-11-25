@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.1.0 (2026-11-26)
+- **Multi-Provider Plugin Packaging & Intent-Driven `/aicn-*` Command Suite:**
+  - Converted `aicn` from 6 loose scattered skill folders (`vendor/*`) into a single unified multi-provider plugin (`~/.gemini/config/plugins/aicn`) shipping standard manifests for **Google Antigravity** (`plugin.json` + `assets/logo.svg` + `rules/AGENTS.md`), **Claude Code** (`.claude-plugin/plugin.json`), **Cursor** (`.cursor-plugin/plugin.json`), **OpenAI Codex** (`.codex-plugin/plugin.json`), and **Gemini CLI** (`gemini-extension.json` + `GEMINI.md`).
+  - Consolidated all 17 Python/Node engine & stage scripts into `scripts/` and all 16 reference manuals into `references/` (retiring `vendor/` and eliminating 12-folder duplication).
+  - Replaced internal pipeline-plumbing skill names with **7 user-invocable intent-driven skills** authored to `superpowers:writing-skills` SDO standards: `/aicn-scout`, `/aicn-create`, `/aicn-script`, `/aicn-produce`, `/aicn-audit`, `/aicn-fix`, and `/aicn-clean`.
+  - Added `aicn.py locate` (maps full-series `HH:MM:SS`, episode-local time, or accent-insensitive Vietnamese/CJK query to exact unit, cue, context window, and Stage 3 utterance telemetry) and `aicn.py audit` (100% read-only forensic validator checking chained gate signatures, CJK leaks, utterance tempo/overflows, mix compliance, A/V drift, and `stale_merge`).
+  - Updated `install.ps1` and `install.sh` to install `~/.gemini/config/plugins/aicn`, set `AICN_HOME`, sync `aicn-*` commands into `~/.claude/skills/`, and retire legacy loose skill directories cleanly.
+
 ## 3.0.0 (2026-11-25)
 - **Ground-Up Architecture Overhaul (`SPEC_V3.md`, `L-023`) — Concurrency, True Content-Addressed Caching, Audio Continuity, ASR Collar Dedup & Fast Hardware Render:**
   - **SQLite-WAL Content-Addressed Hash Store & Relocation-Safe Gates (`scripts/aicn_platform.py`, `cicd_gate.py`, `init_workspace.py`):**

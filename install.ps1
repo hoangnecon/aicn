@@ -1,10 +1,9 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-Install aicn and all 5 vendored stage skills into Windows Antigravity and Claude Code skill folders.
-Uses real directory copies (not NTFS Junctions) so Antigravity on Windows discovers all 6/6 skills for
-both the main agent and sub-agents. Safely upgrades old aicn junctions and refreshes managed copies on
-re-run without overwriting unrelated user folders unless -Force is passed.
+Install AICN v3.1+ as a native Antigravity plugin (%USERPROFILE%\.gemini\config\plugins\aicn),
+sync the 7 user-invocable aicn-* skills into Claude Code (%USERPROFILE%\.claude\skills\aicn-*),
+and retire the legacy 6 loose skill folders from .gemini\config\skills and .claude\skills.
 Optionally installs portable ffmpeg/ffprobe, rubberband, and node with -InstallTools.
 #>
 [CmdletBinding()]
@@ -66,21 +65,6 @@ if ($InstallTools) {
     }
 }
 
-function Copy-CleanTree([string]$Src, [string]$Dst) {
-    New-Item -ItemType Directory -Force -Path $Dst | Out-Null
-    $excludeDirs = @('.git', '__pycache__', '.cache')
-    $excludeFiles = @('.aicn-managed', 'SPEC_V3.md')
-    Get-ChildItem -LiteralPath $Src -Force | ForEach-Object {
-        if ($_.PSIsContainer) {
-            if ($excludeDirs -contains $_.Name) { return }
-            Copy-CleanTree $_.FullName (Join-Path $Dst $_.Name)
-        } else {
-            if ($_.Extension -eq '.pyc' -or ($excludeFiles -contains $_.Name)) { return }
-            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Dst $_.Name) -Force
-        }
-    }
-}
-
 $retiredLegacyFiles = @(
     "apply_channel_branding.py",
     "render_vertical_9x16.py",
@@ -98,23 +82,36 @@ function Remove-RetiredLegacyFiles([string]$Root) {
     }
 }
 
-function Sync-SkillDir([string]$Src, [string]$Dst) {
+function Copy-CleanTree([string]$Src, [string]$Dst) {
+    New-Item -ItemType Directory -Force -Path $Dst | Out-Null
+    $excludeDirs = @('.git', '__pycache__', '.cache', '.pytest_cache')
+    $excludeFiles = @('.aicn-managed', 'SPEC_V3.md')
+    Get-ChildItem -LiteralPath $Src -Force | ForEach-Object {
+        if ($_.PSIsContainer) {
+            if ($excludeDirs -contains $_.Name) { return }
+            Copy-CleanTree $_.FullName (Join-Path $Dst $_.Name)
+        } else {
+            if ($_.Extension -eq '.pyc' -or ($excludeFiles -contains $_.Name)) { return }
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Dst $_.Name) -Force
+        }
+    }
+    Remove-RetiredLegacyFiles $Dst
+}
+
+function Sync-ManagedDir([string]$Src, [string]$Dst) {
     $srcNorm = [System.IO.Path]::GetFullPath($Src).TrimEnd('\')
     $dstNorm = [System.IO.Path]::GetFullPath($Dst).TrimEnd('\')
     if ($srcNorm -ieq $dstNorm) {
         Write-Host "self   $dstNorm"
         return
     }
-
     $marker = Join-Path $dstNorm ".aicn-managed"
     if (Test-Path -LiteralPath $dstNorm) {
         $item = Get-Item -LiteralPath $dstNorm -Force
         $isReparse = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
         if ($isReparse) {
-            # Safely unlink junction/symlink without recursing into its target.
             [System.IO.Directory]::Delete($dstNorm, $false)
             Copy-CleanTree $srcNorm $dstNorm
-            Remove-RetiredLegacyFiles $dstNorm
             Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
             Write-Host "upgrade $dstNorm (junction -> real dir)"
             return
@@ -122,7 +119,6 @@ function Sync-SkillDir([string]$Src, [string]$Dst) {
         if ((Test-Path -LiteralPath $marker) -or $Force) {
             Remove-Item -LiteralPath $dstNorm -Recurse -Force
             Copy-CleanTree $srcNorm $dstNorm
-            Remove-RetiredLegacyFiles $dstNorm
             Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
             Write-Host "sync   $dstNorm"
             return
@@ -130,30 +126,69 @@ function Sync-SkillDir([string]$Src, [string]$Dst) {
         Write-Host "keep   $dstNorm (existing unmanaged folder; pass -Force to overwrite)"
         return
     }
-
     Copy-CleanTree $srcNorm $dstNorm
-    Remove-RetiredLegacyFiles $dstNorm
     Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
     Write-Host "copy   $dstNorm"
 }
 
-$dests = @(
-    (Join-Path $env:USERPROFILE ".claude\skills"),
-    (Join-Path $env:USERPROFILE ".gemini\config\skills")
-)
-
-foreach ($dest in $dests) {
-    New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    Sync-SkillDir $SK (Join-Path $dest "aicn")
-    Get-ChildItem (Join-Path $SK "vendor") -Directory | ForEach-Object {
-        Sync-SkillDir $_.FullName (Join-Path $dest $_.Name)
+function Retire-LegacySkillDir([string]$DirPath) {
+    if (-not (Test-Path -LiteralPath $DirPath)) { return }
+    $norm = [System.IO.Path]::GetFullPath($DirPath).TrimEnd('\')
+    if ($norm -ieq $SK) {
+        Write-Host "skip   $norm (active source repo; relocate repo to .gemini\config\plugins\aicn to retire)"
+        return
     }
+    $item = Get-Item -LiteralPath $norm -Force
+    $isReparse = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if ($isReparse) {
+        [System.IO.Directory]::Delete($norm, $false)
+        Write-Host "retire $norm (unlinked legacy junction)"
+        return
+    }
+    if ((Test-Path -LiteralPath (Join-Path $norm ".aicn-managed")) -or $Force) {
+        Remove-Item -LiteralPath $norm -Recurse -Force
+        Write-Host "retire $norm"
+    }
+}
+
+# 1. Install full plugin into Antigravity plugins root
+$agyPluginsRoot = Join-Path $env:USERPROFILE ".gemini\config\plugins"
+New-Item -ItemType Directory -Force -Path $agyPluginsRoot | Out-Null
+$agyPluginDir = Join-Path $agyPluginsRoot "aicn"
+Sync-ManagedDir $SK $agyPluginDir
+
+[Environment]::SetEnvironmentVariable("AICN_HOME", $agyPluginDir, "User")
+$env:AICN_HOME = $agyPluginDir
+
+# 2. Retire old loose 6-skill layout from .gemini\config\skills and .claude\skills
+$retiredLooseSkills = @(
+    "aicn",
+    "video-localization-orchestrator",
+    "video-asr-visual-audit",
+    "zh-vi-script-adapter",
+    "vieneu-voice-pacing-mixer",
+    "video-localization-qa-review"
+)
+foreach ($legacyRoot in @(
+    (Join-Path $env:USERPROFILE ".gemini\config\skills"),
+    (Join-Path $env:USERPROFILE ".claude\skills")
+)) {
+    foreach ($oldName in $retiredLooseSkills) {
+        Retire-LegacySkillDir (Join-Path $legacyRoot $oldName)
+    }
+}
+
+# 3. Sync the 7 intent-driven aicn-* skills into Claude Code (~/.claude/skills/aicn-*)
+$claudeSkillsRoot = Join-Path $env:USERPROFILE ".claude\skills"
+New-Item -ItemType Directory -Force -Path $claudeSkillsRoot | Out-Null
+Get-ChildItem (Join-Path $agyPluginDir "skills") -Directory | ForEach-Object {
+    Sync-ManagedDir $_.FullName (Join-Path $claudeSkillsRoot $_.Name)
 }
 
 function Find-AicnTool([string]$Name) {
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    foreach ($dir in @($localBin, $localNode, "C:\Program Files\nodejs")) {
+    foreach ($dir in @($localBin, $localNode, "C:\Work\Tools\nodejs", "C:\Program Files\nodejs")) {
         $cand = Join-Path $dir "$Name.exe"
         if (Test-Path $cand) { return $cand }
     }
@@ -185,6 +220,7 @@ if (-not $py) {
     if ($cmdPy) { $py = $cmdPy.Source }
 }
 
+Write-Host "plugin $agyPluginDir"
 Write-Host "python $(if ($py) { $py } else { 'MISSING (set AICN_PY)' })"
 $missingTools = @()
 foreach ($t in @("ffmpeg", "ffprobe", "rubberband", "node", "uvx")) {
@@ -200,29 +236,24 @@ if ($missingTools.Count -gt 0) {
     Write-Host "hint   run '.\install.ps1 -InstallTools' to install portable ffmpeg/ffprobe, rubberband, and node into $localBin"
 }
 
-# Verify Antigravity skill discovery: all 6 skills must be real directories with SKILL.md
-$agyRoot = Join-Path $env:USERPROFILE ".gemini\config\skills"
-$expectedSkills = @("aicn") + @(Get-ChildItem (Join-Path $SK "vendor") -Directory | ForEach-Object { $_.Name })
-$okSkills = 0
+# Verify Antigravity plugin integrity
+if (-not (Test-Path -LiteralPath (Join-Path $agyPluginDir "plugin.json"))) {
+    throw "AGY plugin check failed: missing plugin.json in $agyPluginDir"
+}
+$expectedSkills = @("aicn-scout", "aicn-create", "aicn-script", "aicn-produce", "aicn-audit", "aicn-fix", "aicn-clean")
 foreach ($s in $expectedSkills) {
-    $sDir = Join-Path $agyRoot $s
-    $sMd = Join-Path $sDir "SKILL.md"
-    $isReparse = (Test-Path -LiteralPath $sDir) -and (((Get-Item -LiteralPath $sDir -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
-    if ((Test-Path -LiteralPath $sMd) -and (-not $isReparse)) {
-        if (Test-Path -LiteralPath (Join-Path $sDir ".aicn-managed")) {
-            foreach ($ret in $retiredLegacyFiles) {
-                $hit = Get-ChildItem -LiteralPath $sDir -Recurse -File -Filter $ret -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($hit) {
-                    throw "AGY skill check failed for '$s': retired legacy file still present at $($hit.FullName)"
-                }
-            }
-        }
-        $okSkills++
-    } else {
-        throw "AGY skill check failed for '$s' at $sDir (missing SKILL.md or still a reparse point)"
+    $sMd = Join-Path $agyPluginDir "skills\$s\SKILL.md"
+    if (-not (Test-Path -LiteralPath $sMd)) {
+        throw "AGY plugin check failed: missing skills\$s\SKILL.md in $agyPluginDir"
     }
 }
-Write-Host "ok     AGY skills ready ($okSkills/$($expectedSkills.Count) real dirs in $agyRoot)"
+foreach ($ret in $retiredLegacyFiles) {
+    $hit = Get-ChildItem -LiteralPath $agyPluginDir -Recurse -File -Filter $ret -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($hit) {
+        throw "AGY plugin check failed: retired legacy file still present at $($hit.FullName)"
+    }
+}
+Write-Host "ok     AGY plugin ready ($($expectedSkills.Count)/$($expectedSkills.Count) aicn-* skills in $agyPluginDir)"
 
 if ($py -and (Test-Path $py)) {
     & $py -c "import Crypto, unicorn, requests" 2>$null
@@ -241,7 +272,7 @@ if ($py -and (Test-Path $py)) {
     } else {
         Write-Host "ok     hg_sdk     pycryptodome + unicorn + requests"
     }
-    $null = & $py (Join-Path $agyRoot "aicn\scripts\aicn.py") --help
+    $null = & $py (Join-Path $agyPluginDir "scripts\aicn.py") --help
     if ($LASTEXITCODE -eq 0) {
         Write-Host "ok     aicn.py runs"
     } else {

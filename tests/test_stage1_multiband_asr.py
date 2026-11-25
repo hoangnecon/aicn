@@ -13,12 +13,11 @@ import soundfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 SCRIPTS = os.path.join(ROOT, "scripts")
-V1_SCRIPTS = os.path.join(ROOT, "vendor", "video-asr-visual-audit", "scripts")
-V2_SCRIPTS = os.path.join(ROOT, "vendor", "zh-vi-script-adapter", "scripts")
-ORCH_SCRIPTS = os.path.join(ROOT, "vendor", "video-localization-orchestrator", "scripts")
-for _p in (V1_SCRIPTS, V2_SCRIPTS, ORCH_SCRIPTS, SCRIPTS):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+V1_SCRIPTS = SCRIPTS
+V2_SCRIPTS = SCRIPTS
+ORCH_SCRIPTS = SCRIPTS
+if SCRIPTS not in sys.path:
+    sys.path.insert(0, SCRIPTS)
 
 import analyze_voice_waveform as avw
 import cicd_gate

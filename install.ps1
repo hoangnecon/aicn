@@ -69,13 +69,31 @@ if ($InstallTools) {
 function Copy-CleanTree([string]$Src, [string]$Dst) {
     New-Item -ItemType Directory -Force -Path $Dst | Out-Null
     $excludeDirs = @('.git', '__pycache__', '.cache')
+    $excludeFiles = @('.aicn-managed', 'SPEC_V3.md')
     Get-ChildItem -LiteralPath $Src -Force | ForEach-Object {
         if ($_.PSIsContainer) {
             if ($excludeDirs -contains $_.Name) { return }
             Copy-CleanTree $_.FullName (Join-Path $Dst $_.Name)
         } else {
-            if ($_.Extension -eq '.pyc' -or $_.Name -eq '.aicn-managed') { return }
+            if ($_.Extension -eq '.pyc' -or ($excludeFiles -contains $_.Name)) { return }
             Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Dst $_.Name) -Force
+        }
+    }
+}
+
+$retiredLegacyFiles = @(
+    "apply_channel_branding.py",
+    "render_vertical_9x16.py",
+    "split_compiled_episodes.py",
+    "assemble_master_audio.py",
+    "synthesize_and_audit_pacing.py"
+)
+
+function Remove-RetiredLegacyFiles([string]$Root) {
+    foreach ($rf in $retiredLegacyFiles) {
+        Get-ChildItem -LiteralPath $Root -Recurse -File -Filter $rf -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force
+            Write-Host "prune  $($_.FullName)"
         }
     }
 }
@@ -96,6 +114,7 @@ function Sync-SkillDir([string]$Src, [string]$Dst) {
             # Safely unlink junction/symlink without recursing into its target.
             [System.IO.Directory]::Delete($dstNorm, $false)
             Copy-CleanTree $srcNorm $dstNorm
+            Remove-RetiredLegacyFiles $dstNorm
             Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
             Write-Host "upgrade $dstNorm (junction -> real dir)"
             return
@@ -103,6 +122,7 @@ function Sync-SkillDir([string]$Src, [string]$Dst) {
         if ((Test-Path -LiteralPath $marker) -or $Force) {
             Remove-Item -LiteralPath $dstNorm -Recurse -Force
             Copy-CleanTree $srcNorm $dstNorm
+            Remove-RetiredLegacyFiles $dstNorm
             Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
             Write-Host "sync   $dstNorm"
             return
@@ -112,6 +132,7 @@ function Sync-SkillDir([string]$Src, [string]$Dst) {
     }
 
     Copy-CleanTree $srcNorm $dstNorm
+    Remove-RetiredLegacyFiles $dstNorm
     Set-Content -LiteralPath $marker -Value $srcNorm -Encoding UTF8
     Write-Host "copy   $dstNorm"
 }
@@ -188,6 +209,14 @@ foreach ($s in $expectedSkills) {
     $sMd = Join-Path $sDir "SKILL.md"
     $isReparse = (Test-Path -LiteralPath $sDir) -and (((Get-Item -LiteralPath $sDir -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
     if ((Test-Path -LiteralPath $sMd) -and (-not $isReparse)) {
+        if (Test-Path -LiteralPath (Join-Path $sDir ".aicn-managed")) {
+            foreach ($ret in $retiredLegacyFiles) {
+                $hit = Get-ChildItem -LiteralPath $sDir -Recurse -File -Filter $ret -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($hit) {
+                    throw "AGY skill check failed for '$s': retired legacy file still present at $($hit.FullName)"
+                }
+            }
+        }
         $okSkills++
     } else {
         throw "AGY skill check failed for '$s' at $sDir (missing SKILL.md or still a reparse point)"

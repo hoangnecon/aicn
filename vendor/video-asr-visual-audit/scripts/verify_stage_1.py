@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Stage 1 CI/CD Gate Validator (verify_stage_1.py).
-Verifies:
-  1. Audio stem readiness (Demucs no_vocals.wav / accomp.wav in voice_dub mode, or source audio in sub_only mode) (20 pts)
-  2. Fine-grained Whisper ASR clauses (median duration <= 2.8s, 0 unresolved [GAP_VISUAL_SUB] placeholders) (30 pts)
-  3. Acoustic waveform voice coverage >= 90% with 0 bloated / 0 premature lead-in segments (25 pts)
-  4. Visual keyframe audit completion (>= 10 frames extracted, SHA-256 verified, and logged in 01_visual_audit_notes.md) (25 pts)
+Stage 1 CI/CD Gate Validator (verify_stage_1.py, v3.0.0 — voice_dub only).
+Verifies 4 hard deterministic gates (100 points total):
+  1. stems_ready (20 pts): media/stems/{vocals,accomp}.wav valid and matching source duration.
+  2. asr_monotonic_and_clean (25 pts): fine-grained clauses (median <= 2.8s), 0 overlaps/inversions
+     (0 <= start[i] < end[i] <= start[i+1] - 0.02), 0 <0.15s runts, 0 boundary duplicate fragments,
+     and 0 empty/placeholder texts.
+  3. acoustic_waveform_voice_coverage (30 pts): >= 90% acoustic burst coverage, 0 bloated,
+     0 premature lead-in, longest_uncovered_vocal_gap_s <= 6.0s.
+  4. visual_audit_frames_inspected_and_logged (25 pts): >= 10 frames intact (SHA-256 verified)
+     and documented in 01_visual_audit_notes.md.
 Writes workspace/<slug>/.cicd/stage_1_gate.json only on 100/100 PASS.
 """
 import argparse
@@ -13,14 +17,26 @@ import json
 import os
 import sys
 import numpy as np
+import soundfile as sf
 
-ORCH_SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "video-localization-orchestrator", "scripts"))
-sys.path.insert(0, ORCH_SCRIPTS)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+ORCH_SCRIPTS = os.path.abspath(os.path.join(_HERE, "..", "..", "video-localization-orchestrator", "scripts"))
+for _p in (
+    ORCH_SCRIPTS,
+    os.path.abspath(os.path.join(_HERE, "..", "..", "..", "scripts")),
+    os.path.abspath(os.path.join(_HERE, "..", "..", "aicn", "scripts")),
+):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 from cicd_gate import require_gate, write_gate_token, sha256_file
+try:
+    import aicn_platform as ap  # noqa: F401
+except ImportError:
+    ap = None
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Verify Stage 1 (ASR, Hardsub BBox Scan, Phone/Whisper Gap Coverage & Visual Audit) CI/CD Gate.")
+    parser = argparse.ArgumentParser(description="Verify Stage 1 (Demucs Stems, Multi-Band ASR, Monotonic Acoustic Alignment & Visual Audit) CI/CD Gate.")
     parser.add_argument("--workspace", required=True, help="Workspace path (workspace/<slug>).")
     args = parser.parse_args()
 
@@ -31,68 +47,104 @@ def main():
         profile = json.load(f)
     vid_dur = float(profile.get("duration", 0.0))
     loc_mode = profile.get("localization_mode", "voice_dub")
+    if loc_mode != "voice_dub":
+        sys.exit(f"[CI/CD GATE BLOCKED] AICN v3.0.0 requires localization_mode='voice_dub' (found '{loc_mode}').")
 
     checks = []
-    metrics = {"localization_mode": loc_mode}
+    metrics = {"localization_mode": "voice_dub"}
 
-    # 1. Check audio stem readiness (aicn_audio.py media/stems/accomp.wav or legacy media/demucs/no_vocals.wav)
-    stems_acc = os.path.join(ws, "media", "stems", "accomp.wav")
-    legacy_acc = os.path.join(ws, "media", "demucs", "no_vocals.wav")
-    no_vocals = stems_acc if os.path.exists(stems_acc) else legacy_acc
-    if loc_mode == "sub_only":
-        src_vid = profile.get("source_video", "")
-        has_bgm = os.path.exists(src_vid) or (os.path.exists(no_vocals) and os.path.getsize(no_vocals) > 100_000)
-        bgm_detail = f"sub_only mode: native source audio ready ({src_vid})"
-    else:
-        has_bgm = os.path.exists(no_vocals) and os.path.getsize(no_vocals) > 100_000
-        bgm_detail = f"voice_dub mode: path={no_vocals}, size={os.path.getsize(no_vocals) if os.path.exists(no_vocals) else 0} bytes"
+    # 1. Stems readiness (media/stems/{vocals,accomp}.wav valid & matching duration)
+    voc_p = os.path.join(ws, "media", "stems", "vocals.wav")
+    acc_p = os.path.join(ws, "media", "stems", "accomp.wav")
+    min_stem_bytes = 100_000 if vid_dur > 5.0 else 4_096
+    stems_ok = False
+    stems_detail = f"missing media/stems/{{vocals,accomp}}.wav"
+    if os.path.exists(voc_p) and os.path.exists(acc_p):
+        v_sz, a_sz = os.path.getsize(voc_p), os.path.getsize(acc_p)
+        dur_match = True
+        dur_note = ""
+        try:
+            v_info = sf.info(voc_p)
+            a_info = sf.info(acc_p)
+            if vid_dur > 0.5:
+                dur_match = (abs(v_info.duration - vid_dur) <= 1.5) and (abs(a_info.duration - vid_dur) <= 1.5)
+            dur_note = f", v_dur={v_info.duration:.2f}s, a_dur={a_info.duration:.2f}s (src={vid_dur:.2f}s)"
+        except Exception as exc:
+            dur_match = False
+            dur_note = f", wav_err={exc}"
+        stems_ok = (v_sz > min_stem_bytes) and (a_sz > min_stem_bytes) and dur_match
+        stems_detail = f"vocals={v_sz}B, accomp={a_sz}B{dur_note}"
 
     checks.append({
-        "id": "audio_stem_or_native_source_ready",
-        "description": "Separated BGM stem (voice_dub) or native stereo source audio (sub_only) is ready",
+        "id": "stems_ready",
+        "description": "media/stems/{vocals,accomp}.wav exist, non-empty, and match source duration",
         "weight": 20,
-        "passed": has_bgm,
-        "detail": bgm_detail
+        "passed": stems_ok,
+        "detail": stems_detail,
     })
 
-    # 2. Check fine-grained ASR segments & zero unresolved [GAP_VISUAL_SUB] placeholders
+    # 2. ASR monotonic, clean & deduplicated
+    from analyze_voice_waveform import (
+        analyze_waveform_and_clauses,
+        find_boundary_duplicate_pairs,
+        find_timestamp_violations,
+    )
+
     asr_path = os.path.join(ws, "data", "01_asr_raw_segments.json")
     asr_ok = False
     asr_detail = "Missing data/01_asr_raw_segments.json"
     asr_segs = []
-    unresolved_gaps = []
+    ts_violations = []
+    dup_pairs = []
+    bad_texts = []
+    min_segs_required = 10 if vid_dur >= 30.0 else 1
+
     if os.path.exists(asr_path):
         with open(asr_path, "r", encoding="utf-8") as f:
             asr_segs = json.load(f)
-        if len(asr_segs) >= 10:
+        if len(asr_segs) >= min_segs_required:
             durs = [float(s["end"]) - float(s["start"]) for s in asr_segs]
             med_dur = float(np.median(durs))
-            max_dur = float(np.max(durs))
             for s in asr_segs:
-                txt = s.get("text", "").strip()
-                if (not txt) or ("[GAP_VISUAL_SUB" in txt):
-                    unresolved_gaps.append(f"Seg #{s.get('id')} ({s.get('start')}s-{s.get('end')}s)")
+                txt = (s.get("text") or "").strip()
+                if (not txt) or ("[GAP_" in txt):
+                    bad_texts.append(f"Seg #{s.get('id')} ({s.get('start')}s-{s.get('end')}s)")
+            ts_violations = find_timestamp_violations(asr_segs, min_dur_s=0.15, min_gap_s=0.02)
+            dup_pairs = find_boundary_duplicate_pairs(asr_segs, gap_thresh_s=0.35)
+
             metrics["asr_segment_count"] = len(asr_segs)
             metrics["asr_median_duration_s"] = round(med_dur, 3)
-            metrics["unresolved_gap_placeholders"] = len(unresolved_gaps)
-            asr_ok = (med_dur <= 2.8) and (len(unresolved_gaps) == 0)
+            metrics["timestamp_violations_count"] = len(ts_violations)
+            metrics["boundary_duplicates_count"] = len(dup_pairs)
+            metrics["unresolved_gap_placeholders"] = len(bad_texts)
+
+            asr_ok = (
+                (med_dur <= 2.8)
+                and (len(bad_texts) == 0)
+                and (len(ts_violations) == 0)
+                and (len(dup_pairs) == 0)
+            )
             asr_detail = (
                 f"count={len(asr_segs)}, median_dur={med_dur:.2f}s (<=2.8s), "
-                f"unresolved_gaps={len(unresolved_gaps)} {unresolved_gaps[:3]}"
+                f"ts_violations={len(ts_violations)} {ts_violations[:2]}, "
+                f"boundary_dups={len(dup_pairs)} {dup_pairs[:2]}, "
+                f"bad_texts={len(bad_texts)} {bad_texts[:2]}"
             )
+        else:
+            asr_detail = f"Only {len(asr_segs)} segments (need >= {min_segs_required})"
+
     checks.append({
-        "id": "asr_fine_grained_clauses_and_no_placeholders",
-        "description": "ASR segments are fine-grained clauses (median <= 2.8s) with 0 unresolved [GAP_VISUAL_SUB] placeholders",
-        "weight": 30,
+        "id": "asr_monotonic_and_clean",
+        "description": "ASR clauses have median <= 2.8s, 0 overlaps/inversions/runts, 0 boundary duplicates, and 0 empty/placeholder texts",
+        "weight": 25,
         "passed": asr_ok,
-        "detail": asr_detail
+        "detail": asr_detail,
     })
 
-    # 3. Acoustic Waveform Voice Coverage (no hardsub bbox scan required in v2.0.0)
+    # 3. Acoustic Waveform Voice Coverage & Gap Bound
     ac_ok = False
     ac_detail = "Missing data/01_asr_raw_segments.json"
     if os.path.exists(asr_path):
-        from analyze_voice_waveform import analyze_waveform_and_clauses
         wf_report = analyze_waveform_and_clauses(ws, asr_path)
         bloated_cnt = wf_report["bloated_segments_count"]
         premature_cnt = wf_report.get("premature_lead_segments_count", 0)
@@ -114,24 +166,25 @@ def main():
             (ac_ratio >= 0.90)
             and (bloated_cnt == 0)
             and (premature_cnt == 0)
-            and (len(unresolved_gaps) == 0)
+            and (max_gap_s <= 6.0)
+            and (len(bad_texts) == 0)
         )
         ac_detail = (
-            f"acoustic_cov={ac_ratio*100:.1f}% (need >=90.0%), bursts={ac_bursts}, uncovered={uncov_ac}, "
-            f"max_unprobed_vocal_gap={max_gap_s:.1f}s, pass2b_rec={p2b_sum.get('recovered_total', 0)} "
+            f"acoustic_cov={ac_ratio*100:.1f}% (>=90.0%), bursts={ac_bursts}, uncovered={uncov_ac}, "
+            f"max_unprobed_vocal_gap={max_gap_s:.1f}s (<=6.0s), pass2b_rec={p2b_sum.get('recovered_total', 0)} "
             f"({p2b_sum.get('recovered_by_band', {})}), "
-            f"bloated={bloated_cnt} (need 0), premature_lead={premature_cnt} (need 0)"
+            f"bloated={bloated_cnt}, premature_lead={premature_cnt}"
         )
 
     checks.append({
         "id": "acoustic_waveform_voice_coverage",
-        "description": ">= 90% of acoustic voice bursts are covered by ASR segments with 0 bloated or premature lead-in segments",
-        "weight": 25,
+        "description": ">= 90% acoustic burst coverage, longest unprobed vocal gap <= 6.0s, 0 bloated and 0 premature lead-in segments",
+        "weight": 30,
         "passed": ac_ok,
-        "detail": ac_detail
+        "detail": ac_detail,
     })
 
-    # 5. Check visual audit frames manifest & 01_visual_audit_notes.md cross-check
+    # 4. Visual audit frames manifest & 01_visual_audit_notes.md cross-check
     manifest_path = os.path.join(ws, "data", "01_extracted_audit_manifest.json")
     notes_path = os.path.join(ws, "01_visual_audit_notes.md")
     audit_ok = False
@@ -160,20 +213,20 @@ def main():
         if audit_ok:
             audit_detail = f"All {len(frames_list)} extracted keyframes verified on disk and documented in 01_visual_audit_notes.md"
         else:
-            audit_detail = f"extracted={len(frames_list)} (need >=10), missing_files={missing_on_disk}, unlogged_in_md={unlogged_in_md}"
+            audit_detail = f"extracted={len(frames_list)} (>=10), missing_files={missing_on_disk}, unlogged_in_md={unlogged_in_md}"
 
     checks.append({
         "id": "visual_audit_frames_inspected_and_logged",
         "description": ">=10 audit keyframes extracted, SHA-256 verified, and documented in 01_visual_audit_notes.md",
         "weight": 25,
         "passed": audit_ok,
-        "detail": audit_detail
+        "detail": audit_detail,
     })
 
     write_gate_token(
         workspace=ws,
         stage=1,
-        stage_name="Multi-Pass Whisper ASR, Acoustic Waveform Audit & Visual Keyframe Audit",
+        stage_name="Multi-Band Whisper ASR, Monotonic Acoustic Alignment & Visual Keyframe Audit",
         checks=checks,
         metrics=metrics,
         artifact_paths=[

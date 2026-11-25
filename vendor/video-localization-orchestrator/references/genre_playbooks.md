@@ -1,64 +1,48 @@
-# Generalized Video Localization Playbooks by Genre & Format
+# Generalized Video Localization Playbooks by Genre & Format (`v3.0.0`)
 
-This reference manual defines the exact parameter matrices, voice personas, subtitle geometries, and audio mixing curves across different video genres and aspect ratios.
+This manual defines the `v3.0.0` parameter matrices, voice personas, pacing limits, and mixing defaults across supported video genres and aspect ratios. Every project runs in mandatory **`voice_dub`** mode (full Vietnamese dubbing + dual-corner watermark + external `.srt`).
 
 ---
 
-## 1. Genre Configuration Matrix
+## 1. Genre Configuration Matrix (`voice_dub` Everywhere)
 
-| Parameter | `tech-review` (Bilibili / YouTube Tech, AI, Hardware) | `short-drama` (Multi-Character AI Sci-Fi / Thriller / Drama) | `documentary` (Finance, History, Deep Essays) | `tutorial` (Coding, Software UI Walkthroughs) |
+| Parameter | `short-drama` (Chinese / English AI & Live-Action Dramas) | `tech-review` (Bilibili / Tech, AI, Hardware) | `documentary` (Finance, History, Deep Essays) | `tutorial` (Coding, Software UI Walkthroughs) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Default Localization Mode (`--mode`)** | `voice_dub` (Vietnamese TTS narration + BGM ducking) | `sub_only` (Keep original voice acting/SFX + full ViSub; `voice_dub` optional) | `voice_dub` (or `sub_only` for archival interviews) | `voice_dub` |
-| **Default Overlay Style (`--overlay-style`)** | `frosted_glass` or `solid_pill` | `frosted_glass` (sleek compact translucent glass blur) | `frosted_glass` | `frosted_glass` |
-| **Target Clause Duration** | `1.5s – 3.5s` | `0.8s – 2.5s` (fast dialogue turns & phone calls) | `2.0s – 4.0s` (measured cadence) | `1.2s – 3.0s` (locked to mouse clicks) |
-| **Target Syllable Rate** | `4.5 – 5.2 syl/s` (max `6.2`) | `4.0 – 6.2 syl/s` (max `7.8` in `sub_only` fast arguments) | `4.0 – 4.8 syl/s` (max `5.6`) | `4.5 – 5.4 syl/s` (max `6.2`) |
-| **Max Tempo Ratio (`atempo`)** | `<= 1.24x` (median `~1.05x–1.14x`) | `<= 1.18x` (emotional pitch sensitive) | `<= 1.16x` (preserve gravitas) | `<= 1.24x` |
-| **Inter-Clause Breathing Pause** | `0.18s – 0.28s` (`mean ~0.22s`) | `0.10s – 0.25s` (tight turn-taking) | `0.25s – 0.45s` (dramatic pauses) | `0.15s – 0.25s` |
-| **Default `VieNeu-TTS` Voice** | `Hải Đăng` (clear, analytical male) | Multi-voice mapping (`speaker_id` -> `Hải Đăng`, `Ngọc`, `Bình`, `Tuyên`) | `Hải Đăng` or `Bình` | `Hải Đăng` |
-| **BGM Gain (Active Speech)** | `0.28` (`-11 dB` ducking) | `0.35` (preserve dramatic tension & SFX) | `0.25` | `0.18` (ultra-clear instruction) |
-| **BGM Gain (Pauses / Swells)** | `0.65` | `0.80` (full dramatic stingers) | `0.70` | `0.40` |
-| **Max Subtitle Lines** | `2` balanced lines (`<= 84 chars`) | `2` short lines (`<= 44 chars` total for 9:16) | `2` balanced lines (`<= 84 chars`) | `1–2` compact lines (`<= 76 chars`) |
+| **Localization Mode (`--mode`)** | **`voice_dub`** (mandatory) | **`voice_dub`** (mandatory) | **`voice_dub`** (mandatory) | **`voice_dub`** (mandatory) |
+| **Target Clause Duration** | `0.8s – 2.5s` (fast dialogue turns & phone calls) | `1.5s – 3.5s` | `2.0s – 4.0s` (measured cadence) | `1.2s – 3.0s` (locked to UI cues) |
+| **Target Syllable Rate (`Stage 2`)** | `4.5 – 5.6 syl/s` (hard ceiling `6.8 syl/s`) | `4.5 – 5.2 syl/s` (hard ceiling `6.8`) | `4.0 – 5.0 syl/s` (hard ceiling `6.8`) | `4.5 – 5.4 syl/s` (hard ceiling `6.8`) |
+| **Rubberband R3 Tempo Range (`Stage 3`)** | `base = 1.08x`, `max = 1.28x` (`1.32x` for `<= 2`-syl) | `base = 1.08x`, `max = 1.28x` | `base = 1.08x`, `max = 1.28x` | `base = 1.08x`, `max = 1.28x` |
+| **Continuous Utterance Grouping** | Same speaker & voice, `gap <= 0.12s`, `<= 3` clauses, `span <= 4.5s` | Same speaker & voice, `gap <= 0.12s`, `<= 3` clauses, `span <= 4.5s` | Same speaker & voice, `gap <= 0.12s`, `<= 3` clauses, `span <= 4.5s` | Same speaker & voice, `gap <= 0.12s`, `<= 3` clauses, `span <= 4.5s` |
+| **Default `VieNeu-TTS` Voice** | `Trúc Ly` / `series_bible.json` mapping (`Ngọc`, `Hải Đăng`, `Bình`, `Tuyên`) | `Hải Đăng` (crisp analytical male) | `Hải Đăng` or `Bình` | `Hải Đăng` |
+| **Vocal Carving (`config/audio_mix.json`)** | `base_vocal_db = -10.0`, `speech_vocal_dip_db = -16.0`, `floor_vocal_db = -24.0`, `snr_vocal_db = 14.0` | `base_vocal_db = -10.0`, `speech_vocal_dip_db = -16.0`, `floor_vocal_db = -24.0` | `base_vocal_db = -10.0`, `speech_vocal_dip_db = -16.0`, `floor_vocal_db = -24.0` | `base_vocal_db = -10.0`, `speech_vocal_dip_db = -16.0`, `floor_vocal_db = -24.0` |
+| **BGM / SFX Ducking (`accomp.wav`)** | `snr_bgm_db = 6.0`, `floor_bgm_db = -9.0` | `snr_bgm_db = 6.0`, `floor_bgm_db = -9.0` | `snr_bgm_db = 6.0`, `floor_bgm_db = -9.0` | `snr_bgm_db = 8.0`, `floor_bgm_db = -12.0` |
+| **External `.srt` Line Cap** | `<= 96` chars (prefer `<= 64` chars on portrait) | `<= 96` chars (`<= 2` balanced lines) | `<= 96` chars (`<= 2` balanced lines) | `<= 96` chars (`<= 2` compact lines) |
 
 ---
 
-## 2. Aspect Ratio & Resolution Geometry
+## 2. Aspect Ratio & Watermark Scaling (`Stage 4`)
 
-### A. Landscape `16:9` (`1920x1080` or `3840x2160`)
-- **Hardsub Scan Band:** `y = [880..1080]` (`strip_y0 = 880`, `strip_h = 200` on 1080p; scale by `2x` for 4K).
-- **Horizontal Search Window:** `x = [250..1670]` (centered at `X = 960`).
-- **Typography:** `Arial Bold` `36pt`, `line_h = 42px`, `line_gap = 8px`, `max_px = 1150px` per line.
-- **Pill Padding:** `+44px` horizontal padding around Vietnamese text, `+28px` horizontal and `+14px` vertical padding beyond the widest detected original hardsub pixel in that time slot.
+Because `aicn v3.0.0` does not burn in subtitle pills, Stage 4 preserves the native source resolution (`-fps_mode passthrough -sn`) and adapts only the optional dual-corner watermark strip (`aicn.py render --brand-dir <dir>`):
 
-### B. Vertical Short-Form `9:16` (`1080x1920` Douyin / TikTok / Reels / Shorts)
-- **Why 9:16 is different:** The bottom `280px` (`y = [1640..1920]`) is covered by platform UI (caption, audio marquee, progress bar), and the right `140px` (`x = [940..1080]`) is covered by Like/Comment/Share buttons.
-- **Hardsub Scan Band:** Typically `y = [1280..1640]` (`strip_y0 = 1280`, `strip_h = 360`), though some creators place hardsubs at `y = [1150..1500]`. Always run `scan_hardsub_bbox.py` with `--auto-band` on vertical videos first to locate the vertical peak of white/yellow stroke text.
-- **Horizontal Safe Zone:** Center at `X = 540`, maximum pill width `<= 920px` (`x = [80..1000]`), maximum line width `max_px = 780px` (`<= 22–26 characters per line`).
-- **Typography:** `Arial Bold` `42pt`, `line_h = 50px`, `line_gap = 10px`.
+### A. Landscape `16:9` (`1920×1080` or `1280×720`)
+- At `width >= 1200`: scale `= 1.0` (`top_left_x = 42`, `top_left_y = 22`, `top_right_margin_x = 42`, `top_right_y = 58`).
+
+### B. Portrait `9:16` (`1080×1920` or `720×1280`)
+- Automatically scales watermark PNGs and margins proportionally for portrait widths `< 1200` so the top-left brand lockup and top-right credit badge stay crisp and non-overlapping inside the top safe band.
 
 ---
 
 ## 3. Handling Edge-Case Source Videos
 
-### Case 1: Variable Frame Rate (VFR) Videos (`is_vfr == True`)
-Screen recordings and mobile uploads often use Variable Frame Rate (`r_frame_rate = 60/1` while `avg_frame_rate = 28.4/1`). Overlaying a Constant Frame Rate (CFR) `10fps` `.mov` onto a VFR video can drift by `0.5s–2.0s` over 10 minutes.
-- **Mandatory Fix in Stage 0/1:** Normalize the source video to `30fps` CFR before running Stage 1:
-  ```bash
-  ffmpeg -y -i raw_vfr.mp4 -vf "fps=30" -c:v h264_videotoolbox -b:v 6000k -c:a copy normalized_cfr.mp4
-  ```
+### Case 1: Mixed Frame Rates, Stream Order Reversal, or VFR (`init_workspace.py`)
+Mixed batches (e.g., Bilibili `video=0/audio=1` + Douyin `audio=0/video=1`, `25fps` + `30fps`, `HE-AACv2` + `AAC-LC`, `1/15360` + `1/16000` timescales) cause `Non-monotonic DTS` and ghost duration if concatenated raw.
+- `init_workspace.py` checks `(width, height, codec_name, v_profile, v_index, v_time_base, r_fps, avg_fps, sample_rate, channels, a_codec, a_profile)` and normalizes mismatched episodes automatically with `-map 0:v:0 -map 0:a:0`, mode-fps CFR, `setpts=PTS-STARTPTS`, `-avoid_negative_ts make_zero`, and `-video_track_timescale 15360`, verifying summed episode duration against `source/master_source.mp4`.
 
-### Case 2: Colored or Outlined Hardsubs (Yellow, Cyan, Black-on-White)
-Not all original hardsubs are pure white (`RGB > 238`).
-- **White with dark stroke (Bilibili standard):** `(R > 238) & (G > 238) & (B > 238)`.
-- **Bright Yellow hardsubs (Douyin dramas / variety shows):** `(R > 220) & (G > 190) & (B < 90)`.
-- **High-Contrast Dark Stroke Detection:** When background paper/slides are also white (e.g., white document slides at `t=18s` or `t=655s`), pure white thresholding can pick up the white paper background. Use **stroke-pair detection**: a valid subtitle character has bright interior pixels (`L > 230`) immediately adjacent (within `3px`) to dark outline/shadow pixels (`L < 55`). `run_asr_and_scan.py` includes this stroke-aware filter so white paper backgrounds never trigger false full-width boxes.
+### Case 2: Multi-Speaker Dramas (`series_bible.json`)
+When a drama has 2+ speakers:
+1. Assign stable `speaker` IDs (`M1`, `F1`, `M2`, `SYSTEM`, `NARRATOR`) and map each to a VieNeu preset voice in `config/series_bible.json` (default fallback: `Trúc Ly`).
+2. Tag every segment in `data/02_bilingual_script.json` with `"speaker"` (and optional `"voice"` override).
+3. Stage 3 `group_lines()` never merges segments across speaker/voice changes, preserving clean character transitions and speaker separation.
 
-### Case 3: Multi-Speaker Videos (Interviews, Dialogues, Short Dramas)
-When a video has 2+ speakers:
-1. Add `"speaker": "M1" | "F1" | "M2"` to each segment in `data/02_bilingual_script.json`.
-2. Map each speaker ID to a distinct `VieNeu-TTS` preset voice in `synthesize_and_audit_pacing.py` (e.g., `M1 -> "Hải Đăng"`, `F1 -> "Ngọc"`, `M2 -> "Bình"`).
-3. At speaker changes (`seg[i].speaker != seg[i-1].speaker`), enforce a minimum `0.12s` visual/audio separation so voices never overlap unnaturally unless intentional.
-
-### Case 4: Videos Without Burned-In Hardsubs (Clean Feed or Soft-Sub Only)
-If `01_zh_bbox_scan.json` detects `< 5%` of frames with burned-in bottom text:
-- The pill width no longer needs to mask underlying Chinese characters (`half_span_zh = 0`).
-- Size the pill purely to `half_span_vi = max_text_w // 2 + 44` with a slightly softer background opacity (`RGBA = (14, 16, 22, 215)`) since no anti-ghosting mask is required.
+### Case 3: English Source Audio (`--source-lang en`)
+When localizing English short dramas (e.g., from `dd_tool.py`), pass `--source-lang en` to `aicn.py init-series` (or `--source-lang en` to `run_asr_and_scan.py`) so Stage 1 Whisper transcribes English cleanly instead of defaulting to Simplified Chinese.

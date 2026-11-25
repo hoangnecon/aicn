@@ -25,7 +25,7 @@ if _SCRIPTS_DIR not in sys.path:
 import aicn_platform as ap  # noqa: E402
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = SKILL_DIR.parents[1]
+PROJECT_ROOT = ap.find_project_root(SKILL_DIR) or SKILL_DIR.parents[1]
 DOUYIN_REPO = PROJECT_ROOT / "tools" / "Douyin_TikTok_Download_API"
 COOKIE_CACHE = PROJECT_ROOT / "tools" / ".dy_cookies.json"
 FFPROBE = ap.find_tool("ffprobe")
@@ -97,7 +97,7 @@ def mint_guest_cookies(seed_url: str = "https://www.douyin.com/video/77078447071
         raise RuntimeError("Failed to mint Douyin UIFID guest cookie")
 
     COOKIE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    COOKIE_CACHE.write_text(json.dumps({"minted_at": time.time(), "cookies": cookies}, indent=2), encoding="utf-8")
+    ap.atomic_write_json(COOKIE_CACHE, {"minted_at": time.time(), "cookies": cookies})
     return cookies
 
 
@@ -293,19 +293,21 @@ def download_media(url: str, out_path: Path, is_image: bool = False) -> None:
     from curl_cffi import requests
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    r = requests.get(
-        url,
-        impersonate="chrome131",
-        headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    tmp.write_bytes(r.content)
-    if is_image and out_path.suffix.lower() in (".jpg", ".jpeg"):
-        subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", str(tmp), "-q:v", "2", str(out_path)], check=True)
+    try:
+        r = requests.get(
+            url,
+            impersonate="chrome131",
+            headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        tmp.write_bytes(r.content)
+        if is_image and out_path.suffix.lower() in (".jpg", ".jpeg"):
+            subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", str(tmp), "-q:v", "2", str(out_path)], check=True)
+        else:
+            tmp.replace(out_path)
+    finally:
         tmp.unlink(missing_ok=True)
-    else:
-        tmp.rename(out_path)
 
 
 def main() -> int:
@@ -393,8 +395,14 @@ def main() -> int:
         args.out.mkdir(parents=True, exist_ok=True)
         items = []
         if args.mix:
-            res = client.mix_posts(tid, cursor=0, count=20)
-            items = [summarize_aweme(a) for a in (res.get("aweme_list") or [])]
+            cursor = 0
+            while True:
+                res = client.mix_posts(tid, cursor=cursor, count=20)
+                items.extend(summarize_aweme(a) for a in (res.get("aweme_list") or []))
+                if not res.get("has_more") or (args.limit and len(items) >= args.limit):
+                    break
+                cursor = int(res.get("cursor") or 0)
+                time.sleep(0.8)
         else:
             ad = client.detail(tid).get("aweme_detail")
             if ad:

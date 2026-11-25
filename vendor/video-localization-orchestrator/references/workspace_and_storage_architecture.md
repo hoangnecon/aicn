@@ -1,277 +1,161 @@
-# Workspace Initialization, Storage Topology & File Contract Manual
+# Workspace Initialization, Storage Topology & File Contract Manual (`v3.0.0`)
 
-This manual defines the **mandatory directory architecture, storage rules, initialization workflows, and JSON/Markdown templates** for every video localization project. A strict, predictable file layout eliminates 80%+ of agent confusion, duplicate files, path mismatches, and cross-episode inconsistency.
+This manual defines the **mandatory directory architecture, relocation-safe POSIX storage rules, initialization workflows, and JSON/Markdown schemas** for `aicn v3.0.0`.
 
 ---
 
-## 1. Three Standardized Project Topologies (`--topology`)
-
-Before downloading or processing any media, classify the project into one of **3 topologies** and initialize it with `init_workspace.py`:
+## 1. Standardized Project Topologies (`--topology`)
 
 | Topology | Flag | When to Use | Storage Root | Output Deliverables |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Single Video (`single`)** | `--topology single` | 1 standalone video (e.g., Bilibili tech essay, single short film, documentary, tutorial). | `workspace/<slug>/` | `deliverables/16x9/final_<slug>_vi.mp4`<br>`deliverables/9x16/final_<slug>_vi_9x16.mp4`<br>`deliverables/subtitles/<slug>_vi.srt` |
-| **2. Multi-Episode Compilation (`series_compilation`)** | `--topology series_compilation` | 2–15 short episodes (`1.5–8 min` each) merged into a single `15–30 min` movie (e.g., AI short drama Season/Arc compilation). | `workspace/<slug>/` (with raw episodes in `source/episodes/` and merged timeline in `source/master_source.mp4`) | Full compiled movie (`16x9` + `9x16` + `.srt`) **PLUS** auto-split individual episodes in `deliverables/episodes/epXX_*` |
-| **3. Multi-Episode Series Hub (`series_episodic`)** | `--topology series_episodic` | Long series (`20–100+` episodes) processed episode-by-episode or batch-by-batch over time while sharing character names, pronouns (`xưng hô`), voice IDs, and glossary. | Series Hub: `workspace/<series-slug>/`<br>Working Units: `workspace/<series-slug>/units/<unit-slug>/` | Consolidated in Series Hub `workspace/<series-slug>/deliverables/{16x9,9x16,subtitles,episodes}/` |
+| **Series Hub + Working Units (Canonical)** | `--topology series_episodic` | Standard AICN full-series pipeline (`20–150+` episodes split into ~10-ep working slices sharing `series_bible.json`). | Series Hub: `workspace/<series-slug>/`<br>Working Units: `workspace/<series-slug>/units/<unit-slug>/` | `workspace/<series-slug>/deliverables/final_<series-slug>_full_vi.mp4` + `deliverables/subtitles/final_<series-slug>_full_vi.srt` (via `aicn.py merge-series`) |
+| **Multi-Episode Compilation** | `--topology series_compilation` | Standalone compilation of 2–15 short episodes into one workspace. | `workspace/<slug>/` | Unit master `media/final_<slug>_vi.mp4` + `data/subtitles_full.srt` |
+| **Single Video** | `--topology single` | 1 standalone video. | `workspace/<slug>/` | Unit master `media/final_<slug>_vi.mp4` + `data/subtitles_full.srt` |
+
+> **Mandatory Mode & Release Contract:** Every workspace uses **`--mode voice_dub`** (full Vietnamese dubbing + dual-corner watermark + external `.srt`). `init_workspace.py` enforces `voice_dub` across all genres and rejects non-dubbing modes. Working batches under `units/` are internal slices only — never standalone uploads.
 
 ---
 
-## 2. Canonical Directory Tree (`workspace/<slug>/`)
+## 2. Canonical Directory Trees (`v3.0.0`)
 
-Every workspace (whether a standalone project in `workspace/<slug>/` or a unit inside `workspace/<series-slug>/units/<unit-slug>/`) MUST follow this exact directory contract:
-
+### 2.1 Global Content-Addressed Cache (`<project_root>/.cache/`)
+Shared across all hubs/units and immune to folder moves or `aicn.py clean`:
 ```text
-workspace/<slug>/
-├── .cicd/                                   # [LOCKED] Cryptographic SHA-256 CI/CD Gate Tokens
-│   ├── stage_0_gate.json                    # Stage 0: Topology, source media, config & templates gate
-│   ├── stage_1_gate.json                    # Stage 1: Demucs/audio, 5fps bbox, waveform onset & audit gate
-│   ├── stage_2_gate.json                    # Stage 2: Bilingual script, CJK=0, onset lock & IPA gate
-│   ├── stage_3_gate.json                    # Stage 3: 48kHz audio master, pacing tempo & drift=0 gate
-│   ├── stage_4_gate.json                    # Stage 4: Frosted-glass/pill geometry, leak=0 & ProRes 4444 gate
-│   └── stage_5_gate.json                    # Stage 5: Stream check, CV perimeter scan & release promotion gate
-├── config/                                  # [CONFIG & TEMPLATES] Setup parameters, Series Bible & JSON schemas
-│   ├── project_config.json                  # Canonical topology, mode, style, export formats & file path map
-│   ├── series_bible.json                    # Character roster, Pronoun Matrix (xưng hô), Voice IDs & Glossary
-│   └── schemas/                             # Read-only JSON schema templates for agent reference
-│       ├── 01_asr_segment.template.json     # Stage 1 fine-grained clause schema
-│       ├── 02_bilingual_cue.template.json   # Stage 2 dual-layer translation schema
-│       └── 03_aligned_cue.template.json     # Stage 3 locked timing schema
-├── source/                                  # [IMMUTABLE INPUTS] Raw source videos & concatenation manifests
-│   ├── episodes/                            # Raw individual episodes (ep01.mp4, ep02.mp4, ...)
-│   ├── concat_list.txt                      # FFmpeg concat demuxer list (auto-generated for compilations)
-│   └── master_source.mp4                    # Canonical input video read by Stages 1–5
-├── data/                                    # [SINGLE SOURCE OF TRUTH] Structured pipeline JSONs & canonical SRT
-│   ├── 00_video_profile.json                # Probed resolution, FPS, VFR flag, aspect_mode, strip_y0, strip_h
-│   ├── 00_episodes_manifest.json            # Episode timeline map (ep_id, start_s, end_s, timecode_range, sha256)
-│   ├── 01_asr_raw_segments.json             # Onset-clamped, blank-gap-split Chinese clauses (with ep_id)
-│   ├── 01_zh_bbox_scan.json                 # 5fps stroke-validated hardsub bounding boxes + glyph IoU changes
-│   ├── 01_waveform_voice_audit.json         # Acoustic waveform & visual sub-clause coverage report
-│   ├── 01_extracted_audit_manifest.json     # SHA-256 manifest of Stage 1 visual audit frames
-│   ├── 02_bilingual_script.json             # Dual-layer Vietnamese script (sub_text + tts_text + speaker + ep_id)
-│   ├── 03_aligned_subtitles.json            # Final locked slot_start/slot_end & tempo ratios
-│   ├── 04_qa_frames_manifest.json           # Stratified QA frames + SHA-256 hashes
-│   └── subtitles_full.srt                   # Canonical Vietnamese SRT subtitle file
-├── frames/                                  # [VISUAL EVIDENCE] Extracted keyframes for OCR & QA
-│   ├── audit/                               # Stage 1 keyframes for homophone & visual context verification
-│   ├── qa/                                  # Stage 5 16:9 composite verification frames
-│   └── qa_9x16/                             # Stage 5B 9:16 vertical composite verification frames
-├── media/                                   # [INTERMEDIATE & MASTER MEDIA] Audio stems, alpha overlay & renders
-│   ├── source_audio.wav                     # 16kHz mono PCM for acoustic waveform & high-recall ASR
-│   ├── demucs/                              # htdemucs stems (vocals.wav, no_vocals.wav)
-│   ├── tts_segments/                        # 48kHz VieNeu-TTS segment WAVs (seg_0000.wav .. seg_NNNN.wav)
-│   ├── master_audio_48k.wav                 # 48kHz stereo master audio track (TTS+BGM or native stereo)
-│   ├── .staging_final.mp4                   # Locked staging composite prior to Stage 5 gate approval
-│   ├── final_<slug>_vi.mp4                  # Verified 16:9 master MP4
-│   └── final_<slug>_vi_9x16.mp4             # Verified 9:16 vertical master MP4
-├── deliverables/                            # [RELEASE VAULT] Clean user-facing outputs organized by format
-│   ├── 16x9/
-│   │   └── final_<slug>_vi.mp4              # Ready-to-publish 16:9 Landscape MP4
-│   ├── 9x16/
-│   │   └── final_<slug>_vi_9x16.mp4         # Ready-to-publish 9:16 Vertical MP4 (TikTok / Reels / Shorts)
-│   ├── subtitles/
-│   │   └── <slug>_vi.srt                    # Ready-to-publish Vietnamese SRT file
-│   └── episodes/                            # Individual localized episodes (auto-split from compilation)
-│       ├── ep01_<slug>_vi_16x9.mp4
-│       ├── ep01_<slug>_vi_9x16.mp4
-│       └── ep01_<slug>_vi.srt
-├── scripts/                                 # [CODE ONLY] Project-specific Python helper scripts (.py/.sh ONLY)
-├── 00_project_manifest.md                   # Project overview, episode timeline map & CI/CD checklist
-├── 01_visual_audit_notes.md                 # Visual frame OCR table & acoustic phone/whisper audit log
-├── 02_glossary_and_pronunciation.md         # Character roster, pronoun matrix (xưng hô), glossary & IPA rules
-├── 03_pacing_and_audio_report.md            # Audio fidelity & subtitle pacing metrics
-└── 04_qa_review_report.md                   # Final stream verification & visual QA sign-off table
+<project_root>/.cache/
+├── content_hash.db              # SQLite-WAL stat->sha256 index (PRAGMA journal_mode=WAL; busy_timeout=15000)
+├── asr/<stage1_asr_key>.json    # Pure content-SHA256 Stage 1 ASR cache (asr-4.0)
+├── stems/<stems_key>/           # Demucs 48 kHz PCM_16 vocals.wav + accomp.wav (aicn-audio-1.0)
+├── tts_sent/<tts_sent_key>.wav  # Raw VieNeu-TTS utterance WAVs (PCM_16, vieneu-v3-turbo-48k)
+├── rb_stretch/<rb_key>.wav      # Stretched rubberband R3 WAVs (PCM_16, rb3-f-3.0)
+└── wm_overlay/<wm_key>.png      # Pre-composited tight top-band dual-corner watermark strips
 ```
 
----
-
-## 3. Series Hub Architecture for Multi-Episode Projects (`series_episodic`)
-
-When localizing a multi-episode series across multiple sessions or batches (e.g., 30 episodes of an AI drama, or Season 1 + Season 2), store the project under a **Series Hub (`workspace/<series-slug>/`)**:
-
+### 2.2 Series Hub (`workspace/<series-slug>/`)
 ```text
-workspace/<series-slug>/                         # SERIES HUB ROOT (e.g., workspace/drama-quy-khu/)
-├── 00_series_manifest.md                        # Series-wide episode status table & release tracker
+workspace/<series-slug>/
+├── CHANGELOG.md
+├── PROGRESS.md
+├── 00_series_manifest.md
 ├── config/
-│   ├── series_config.json                       # Default genre, localization_mode, export_formats
-│   └── series_bible.json                        # MASTER Character Roster, Pronoun Matrix & World Glossary
-├── source_inbox/                                # Raw downloaded episodes waiting to be assigned to a unit
-│   ├── ep01.mp4
-│   ├── ep02.mp4
-│   └── ...
-├── units/                                       # Independent 6-stage workspaces per Episode or Compilation Batch
-│   ├── s01-ep01-05/                             # Batch compilation of Episodes 1–5 (follows Section 2 tree)
-│   ├── s01-ep06-10/                             # Batch compilation of Episodes 6–10
-│   └── ep11/                                    # Single-episode workspace for Episode 11
-└── deliverables/                                # Consolidated Series Release Vault (all completed units)
-    ├── 16x9/
-    ├── 9x16/
-    ├── subtitles/
-    └── episodes/
+│   ├── rights.json
+│   ├── series_bible.json        # MASTER Character Roster, Pronoun Matrix & Glossary
+│   └── series_config.json       # mode: "voice_dub", genre, source_lang
+├── posters/
+│   ├── cover.jpg
+│   ├── official_poster_<slug>_zh.jpg
+│   └── poster_<slug>_vi_<ratio>_{raw,clean,branded}.png
+├── source_inbox/
+│   ├── raw/                     # Immutable raw downloads
+│   └── batch_01_ep01_10/ ...    # Hardlinked 10-ep input batches
+├── units/
+│   └── unit_01_ep01_10/ ...     # Internal working batches (see Section 2.3)
+├── deliverables/
+│   ├── final_<series-slug>_full_vi.mp4
+│   └── subtitles/final_<series-slug>_full_vi.srt
+└── .cache/
 ```
 
-### Why the Shared `series_bible.json` Is Critical for Multi-Episode Series
-Without `series_bible.json`, an agent working on Episode 2 might translate `陈默` as *"Trần Mặc"* with pronouns *"tôi - Đội trưởng Lâm"*, while in Episode 6 it translates the same character or title differently or changes pronouns to *"em - anh"*.
-- In `series_episodic` mode, every unit's `config/series_bible.json` is linked to the Series Hub's `workspace/<series-slug>/config/series_bible.json`.
-- Before Stage 2 translation begins on any new episode or batch, the agent MUST read `config/series_bible.json` and append any newly introduced characters/terms back into the shared bible.
+### 2.3 Internal Working Batch (`units/<unit-slug>/`)
+```text
+units/<unit-slug>/
+├── .cicd/                                   # Relocation-safe signed gates (`schema_version: "3.0"`)
+│   └── stage_0_gate.json .. stage_5_gate.json
+├── config/
+│   ├── project_config.json                  # Canonical settings (`series_hub_rel: "../.."`, optional `watermark`)
+│   ├── audio_mix.json                       # Optional Stage 3 overrides
+│   ├── series_bible.json                    # Synced copy of hub series_bible.json
+│   └── schemas/                             # 01_asr_segment, 02_bilingual_cue, 03_aligned_cue templates
+├── source/
+│   ├── episodes/                            # ep01.mp4 .. epNN.mp4 (hardlinked, immutable)
+│   ├── concat_list.txt
+│   └── master_source.mp4                    # Canonical input video read by Stages 1–5
+├── data/
+│   ├── 00_video_profile.json                # Resolution, FPS, duration, `source_video: "source/master_source.mp4"`, `localization_mode: "voice_dub"`
+│   ├── 00_episodes_manifest.json            # Episode map (`source_file` in POSIX `/`, sha256, offsets)
+│   ├── 01_asr_raw_segments.json             # Anti-orphan & collar-deduped ASR clauses (`asr-4.0`)
+│   ├── 01_pass2b_recovery_report.json       # Multi-band Pass 2B recovery + `verified_non_speech_gaps`
+│   ├── 01_waveform_voice_audit.json         # Acoustic alignment & strict monotonic audit (`wf-4.0`)
+│   ├── 01_extracted_audit_manifest.json     # Audit frames + content SHA-256
+│   ├── 02_bilingual_script.json             # Dual-layer script (`sub_text` + `tts_text` + `speaker` + `ep_id`)
+│   ├── 03_aligned_subtitles.json            # Per-clause SRT timing + `utterance_id`, `utterance_wav`, `tempo_ratio`
+│   ├── 03_dub_sentences.json                # Indivisible utterance synthesis log & overflow trim advice
+│   ├── 03_mix_stats.json                    # Dub gain, active-frame `dub_snr_speech_db`, vocal/BGM attenuation
+│   ├── 03_mix_report.json                   # 7 Stage 3 gate checks
+│   ├── subtitles_full.srt                   # Unit Vietnamese SRT
+│   └── 04_qa_frames_manifest.json           # Stratified QA frames + content SHA-256
+├── frames/
+│   ├── audit/                               # Stage 1 visual audit frames
+│   └── qa/                                  # Stage 5 QA frames
+├── media/
+│   ├── stems/{vocals,accomp}.wav            # 48 kHz PCM_16 Demucs stems + stems.json
+│   ├── tts_segments/utt_NNNN.wav            # Intact stretched 48 kHz PCM_16 utterance WAVs
+│   ├── audio/{dub_voice,premaster}_48k.wav  # Intermediate Stage 3 WAVs (pruned by `clean`)
+│   ├── master_audio_48k.wav                 # Final -14 LUFS 24-bit stereo master
+│   ├── .staging_render.mp4                  # Stage 4 one-pass hardware render
+│   ├── .staging_final.mp4                   # Hardlink of .staging_render.mp4 for Stage 5 QA
+│   └── final_<unit-slug>_vi.mp4             # Hardlink promoted by verify_stage_5.py
+├── scripts/                                 # Unit-local helper code only (0 .json/.srt allowed)
+├── CHECKLIST.md
+├── CHANGELOG.md
+├── 00_project_manifest.md
+├── 01_visual_audit_notes.md
+├── 02_glossary_and_pronunciation.md
+├── 03_pacing_and_audio_report.md
+└── 04_qa_review_report.md
+```
 
 ---
 
-## 4. Initialization Commands (`init_workspace.py`)
+## 3. Initialization Commands (`init_workspace.py`)
 
-### Case A: Single Video (`--topology single`)
+### Case A: Series Hub + Working Unit (`--topology series_episodic`, Canonical)
 ```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python \
-  .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
-  --topology single \
-  --video "bilibili/input.mp4" \
-  --slug "bilibili-anthropic-distill" \
-  --genre "tech-review" \
-  --mode "voice_dub" \
-  --overlay-style "solid_pill" \
-  --export-formats "16x9"
-```
+$AICN_PY <aicn>/scripts/aicn.py init-series \
+  --series-slug "nam-18-tuoi-toi-che-tao-than-khi" \
+  --title-vi "Năm 18 Tuổi Tôi Chế Tạo Thần Khí" \
+  --title-zh "那年十八我造神器" \
+  --total-episodes 80 \
+  --rights "own"
 
-### Case B: Multi-Episode Compilation (`--topology series_compilation`)
-Pass `--episodes-dir` (a folder containing `ep01.mp4`, `ep02.mp4`, ...) OR `--episodes ep01.mp4 ep02.mp4 ...`.
-`init_workspace.py` will automatically copy/link the episodes into `source/episodes/`, probe and verify stream compatibility, generate `source/concat_list.txt`, concatenate them into `source/master_source.mp4`, and write `data/00_episodes_manifest.json` with exact timeline boundaries:
-```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python \
-  .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
-  --topology series_compilation \
-  --episodes-dir "downloads/quy_khu_s01" \
-  --slug "drama-quy-khu-s01" \
-  --genre "short-drama" \
-  --mode "sub_only" \
-  --overlay-style "frosted_glass" \
-  --export-formats "16x9,9x16"
-```
-
-### Case C: Multi-Episode Series Hub + Working Unit (`--topology series_episodic`)
-Creates/updates the Series Hub at `workspace/<series-slug>/` and initializes a working unit at `workspace/<series-slug>/units/<unit-slug>/`:
-```bash
-/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python \
-  .agents/skills/video-localization-orchestrator/scripts/init_workspace.py \
+$AICN_PY <aicn>/vendor/video-localization-orchestrator/scripts/init_workspace.py \
   --topology series_episodic \
-  --series-slug "drama-quy-khu" \
-  --unit-slug "batch-01-ep01-05" \
-  --episodes-dir "workspace/drama-quy-khu/source_inbox/batch01" \
+  --series-slug "nam-18-tuoi-toi-che-tao-than-khi" \
+  --unit-slug "unit_01_ep01_10" \
+  --episodes-dir "workspace/nam-18-tuoi-toi-che-tao-than-khi/source_inbox/batch_01_ep01_10" \
   --genre "short-drama" \
-  --mode "sub_only" \
-  --overlay-style "frosted_glass" \
-  --export-formats "16x9,9x16"
+  --mode "voice_dub"
+
+$AICN_PY <aicn>/scripts/aicn.py adopt \
+  --unit "workspace/nam-18-tuoi-toi-che-tao-than-khi/units/unit_01_ep01_10"
 ```
 
-### Case D: Retrofit / Upgrade an Existing Workspace (`--sync-existing`)
-If a workspace was created with an older layout, run `init_workspace.py --sync-existing --workspace workspace/<slug>` to provision `config/`, `source/`, `deliverables/`, `data/00_episodes_manifest.json`, and `config/schemas/` without overwriting completed translations or renders.
-
----
-
-## 5. JSON Schema Templates (`config/schemas/`)
-
-`init_workspace.py` writes 3 canonical JSON templates into `config/schemas/` so the agent never guesses field names:
-
-### 5.1 `data/00_episodes_manifest.json`
-```json
-{
-  "slug": "drama-quy-khu-s01",
-  "topology": "series_compilation",
-  "total_episodes": 2,
-  "total_duration_s": 1009.15,
-  "master_source": "source/master_source.mp4",
-  "episodes": [
-    {
-      "ep_index": 1,
-      "ep_id": "ep01",
-      "title": "Part 1 (Tập 1–3)",
-      "source_file": "source/episodes/ep01.mp4",
-      "duration_s": 491.77,
-      "timeline_start_s": 0.0,
-      "timeline_end_s": 491.77,
-      "timecode_start": "00:00:00.000",
-      "timecode_end": "00:08:11.770",
-      "width": 1920,
-      "height": 1080,
-      "fps": 30.0
-    },
-    {
-      "ep_index": 2,
-      "ep_id": "ep02",
-      "title": "Part 2 (Tập 4–5)",
-      "source_file": "source/episodes/ep02.mp4",
-      "duration_s": 517.38,
-      "timeline_start_s": 491.77,
-      "timeline_end_s": 1009.15,
-      "timecode_start": "00:08:11.770",
-      "timecode_end": "00:16:49.150",
-      "width": 1920,
-      "height": 1080,
-      "fps": 30.0
-    }
-  ]
-}
+### Case B: Single Video or Compilation
+```bash
+$AICN_PY <aicn>/vendor/video-localization-orchestrator/scripts/init_workspace.py \
+  --topology single \
+  --video "downloads/input.mp4" \
+  --slug "my-video" \
+  --genre "tech-review" \
+  --mode "voice_dub"
 ```
 
-### 5.2 `config/series_bible.json`
-```json
-{
-  "series_slug": "drama-quy-khu",
-  "title_zh": "诡区",
-  "title_vi": "Quỷ Khu",
-  "genre": "short-drama",
-  "localization_mode": "voice_dub",
-  "characters": [
-    {
-      "speaker_id": "M1",
-      "name_zh": "外卖员 / 男主",
-      "name_vi": "Chàng shipper (Nam chính)",
-      "role": "Protagonist / Survivor",
-      "voice_id": "Hải Đăng",
-      "default_self_pronoun": "tôi",
-      "notes": "Calm, observant under life-or-death rules"
-    }
-  ],
-  "pronoun_matrix": [
-    {
-      "from_speaker": "M1",
-      "to_speaker": "COMMANDER",
-      "self_pronoun": "tôi",
-      "address_pronoun": "Đội trưởng / Ngài",
-      "register": "Formal military/investigation"
-    }
-  ],
-  "glossary": [
-    {
-      "zh": "诡区",
-      "vi": "Quỷ Khu",
-      "tts_text": "Quỷ Khu",
-      "category": "World-building"
-    }
-  ]
-}
-```
-
-### 5.3 `data/02_bilingual_script.json` Item Schema (`config/schemas/02_bilingual_cue.template.json`)
-```json
-{
-  "id": 0,
-  "ep_id": "ep01",
-  "speaker": "M1",
-  "audio_type": "normal_speech",
-  "raw_ids": [0],
-  "start": 7.2,
-  "end": 8.6,
-  "zh_text": "你好 外卖到了",
-  "sub_text": "Xin chào, đồ ăn giao tới rồi,",
-  "tts_text": "Xin chào, đồ ăn giao tới rồi,"
-}
+### Case C: Upgrade / Retrofit an Existing Workspace (`--sync-existing`)
+```bash
+$AICN_PY <aicn>/vendor/video-localization-orchestrator/scripts/init_workspace.py \
+  --sync-existing \
+  --workspace "workspace/<series>/units/<unit>"
 ```
 
 ---
 
-## 6. Five Golden Storage Rules (Enforced by CI/CD Validators)
+## 4. Relocation-Safe Relative Paths & Golden Rules
 
-1. **Zero Stray Data in `scripts/`:** `scripts/` is strictly for `.py` and `.sh` code. Never save `.json` or `.srt` files inside `scripts/`. All JSON state files belong in `data/`.
-2. **Never Write Temp Files to `/tmp` or Project Root:** All intermediate files belong inside `workspace/<slug>/media/` or `workspace/<slug>/data/`.
-3. **Immutable `source/` Directory:** Once `source/master_source.mp4` and `source/episodes/*.mp4` are ingested and hashed into `.cicd/stage_0_gate.json`, never overwrite them with rendered outputs.
-4. **Staging before Release:** Composite outputs always write to `media/.staging_final.mp4` first. Only `verify_stage_5.py` promotes to `media/final_<slug>_vi.mp4` and publishes hardlinks into `deliverables/16x9/`, `deliverables/9x16/`, and `deliverables/subtitles/`.
-5. **Multi-Episode Post-Split (`split_compiled_episodes.py`):** When `topology == "series_compilation"` and `total_episodes >= 2`, run `split_compiled_episodes.py --workspace workspace/<slug>` after Stage 5 to populate `deliverables/episodes/epXX_<slug>_vi_16x9.mp4`, `epXX_<slug>_vi_9x16.mp4`, and re-zeroed `epXX_<slug>_vi.srt`.
+1. **Zero Absolute Workspace Paths in Metadata or Gates:**
+   - `00_video_profile.json` writes `"source_video": "source/master_source.mp4"`.
+   - `00_episodes_manifest.json` uses POSIX `/` paths.
+   - `project_config.json` uses `"series_hub_rel": "../.."`.
+   - `.cicd/stage_N_gate.json` (`schema_version: "3.0"`) records `"workspace_slug"` and relative POSIX artifact keys hashed with `ap.content_sha256`.
+2. **Zero Stray Data in `scripts/`:** `scripts/` holds code only; structured JSONs and SRTs live in `data/`.
+3. **Immutable `source/` & `source_inbox/`:** Rebuilding `master_source.mp4` invalidates Stage 1 and downstream outputs.
+4. **Staging Before Promotion:** Stage 4 renders to `media/.staging_render.mp4`; Stage 5 hardlinks to `media/.staging_final.mp4` and promotes `media/final_<unit>_vi.mp4` only after `verify_stage_5.py` scores `100/100`.
+5. **Single Full-Series Release (`merge-series`):** Once ALL batches read `PPPPPP`, `aicn.py merge-series --hub <hub>` reads `units/<u_slug>/media/final_*_vi.mp4` and `units/<u_slug>/data/subtitles_full.srt` to produce `deliverables/final_<series>_full_vi.mp4` and `deliverables/subtitles/final_<series>_full_vi.srt`.

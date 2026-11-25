@@ -347,7 +347,7 @@ function resolveBin(name, envKey) {
   }
   const exe = process.platform === 'win32' ? `${name}.exe` : name;
   const candidates = process.platform === 'win32'
-    ? [path.join(os.homedir(), '.local', 'bin', exe)]
+    ? [path.join(os.homedir(), '.local', 'bin', exe), path.join('C:\\ffmpeg\\bin', exe)]
     : [`/opt/homebrew/bin/${name}`, `/usr/local/bin/${name}`, path.join(os.homedir(), '.local', 'bin', name)];
   for (const cand of candidates) {
     if (fs.existsSync(cand)) return cand;
@@ -941,7 +941,7 @@ async function cmdDownload(positional, flags) {
       const contentType = String(ep.content_type || ep.contentType || defaultContentType || '1004');
       const outFile = path.join(outDir, `ep_${String(epNum).padStart(3, '0')}.mp4`);
 
-      if (fs.existsSync(outFile) && probeDuration(outFile) > 5) {
+      if (fs.existsSync(outFile) && probeDuration(outFile) > 1) {
         console.log(`[${i + 1}/${wanted.length}] SKIP ep_${String(epNum).padStart(3, '0')}.mp4 (already valid)`);
         skipped++;
         continue;
@@ -1010,25 +1010,32 @@ async function cmdDownload(positional, flags) {
         if (play.userAgent || UA) reqHeaders['User-Agent'] = play.userAgent || UA;
         if (play.referer) reqHeaders.Referer = play.referer;
 
-        const resp = await fetch(url, { headers: reqHeaders });
+        const resp = await fetch(url, { headers: reqHeaders, signal: AbortSignal.timeout(30000) });
         if (!resp.ok) throw new Error(`CDN HTTP ${resp.status}`);
         const buf = Buffer.from(await resp.arrayBuffer());
         const tmpRaw = `${outFile}.raw.tmp`;
         const tmpOut = `${outFile}.dec.tmp.mp4`;
-        fs.writeFileSync(tmpRaw, buf);
+        try {
+          fs.writeFileSync(tmpRaw, buf);
 
-        if (keyHex) {
-          execFileSync(FFMPEG, [
-            '-y', '-loglevel', 'error',
-            '-decryption_key', keyHex,
-            '-i', tmpRaw,
-            '-c', 'copy',
-            tmpOut,
-          ]);
-          fs.unlinkSync(tmpRaw);
-          fs.renameSync(tmpOut, outFile);
-        } else {
-          fs.renameSync(tmpRaw, outFile);
+          if (keyHex) {
+            execFileSync(FFMPEG, [
+              '-y', '-loglevel', 'error',
+              '-decryption_key', keyHex,
+              '-i', tmpRaw,
+              '-c', 'copy',
+              tmpOut,
+            ]);
+            fs.renameSync(tmpOut, outFile);
+          } else {
+            fs.renameSync(tmpRaw, outFile);
+          }
+        } finally {
+          for (const tmp of [tmpRaw, tmpOut]) {
+            if (fs.existsSync(tmp)) {
+              try { fs.unlinkSync(tmp); } catch {}
+            }
+          }
         }
 
         const dur = probeDuration(outFile);
@@ -1076,16 +1083,18 @@ async function cmdFetchCovers(flags) {
     const jpgPath = path.join(outDir, `${i + 1}_${slug}.jpg`);
     const tmpPath = `${jpgPath}.raw`;
     try {
-      const resp = await fetch(coverUrl);
+      const resp = await fetch(coverUrl, { signal: AbortSignal.timeout(30000) });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       fs.writeFileSync(tmpPath, Buffer.from(await resp.arrayBuffer()));
       execFileSync(FFMPEG, ['-y', '-loglevel', 'error', '-i', tmpPath, '-q:v', '2', jpgPath]);
-      fs.unlinkSync(tmpPath);
       console.log(`[cover] OK ${jpgPath}`);
       ok++;
     } catch (e) {
       console.error(`[cover] FAIL ${slug}: ${e.message}`);
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } finally {
+      if (fs.existsSync(tmpPath)) {
+        try { fs.unlinkSync(tmpPath); } catch {}
+      }
     }
   }
   console.log(`[hg_tool] Covers saved: ${ok}/${items.length} -> ${outDir}`);

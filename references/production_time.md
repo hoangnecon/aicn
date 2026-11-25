@@ -1,62 +1,38 @@
-# Production time (Full-Series Release — Full Dubbing + Subtitles + Watermark)
+# Production Time (`v3.0.0`, Full-Series Release — Full Dubbing + Watermark + Subtitles)
 
-Reference measurement batch: `unit_07_ep61_70` (10 episodes, 609.54 s, 1080p30, 186 lines / 107 sentences, full `voice_dub` mode on Apple M1 8-core / 16 GB).
-**M** = measured directly on this machine (2026-11-19/20). **P** = projected from measured per-batch numbers. **E** = agent/human estimate.
+> **Release rule:** 1 published video = **1 FULL series** (`deliverables/final_<series>_full_vi.mp4`, e.g. 80–134 episodes ≈ 90–145 min).
+> Working batches (`units/*`, ~10 episodes each) are internal processing slices only.
 
-> **Release rule:** 1 published video = **1 FULL series** (`final_<series>_full_vi.mp4`, e.g., 80 episodes ≈ 100 min).
-> Working batches (~10 episodes each) are internal processing slices only.
+## 1. Forensic Baseline (`v2.7.0`) vs `v3.0.0` Redesign
 
-## Per internal working batch (10 episodes, ≈ 10 min of video)
+Measured bottlenecks on a real 13-unit / 134-episode `1080×1920` production run on Windows 11 + NVIDIA RTX 2060 (6 GB VRAM):
 
-| Step | `v1.2.1` (M) | `v1.3.0` (M) | Notes |
+| Bottleneck | Measured in `v2.7.0` | Fixed in `v3.0.0` (`SPEC_V3.md`) | Measured / Target Impact |
 |---|---|---|---|
-| Stage 0 init + adopt | < 30 s | < 30 s | |
-| Stage 1 Demucs stems (`demucs-mlx` Metal / PyTorch CUDA) | 74 s | 74 s | cached for Stage 3 |
-| Stage 1 5 fps hardsub scan | 38.9 s | **0 s (skipped in v2.0.0)** | dub + watermark + translate only |
-| Stage 1 Whisper ASR (MLX Metal / CUDA `float16`) | ~80 s | **~22–28 s** (3.3×) | `word_timestamps=False` (72.0s → 21.6s on 120s warm slice) |
-| Stage 3 VieNeu CPU (`fp32`) + parallel rubberband | ~240 s | **~185–195 s** (+23%) | `tts_workers=2, tts_threads=4` (`gen_RTF` 0.317 → 0.258) |
-| Stage 3 frequency-aware `mix` | 78.8 s (56.5 s compute) | **~21.5 s** (20.5 s compute) | cached-Z `complex64` STFT + piped `lufs()` (2.8–3.7×) |
-| Stage 3 `master` (-14 LUFS) | **115.4 s** | **4.1 s** (**28×**) | native 48 kHz `ebur128 + alimiter` (-14.00 LUFS, -0.80 dBFS) |
-| Stage 4 one-pass render (+ 2-corner watermark) | ~145 s (2 passes) | **~100–108 s** (1 pass) | `videotoolbox` / `nvenc` VBR (or `libx264` CPU fallback), -49% to -63% smaller |
-| Stage 5 hardlink + parallel QA extract | ~12 s (+790 MB copy) | **~4 s** (0 B extra) | hardlink + 4-worker ffmpeg |
-| **Machine time / 10-min batch** | **≈ 13.0 min** | **≈ 7.5 min** (**-42%**) | full dub + full sub + watermark |
+| **Serial GPU lock** | 33 lock waits = **343.6 min** (max **78 min** single wait); 26+ cold model loads | Replaced single-lock serialization with 512 MB-unit `ap.gpu_slot` (`10` slots on RTX 2060: `whisper(5)+demucs(2)+vieneu(2)=9` run concurrently) + warm multi-unit `batch-separate`, `run_asr_and_scan --units`, `batch-all` | Zero serial GPU lock pileups; models load **ONCE** per batch |
+| **Stage 3 VieNeu TTS** | Cold-started 13+ times across units; post-synthesis clause slicing chopped words | Single in-process CUDA `infer_batch(16)` (`4.23s` for 16 sents, `RTF 0.127`, `498 MB` VRAM on RTX 2060) + indivisible utterance placement + global `tts_sent/` & `rb_stretch/` cache | Zero mid-word chops; `cmd_dub` fails fast (`exit 2`) before `cmd_mix` (saving ~28 min across 15 overflowed runs) |
+| **Stage 3 DSP Mix** | **113.8s/unit** avg (8 STFT/iSTFT passes + Python `follow_hold()` loop + `ffmpeg` pipe `lufs()`) | PyTorch Welch `spectral_profile_fast()` + anti-denormal `sosfilt` + in-RAM BS.1770-4 `lufs()` + C-speed chunked `follow_hold()` + PyTorch CPU `torch.stft`/`torch.istft` (`scipy.fft` fallback) combined synthesis | **`11.56s`** measured on 10-min (`600s`) 48 kHz stereo (**9.8× faster**; `dub_snr_speech_db_median = 17.4 dB`, `p10 = 16.48 dB`) |
+| **Stage 3 Master** | Legacy 192 kHz 2-pass `loudnorm` (`115.4s`) | Native 48 kHz `acompressor` + `ebur128` + `alimiter` (`master_mode="fast"`) | **`~4.1s`** (**28× faster**) |
+| **Stage 4 Hardware Render** | **154.7s/unit** (`8.75s` on 30s 1080p30 slice due to dual `-framerate 30 -loop 1` CPU `overlay`) | Pre-composited top-band RGBA PNG (`wm_overlay/` cache) + `-hwaccel cuda` + `overlay_cuda` (or single static `overlay` fallback), lock-free parallel (`AICN_MAX_RENDER_JOBS=2`) | **`2.87s` / 30s** (`10.5×` RT, **3.05× faster** with `overlay_cuda`); **`3.90s` / 30s** (`7.7×` RT single CPU `overlay` fallback) |
+| **Stage 5 QA Extract** | Sequential under `media.lock` | Hardlink `.staging_render.mp4 → .staging_final.mp4` (`0 B`) + 4-worker parallel extract, lock-free | **~3–4s** per unit |
 
-## Full 80-episode series (8 batches, ≈ 100–144 min, full dub + sub + watermark)
+## 2. Measured Hardware Benchmark Reference Points
 
-| Execution mode | Machine wall time | Notes |
+- **VieNeu-TTS v3 Turbo CUDA `infer_batch(16)` (RTX 2060 6 GB):** `4.23s` for 16 sentences (`RTF 0.127`, `3.78 sent/s`, peak VRAM `498 MB`).
+- **Stage 3 Single-STFT DSP Mix (10-min `600s` 48 kHz stereo benchmark):** **`11.56s`** wall time (**9.8× faster** than `113.8s` in `v2.7.0`, `dub_snr_speech_db_median = 17.4 dB`, `p10 = 16.48 dB`, `orig_vocal_atten_db_median_during_dub = -15.36 dB`, `min = -24.0 dB`).
+- **Stage 4 Render Speed (RTX 2060 1080p30, 30s real slice):** `2.87s` (`10.5×` realtime) with `overlay_cuda`, `3.90s` (`7.7×` realtime) with single static CPU `overlay` vs `8.75s` (`3.4×` realtime) in `v2.7.0`.
+- **Stage 4 Output File Size & Visual Quality (Apple Silicon VideoToolbox 60s 1080p30 slice, `1.01 Mbps` HEVC source):**
+  - `h264` (`-q:v 58`, default + dual watermark): `19.00 MB / 60s` (`≈ 1.86 GB / 100 min`, SSIM `0.988`).
+  - `hevc` (`-q:v 60 -tag:v hvc1` + dual watermark): `14.40 MB / 60s` (`≈ 1.41 GB / 100 min`, SSIM `0.987`).
+  - `h264_high` (`5000k` ABR, legacy): `37.40 MB / 60s` (`≈ 3.65 GB / 100 min`, SSIM `0.991`).
+  - No watermark (`-c:v copy -sn`): stream-copy completes in seconds (preserves source bitrate).
+
+## 3. Incremental Edits After Release (Per Affected Batch + ~3s `merge-series`)
+
+| Change | Typical Time | Work Performed |
 |---|---|---|
-| `v1.2.1` sequential (8 × 13.0 min) | ≈ **104 min** (P) | single-engine sequential |
-| `v1.3.0` sequential (8 × 7.5 min) | ≈ **60 min** (P) | -42% faster per stage |
-| `v1.5.x` batch-barrier run (`do-dai-hoc-la-len-dinh`, 81 eps / 143.8 min) | **~6.5 h** (M) | 2h10m all-batch Stage-2 barrier + `strip_y0=1306` rescan + `series_bible.json` Stage 0 re-sync |
-| **`v1.6.0` streaming overlapped (`run-series --units ...`)** | **≈ 38–48 min** (P) | Zero Stage-2 barrier (stream units S1→S5), overlapped `prep` (Metal ∥ CPU), hub-shared TTS cache, auto `strip_y0` (0 rescans), 2–3 lean workers with `gpu/cpu/media` locks |
-
-*Human/agent work (audit frames, translation, mandatory Stage 5 visual QA viewing) runs in parallel or before `--phase produce` and depends on glossary reuse.*
-
-## Output file size for 1 full 100-minute series (1080p30)
-
-Measured on a 60 s real slice of `unit_07_ep61_70` (original HEVC source `1.01 Mbps` / `7.54 MB`):
-
-| Preset | Speed (M) | 60 s size (M) | Full 100 min (P) | SSIM vs source (M) |
-|---|---|---|---|---|
-| `h264_high` (`5000k` ABR, legacy) | 4.21× (no hwdec) / 5.30× (hwdec) | 37.40 MB | ≈ 3.65 GB | 0.9908 |
-| **`h264` (`-q:v 58`, default, + 2-corner wm)** | **5.75×** | **19.00 MB** | **≈ 1.86 GB (-49%)** | 0.9879 (at q60) |
-| **`hevc` (`-q:v 60 -tag:v hvc1`)** | **6.06×** | **13.86 MB** | **≈ 1.35 GB (-63%)** | 0.9870 |
-| **`hevc` + 2-corner watermark** | **5.59×** | **14.40 MB** | **≈ 1.41 GB (-61%)** | — |
-
-## Edits after release (incremental, per affected batch + 3 s `merge-series`)
-
-| Change | Time | | Work |
-|---|---|---|---|
-| Reword external `.srt` (`sub_text`) | ≈ 0.1 min | M | validate, regenerate SRT (no video re-render needed in v2.0.0) |
-| Change one dubbed line (`tts_text`) | ≈ 2.2 min | M/E | 1 sentence TTS + `mix` (21 s) + `master` (4 s) + one ffmpeg pass + `merge-series` |
-| Change mix parameters only | ≈ 30 s + render | M | `mix` (21 s) + `master` (4 s) + gate |
-| Codec or watermark change | ≈ 1.8 min/batch | M | one ffmpeg pass (or instant stream-copy with no watermark) |
-
-## Formula (per internal working batch, `v1.3.0`)
-
-```
-machine_min ≈ 0.09·D (Stage 1 MLX+scan) + 0.12·D (stems) + 0.017·L (CPU TTS 2x4) + 0.042·D (mix+master) + 0.17·D (render) + 0.3
-human_min   ≈ 0.10·L (translate + adapt) + 10 (audit + QA viewing)
-```
-
-`D` = batch duration in minutes, `L` = number of lines. For `D = 10`, `L = 186`: ≈ 7.7 min sequential per batch (≈ 32–38 min overlapped machine wall time for an entire 80-episode series).
+| Reword external `.srt` (`sub_text` only) | ≈ `0.1 min` | `validate_bilingual_script.py` → re-export `subtitles_full.srt` → `merge-series` (0 TTS, 0 mix, 0 render) |
+| Change one dubbed line (`tts_text`) | ≈ `1–1.5 min` | 1 VieNeu utterance + 1 `rubberband` (all other lines hit `tts_sent`/`rb_stretch` cache) → `< 12s` `mix` → `~4s` `master` → 1 fast hardware `render` → QA → `merge-series` |
+| Tune `config/audio_mix.json` only | ≈ `0.5 min` + render | `< 12s` `mix` → `~4s` `master` → `verify` → 1 fast hardware `render` → `merge-series` |
+| Change codec or `--brand-dir` | `render` + QA | Global `wm_overlay` composited once → 1 fast hardware `render` (or instant `-c:v copy` if unbranded) |
+| Rename/move unit or series hub | **Seconds** (100% cache hit) | `content_hash.db` hashes content once at new path; `stage_N_gate.json` (`schema_version: "3.0"`) stays valid |

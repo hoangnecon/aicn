@@ -11,17 +11,34 @@ import hashlib
 import json
 import os
 import sys
+import threading
+import time
 from datetime import datetime
 from typing import Dict, List, Any
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (
+    _HERE,
+    os.path.abspath(os.path.join(_HERE, "..", "..", "..", "scripts")),
+    os.path.abspath(os.path.join(_HERE, "..", "..", "aicn", "scripts")),
+):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+try:
+    import aicn_platform as ap
+except ImportError:
+    ap = None
 
 
 GATE_EXIT_CODE = 2
 
 
 def sha256_file(path: str) -> str:
-    """Compute SHA-256 digest of a file (streams in 1MB chunks for large media files)."""
+    """Compute SHA-256 digest of a file (accelerated via SQLite-WAL content_sha256 when available)."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Cannot hash missing file: {path}")
+    if ap is not None and hasattr(ap, "content_sha256"):
+        return ap.content_sha256(path)
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
@@ -30,6 +47,31 @@ def sha256_file(path: str) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def _write_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    if ap is not None and hasattr(ap, "atomic_write_json"):
+        ap.atomic_write_json(path, payload)
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        for attempt in range(8):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def cicd_dir(workspace: str) -> str:
@@ -52,25 +94,26 @@ def write_gate_token(
 ) -> Dict[str, Any]:
     """
     Evaluate rubric checks, compute deterministic score (0-100), hash artifacts,
-    and write signed gate token to workspace/<slug>/.cicd/stage_N_gate.json.
+    and write signed relocation-safe v3.0 gate token to workspace/<slug>/.cicd/stage_N_gate.json.
     """
     workspace = os.path.abspath(workspace)
-    total_weight = sum(int(c.get("weight", 10)) for c in checks)
-    earned_weight = sum(int(c.get("weight", 10)) for c in checks if c.get("passed", False))
+    checks_out = list(checks)
+    total_weight = sum(int(c.get("weight", 10)) for c in checks_out)
+    earned_weight = sum(int(c.get("weight", 10)) for c in checks_out if c.get("passed", False))
     score = round((earned_weight / max(1, total_weight)) * 100.0, 1)
-    all_passed = all(bool(c.get("passed", False)) for c in checks)
+    all_passed = all(bool(c.get("passed", False)) for c in checks_out)
 
     artifacts_hashed = {}
     for rel_or_abs in artifact_paths:
         p = rel_or_abs if os.path.isabs(rel_or_abs) else os.path.join(workspace, rel_or_abs)
         if not os.path.exists(p):
             all_passed = False
-            checks.append({
-                "id": f"artifact_exists:{ os.path.basename(p) }",
-                "description": f"Required artifact exists: {p}",
+            checks_out.append({
+                "id": f"artifact_exists:{os.path.basename(p)}",
+                "description": f"Required artifact exists: {os.path.basename(p)}",
                 "weight": 20,
                 "passed": False,
-                "detail": "File does not exist on disk"
+                "detail": "File does not exist on disk",
             })
         else:
             norm_p = os.path.normcase(os.path.abspath(p))
@@ -79,33 +122,33 @@ def write_gate_token(
             rel_key = os.path.relpath(os.path.abspath(p), workspace).replace("\\", "/") if under_ws else os.path.abspath(p)
             artifacts_hashed[rel_key] = {
                 "sha256": sha256_file(p),
-                "size_bytes": os.path.getsize(p)
+                "size_bytes": os.path.getsize(p),
             }
 
     status = "PASS" if (all_passed and score == 100.0) else "FAIL"
     payload = {
+        "schema_version": "3.0",
         "stage": stage,
         "stage_name": stage_name,
         "status": status,
         "score": score,
         "timestamp": datetime.now().isoformat(),
-        "workspace": workspace,
+        "workspace_slug": os.path.basename(workspace),
         "metrics": metrics,
-        "checks": checks,
+        "checks": checks_out,
         "artifacts": artifacts_hashed,
     }
-    # Compute integrity signature over the gate payload
+    # Compute integrity signature over the relocation-safe gate payload
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     payload["signature"] = hashlib.sha256(canonical).hexdigest()
 
     out_file = gate_path(workspace, stage)
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(out_file, payload)
 
     print(f"\n{'='*72}", flush=True)
     print(f"[CI/CD GATE REPORT] Stage {stage}: {stage_name} | Status: {status} | Score: {score}/100", flush=True)
     print(f"{'-'*72}", flush=True)
-    for c in checks:
+    for c in checks_out:
         mark = "PASS" if c.get("passed") else "FAIL"
         print(f"  [{mark}] ({c.get('weight', 10)} pts) {c.get('id')}: {c.get('detail', '')}", flush=True)
     print(f"{'='*72}\n", flush=True)

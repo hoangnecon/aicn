@@ -1,78 +1,148 @@
 #!/usr/bin/env python3
 """
-aicn_audio.py - Stage 3 audio for AICN: separation, sentence-level dub, frequency-aware mix, master.
-
-  separate  Demucs (MLX) on the unit source -> media/stems/{vocals,accomp}.wav   (cached by source sha256)
-  dub       sentence-level VieNeu TTS -> rubberband tempo -> media/audio/dub_voice_48k.wav
-            + per-line media/tts_segments/seg_NNNN.wav + data/03_aligned_subtitles.json  (cached per sentence)
-  mix       per-band, per-frame ducking of the ORIGINAL stems under the dub (never muted)
-  master    glue compression + 2-pass loudnorm -> media/master_audio_48k.wav
-  verify    audio gate (data/03_mix_report.json), then the Stage 3 gate (verify_stage_3.py)
-  all       separate -> dub -> mix -> master -> verify
+aicn_audio.py - Stage 3 audio engine for AICN v3.0.0:
+  separate       Demucs separation -> <global_cache>/stems + media/stems/{vocals,accomp}.wav
+  dub            indivisible utterance VieNeu TTS -> rubberband R3 -> media/audio/dub_voice_48k.wav
+  analyze        fast active-frame 9-band spectral audit -> data/03_spectral_analysis.json
+  mix            single-STFT + C-speed follow_hold + combined iSTFT vocal-carving mix
+  master         glue compression + native 48 kHz EBU R128 master -> media/master_audio_48k.wav
+  verify         audio quality gate (data/03_mix_report.json) + Stage 3 gate (verify_stage_3.py)
+  all            separate -> dub -> mix -> master -> verify
+  batch-separate warm single-load Demucs across --units u1,u2,...
+  batch-dub      warm single-load VieNeu CUDA infer_batch + parallel rubberband across --units u1,u2,...
+  batch-all      batch-separate -> batch-dub (fail-fast per unit) -> parallel CPU mix/master/verify
 
 Run with the VieNeu venv python ($AICN_PY). Parameters: config/audio_mix.json overrides DEFAULTS.
-In sub_only mode there is no dub: the original stereo is mastered and verified.
 """
-import argparse, json, os, re, subprocess, sys, tempfile, time
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
+from scipy import fft as sp_fft
+from scipy.ndimage import minimum_filter1d
+from scipy.signal import butter, get_window, lfilter, sosfilt
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError:  # pragma: no cover
+    torch = None
+    F = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-import aicn  # noqa: E402  (jload, jdump, h_obj, FastHash, cicd)
 import aicn_platform as ap  # noqa: E402
 
 SR = 48000
-AUDIO_VERSION = "aicn-audio-1.3"
-STEMS_VERSION = "aicn-audio-1.0"  # unchanged Demucs separation; keep cache-compatible with v1.2.x stems
+AUDIO_VERSION = "aicn-audio-3.0"
+STEMS_VERSION = getattr(ap, "STEMS_VERSION", "aicn-audio-1.0")
+TTS_ENGINE_TAG = getattr(ap, "TTS_ENGINE_TAG", "vieneu-v3-turbo-48k")
+RB_STRETCH_VERSION = getattr(ap, "RB_STRETCH_VERSION", "rb3-f-3.0")
+VENDOR = os.path.normpath(os.path.join(HERE, "..", "vendor"))
+
 DEFAULTS = {
     "voice": "Trúc Ly",
-    "tts_workers": 0, "tts_threads": 0,         # 0=auto-scale CPU fp32 ONNX workers (2x4 on 8-core M1, up to 4x4 on 16+ core desktop)
-    "tts_batch_size": 16,                       # CUDA PyTorch static batch size (single process, ~0.5-0.8 GB VRAM, 3-4x faster than multi-proc)
-    "temperature": 0.8, "top_k": 25,            # VieNeu v3 Turbo defaults (same as its app)
-    "group_max_gap_s": 0.6,                     # clauses of one speaker closer than this are read as one sentence
-    "base_tempo": 1.10,                         # model reads ~5.2 syl/s; 1.10 brings it to ~5.7
-    "max_tempo": 1.25,                          # rubberband R3, formant preserved
-    "lead_gap_s": 0.10,                         # keep this much silence before the next sentence
-    "expander_thresh_db": -50.0, "expander_depth_db": -15.0,   # removes the TTS hiss floor between words
-    "dub_over_vocal_lu": 1.5,                   # dub loudness relative to the original vocal stem
-    "snr_vocal_db": 12.0, "snr_bgm_db": 6.0,    # wanted dub-to-original ratio per band while the dub talks
-    "floor_vocal_db": -20.0, "floor_bgm_db": -9.0,   # the original is never turned down further than this
-    "base_vocal_db": -6.5,                      # gentler broadband dip of original voice while keeping SFX natural
-    "vocal_high_dip_db": -3.5,                  # dynamic >5 kHz vocal sibilance softening ONLY while dub speaks
-    "attack_s": 0.02, "hold_s": 0.35, "release_s": 0.42,   # attack-hold-release eliminates inter-clause pumping
-    "dub_hp_hz": 90.0, "dub_lp_hz": 16000.0,    # pre-mix HP/LP conditioning for dubbed voice
-    "vocal_hp_hz": 95.0, "vocal_lp_hz": 0.0,    # gentle vocal sub-rumble HP; LP=0 preserves air when dub is silent
-    "bgm_hp_hz": 35.0, "bgm_lp_hz": 18500.0,    # keep SFX/foley/music warm & full-bodied, strip subsonic DC only
+    "tts_workers": 0, "tts_threads": 0,
+    "tts_batch_size": 16,
+    "temperature": 0.8, "top_k": 25,
+    "group_max_gap_s": 0.12,
+    "max_group_clauses": 3,
+    "max_group_span_s": 4.5,
+    "base_tempo": 1.08,
+    "max_tempo": 1.28,
+    "max_tempo_short": 1.32,
+    "lead_gap_s": 0.05,
+    "max_overhang_s": 1.20,
+    "min_utterance_s": 0.12,
+    "expander_thresh_db": -50.0, "expander_depth_db": -15.0,
+    "dub_over_vocal_lu": 1.5,
+    "snr_vocal_db": 14.0, "snr_bgm_db": 6.0,
+    "floor_vocal_db": -24.0, "floor_bgm_db": -9.0,
+    "base_vocal_db": -10.0,
+    "speech_vocal_dip_db": -16.0,
+    "vocal_high_dip_db": -4.5,
+    "attack_s": 0.015, "hold_s": 0.30, "release_s": 0.38,
+    "dub_hp_hz": 90.0, "dub_lp_hz": 16000.0,
+    "vocal_hp_hz": 95.0, "vocal_lp_hz": 0.0,
+    "bgm_hp_hz": 35.0, "bgm_lp_hz": 18500.0,
     "target_lufs": -14.0, "true_peak_db": -1.0, "lra": 11.0,
-    "master_mode": "fast",                      # fast (ebur128+alimiter, ~4s, 28x faster) | loudnorm (legacy 192kHz 2-pass, ~115s)
+    "master_mode": "fast",
     "demucs_model": "htdemucs",
 }
-GATE = {"lufs_tol": 1.0, "dub_snr_min_db": 8.0, "orig_presence_min_db": -6.0, "vocal_floor_margin_db": 6.0}
+
+GATE = {
+    "lufs_tol": 1.0,
+    "true_peak_max_db": -0.8,
+    "dub_snr_median_min_db": 10.0,
+    "dub_snr_min_db": 10.0,
+    "dub_snr_p10_min_db": 4.0,
+    "orig_presence_min_db": -6.0,
+    "vocal_floor_margin_db": 6.0,
+}
 
 
 # ---------------------------------------------------------------- helpers
+def _jload(p, default=None):
+    if not p or not os.path.exists(p):
+        return default
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _jdump(p, obj):
+    ap.atomic_write_json(p, obj)
+
+
+def _hash_file(p, fh=None):
+    return fh(p) if fh is not None else ap.content_sha256(p)
+
+
 def cfg(ws):
     c = dict(DEFAULTS)
-    c.update(aicn.jload(os.path.join(ws, "config", "audio_mix.json"), {}) or {})
+    c.update(_jload(os.path.join(ws, "config", "audio_mix.json"), {}) or {})
     return c
 
 
 def profile(ws):
-    return aicn.jload(os.path.join(ws, "data", "00_video_profile.json"), {})
+    return _jload(os.path.join(ws, "data", "00_video_profile.json"), {}) or {}
+
+
+def _assert_voice_dub(ws):
+    mode = profile(ws).get("localization_mode", "voice_dub")
+    if mode == "sub_only":
+        sys.exit("[aicn-audio] sub_only mode is retired in AICN v3.0.0; full voice_dub is mandatory.")
+    return mode
 
 
 def source_path(ws):
     p = os.path.join(ws, "source", "master_source.mp4")
-    return p if os.path.exists(p) else profile(ws).get("source_video", "")
+    if os.path.exists(p):
+        return p
+    sv = profile(ws).get("source_video", "")
+    if not sv:
+        return ""
+    return sv if os.path.isabs(sv) else os.path.normpath(os.path.join(ws, sv))
 
 
 def run(cmd, **kw):
     r = subprocess.run(cmd, capture_output=True, **kw)
     if r.returncode:
-        sys.exit(f"[aicn-audio] command failed: {' '.join(map(str, cmd))[:200]}\n{r.stderr[-800:]}")
+        err = r.stderr[-800:] if isinstance(r.stderr, str) else r.stderr[-800:].decode("utf-8", errors="replace")
+        sys.exit(f"[aicn-audio] command failed: {' '.join(map(str, cmd))[:200]}\n{err}")
     return r
 
 
@@ -82,120 +152,333 @@ def load(p, ch=2, sr=SR):
 
 
 def lufs_file(p):
-    o = subprocess.run([ap.find_tool("ffmpeg"), "-nostats", "-i", p, "-af", "ebur128=peak=true", "-f", "null", "-"],
-                       capture_output=True, text=True).stderr
-    i = float(re.findall(r"I:\s+(-?[\d.]+) LUFS", o)[-1])
+    o = subprocess.run(
+        [ap.find_tool("ffmpeg"), "-nostats", "-i", p, "-af", "ebur128=peak=true", "-f", "null", "-"],
+        capture_output=True, text=True,
+    ).stderr
+    i_hits = re.findall(r"I:\s+(-?[\d.]+) LUFS", o)
+    i = float(i_hits[-1]) if i_hits else -70.0
     pk = re.findall(r"Peak:\s+(-?[\d.inf]+) dBFS", o)
     return i, (float(pk[-1]) if pk and pk[-1] not in ("-inf", "inf") else -99.0)
 
 
+# Precomputed ITU-R BS.1770-4 K-weighting SOS for 48 kHz (Stage 1 shelf + Stage 2 RLB HPF)
+_BS1770_SOS_48K = np.array([
+    [1.53512485958697, -2.69169618940638, 1.19839281085285, 1.0, -1.69065929318241, 0.73248077421585],
+    [1.0, -2.0, 1.0, 1.0, -1.99004745483398, 0.99007225036621],
+], dtype=np.float64)
+
+
+def _anti_denormal(arr, dtype=None, inplace=False):
+    """Add 12 kHz -300 dBFS bias so IIR filters over digital-silence gaps never hit x86_64 denormal traps."""
+    dt = np.dtype(dtype) if dtype is not None else np.dtype(arr.dtype)
+    out = arr if (inplace and np.dtype(arr.dtype) == dt) else np.array(arr, dtype=dt, copy=True)
+    n_s = len(out)
+    if n_s >= SR:
+        pat = np.array([0.0, 1e-15, 0.0, -1e-15], dtype=dt)
+        q = n_s // 4
+        if out.ndim == 1:
+            out[: q * 4].reshape(-1, 4)[:] += pat
+        else:
+            out[: q * 4].reshape(-1, 4, out.shape[1])[:] += pat[None, :, None]
+    return out
+
+
+def _sosfilt_parallel(sos, arr):
+    """Apply sosfilt concurrently across stereo/multi-channel columns when audio is >=10s (denormal-safe)."""
+    if arr.ndim == 2 and arr.shape[1] > 1 and len(arr) >= SR * 10:
+        with ThreadPoolExecutor(max_workers=arr.shape[1]) as ex:
+            cols = list(ex.map(lambda ch: sosfilt(sos, _anti_denormal(arr[:, ch], inplace=False)), range(arr.shape[1])))
+        return np.stack(cols, axis=1)
+    return sosfilt(sos, _anti_denormal(arr), axis=0)
+
+
 def lufs(x):
-    """Measure integrated LUFS by piping float32 PCM directly into ffmpeg (zero temp-file disk I/O)."""
+    """Measure integrated ITU-R BS.1770-4 LUFS in RAM (~0.35s on 10-min audio, zero ffmpeg pipe)."""
     arr = np.asarray(x, dtype=np.float32)
-    ch = 1 if arr.ndim == 1 else arr.shape[1]
-    proc = subprocess.run(
-        [ap.find_tool("ffmpeg"), "-nostats", "-f", "f32le", "-ar", str(SR), "-ac", str(ch),
-         "-i", "pipe:0", "-af", "ebur128=peak=true", "-f", "null", "-"],
-        input=np.ascontiguousarray(arr).tobytes(), capture_output=True,
-    )
-    o = proc.stderr.decode("utf-8", errors="replace")
-    hits = re.findall(r"I:\s+(-?[\d.]+) LUFS", o)
-    return float(hits[-1]) if hits else -70.0
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if len(arr) < int(0.4 * SR):
+        return -70.0
+    step = int(0.1 * SR)
+    nb = len(arr) // step
+    if nb < 4:
+        return -70.0
+    n_use = nb * step
+
+    def _ch_e100(col):
+        ch64 = _anti_denormal(col, dtype=np.float64, inplace=False)
+        yk = sosfilt(_BS1770_SOS_48K, ch64)[:n_use]
+        return (yk.reshape(nb, step) ** 2).mean(axis=1)
+
+    n_ch = arr.shape[1]
+    if n_ch > 1 and len(arr) >= SR * 10:
+        with ThreadPoolExecutor(max_workers=n_ch) as ex:
+            e100 = sum(ex.map(lambda ch: _ch_e100(arr[:, ch]), range(n_ch)))
+    else:
+        e100 = sum(_ch_e100(arr[:, ch]) for ch in range(n_ch))
+    e400 = 0.25 * (e100[:-3] + e100[1:-2] + e100[2:-1] + e100[3:])
+    l_blk = -0.691 + 10.0 * np.log10(np.maximum(e400, 1e-12))
+    g1 = e400[l_blk > -70.0]
+    if not len(g1):
+        return -70.0
+    rel = -0.691 + 10.0 * np.log10(float(g1.mean())) - 10.0
+    g2 = e400[l_blk > max(-70.0, rel)]
+    return float(-0.691 + 10.0 * np.log10(float(g2.mean()))) if len(g2) else -70.0
+
+
+def follow_hold(g, fps, att, hold_s, rel):
+    """Vectorized C-speed attack-hold-release envelope follower over the last axis."""
+    g_arr = np.atleast_2d(np.asarray(g, dtype=np.float64))
+    n_bands, n_frames = g_arr.shape
+    if n_frames == 0:
+        return g_arr.copy()
+    hold_frames = max(0, int(round(max(0.0, float(hold_s)) * fps)))
+    a_att = float(np.exp(-1.0 / max(1e-6, float(att) * fps)))
+    a_rel = float(np.exp(-1.0 / max(1e-6, float(rel) * fps)))
+
+    if hold_frames > 0:
+        sz = hold_frames + 1
+        origin = (sz - 1) // 2
+        pad = np.pad(g_arr, ((0, 0), (hold_frames, 0)), mode="constant", constant_values=1.0)
+        g_held = minimum_filter1d(pad, size=sz, axis=1, mode="nearest", origin=origin)[:, hold_frames:]
+    else:
+        g_held = g_arr
+
+    zi_att = np.full((n_bands, 1), a_att, dtype=np.float64)
+    y_att, _ = lfilter([1.0 - a_att], [1.0, -a_att], g_held, axis=1, zi=zi_att)
+
+    # Peak-dip exponential release from y_att via chunked maximum.accumulate (prevents float overflow)
+    dip = np.maximum(0.0, 1.0 - y_att)
+    blk = 512
+    pows = a_rel ** np.arange(blk, dtype=np.float64)
+    inv_pows = 1.0 / pows
+    dip_rel = np.empty_like(dip)
+    carry = np.zeros(n_bands, dtype=np.float64)
+    for s in range(0, n_frames, blk):
+        e = min(n_frames, s + blk)
+        seg = dip[:, s:e] * inv_pows[None, : e - s]
+        seg[:, 0] = np.maximum(seg[:, 0], carry * a_rel)
+        out_blk = np.maximum.accumulate(seg, axis=1) * pows[None, : e - s]
+        dip_rel[:, s:e] = out_blk
+        carry = out_blk[:, -1]
+    return np.clip(1.0 - dip_rel, 0.0, 1.0)
 
 
 def follow(g, fps, att, rel):
     """Envelope follower over the last axis: fast down (attack), slow up (release)."""
-    a_att, a_rel = np.exp(-1 / (att * fps)), np.exp(-1 / (rel * fps))
-    g = np.atleast_2d(g); out = np.empty_like(g); cur = np.ones(g.shape[0])
-    for t in range(g.shape[1]):
-        tgt = g[:, t]; a = np.where(tgt < cur, a_att, a_rel)
-        cur = a * cur + (1 - a) * tgt; out[:, t] = cur
-    return out
+    return follow_hold(g, fps, att, 0.0, rel)
 
 
-def follow_hold(g, fps, att, hold_s, rel):
-    """Attack-hold-release gain follower over the last axis: fast attack down, flat hold during micro-pauses, smooth release up."""
-    a_att = np.exp(-1.0 / max(1e-6, att * fps))
-    a_rel = np.exp(-1.0 / max(1e-6, rel * fps))
-    hold_frames = max(0, int(round(max(0.0, float(hold_s)) * fps)))
-    g = np.atleast_2d(np.asarray(g, dtype=np.float64))
-    out = np.empty_like(g)
-    cur = np.ones(g.shape[0], dtype=np.float64)
-    rem = np.zeros(g.shape[0], dtype=np.int32)
-    for t in range(g.shape[1]):
-        tgt = g[:, t]
-        attacking = tgt < cur
-        holding = (~attacking) & (rem > 0)
-        releasing = (~attacking) & (~holding)
-        cur = np.where(
-            attacking,
-            a_att * cur + (1.0 - a_att) * tgt,
-            np.where(releasing, a_rel * cur + (1.0 - a_rel) * tgt, cur),
-        )
-        rem = np.where(attacking, hold_frames, np.maximum(0, rem - 1))
-        out[:, t] = cur
-    return out
+def _tmp_path(path, suffix):
+    return f"{path}.{os.getpid()}.{threading.get_ident()}.{suffix}"
 
 
-def _write_wav16(path, arr, sr=SR):
-    """Write compact lossless 16-bit PCM WAV atomically (-50% disk vs FLOAT32, -96 dB dynamic range)."""
+def _atomic_replace(tmp, dst):
+    for attempt in range(10):
+        try:
+            os.replace(tmp, dst)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.02)
+
+
+def _write_wav16(path, arr, sr=SR, inplace=False):
+    """Write compact lossless 16-bit PCM WAV atomically (multi-threaded Torch int16 quantize on >=10s float32)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + ".part.wav"
-    sf.write(tmp, np.clip(np.asarray(arr, dtype=np.float32), -1.0, 0.999969), sr, subtype="PCM_16")
-    os.replace(tmp, path)
+    tmp = _tmp_path(path, "part.wav")
+    a = np.ascontiguousarray(arr, dtype=np.float32) if not (isinstance(arr, np.ndarray) and arr.dtype == np.float32 and arr.flags["C_CONTIGUOUS"]) else arr
+    try:
+        if torch is not None and len(a) >= SR * 10:
+            mt = torch.from_numpy(a)
+            if not inplace:
+                mt = mt.clamp(-1.0, 0.999969).mul_(32767.0)
+            else:
+                mt.clamp_(-1.0, 0.999969).mul_(32767.0)
+            sf.write(tmp, mt.round_().to(torch.int16).numpy(), sr, subtype="PCM_16")
+        else:
+            clipped = np.clip(a, -1.0, 0.999969, out=a if inplace else None)
+            sf.write(tmp, clipped, sr, subtype="PCM_16")
+        _atomic_replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
+def _link_or_copy(src_p, dst_p):
+    os.makedirs(os.path.dirname(os.path.abspath(dst_p)), exist_ok=True)
+    if os.path.exists(dst_p):
+        try:
+            if os.path.samefile(src_p, dst_p):
+                return
+        except OSError:
+            pass
+    tmp = _tmp_path(dst_p, "part.wav")
+    with contextlib.suppress(OSError):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    try:
+        try:
+            os.link(src_p, tmp)
+        except OSError:
+            shutil.copy2(src_p, tmp)
+        _atomic_replace(tmp, dst_p)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
+def _audio_state_load(ws):
+    return _jload(os.path.join(ws, ".cache", "audio_state.json"), {}) or {}
+
+
+def _audio_state_save(ws, st):
+    _jdump(os.path.join(ws, ".cache", "audio_state.json"), st)
 
 
 # ---------------------------------------------------------------- separate
-def cmd_separate(ws, c, fh):
-    import contextlib
-    src = source_path(ws)
-    if not src or not os.path.exists(src):
-        sys.exit("[aicn-audio] no source video (source/master_source.mp4)")
-    key = aicn.h_obj({"src": fh(src), "model": c["demucs_model"], "v": STEMS_VERSION})
-    d = os.path.join(ws, "media", "stems"); meta_p = os.path.join(d, "stems.json")
-    meta = aicn.jload(meta_p, {})
-    if meta.get("key") == key and all(os.path.exists(os.path.join(d, f)) for f in ("vocals.wav", "accomp.wav")):
-        print("[separate] cached"); return
-    os.makedirs(d, exist_ok=True); t0 = time.time()
+def _separate_with_separator(sep, src, sr=SR):
+    import torch
+    import torchaudio.functional as TAF
+
+    wav_44k = load(src, ch=2, sr=44100)
+    wav_t = torch.from_numpy(wav_44k.T.copy())
+    _, stems = sep.separate_tensor(wav_t, 44100)
+    voc_t = stems["vocals"]
+    acc_t = sum(v for k, v in stems.items() if k != "vocals")
+    voc_48 = TAF.resample(voc_t, 44100, sr).cpu().numpy().T.astype(np.float32)
+    acc_48 = TAF.resample(acc_t, 44100, sr).cpu().numpy().T.astype(np.float32)
+    return voc_48, acc_48
+
+
+def _separate_with_mlx(src, model_name):
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = os.path.join(tmp, "source.wav")
+        run([ap.find_tool("ffmpeg"), "-v", "error", "-y", "-i", src, "-vn", "-ac", "2", "-ar", "44100", wav])
+        run([ap.find_tool("uvx"), "--from", "demucs-mlx", "demucs-mlx", "-n", model_name, "-o", tmp, wav])
+        sd = os.path.join(tmp, model_name, "source")
+        if not os.path.isdir(sd):
+            sd = os.path.join(tmp, "source")
+        voc = load(os.path.join(sd, "vocals.wav"))
+        no_voc = os.path.join(sd, "no_vocals.wav")
+        acc = load(no_voc) if os.path.exists(no_voc) else sum(load(os.path.join(sd, f"{s}.wav")) for s in ("drums", "bass", "other"))
+        return voc, acc
+
+
+def batch_separate(units, force=False, fh=None):
+    """Separate stems across one or more units, loading Demucs ONCE in GPU memory across cache misses."""
+    if not units:
+        return
     bk = ap.detect_demucs_backend(sys.executable)
     if bk["engine"] == "missing":
         sys.exit("[aicn-audio] Demucs not available: install `demucs` in AICN_PY or install `uv` (for uvx)")
-    lock_ctx = ap.gpu_lock() if bk["engine"] in ("mlx", "torch-cuda") else contextlib.nullcontext()
-    with lock_ctx:
-        with tempfile.TemporaryDirectory() as tmp:
-            wav = os.path.join(tmp, "source.wav")
-            run([ap.find_tool("ffmpeg"), "-v", "error", "-y", "-i", src, "-vn", "-ac", "2", "-ar", "44100", wav])
-            if bk["engine"] == "mlx":
-                run([ap.find_tool("uvx"), "--from", "demucs-mlx", "demucs-mlx", "-n", c["demucs_model"], "-o", tmp, wav])
-            else:
-                dev = "cuda" if bk["engine"] == "torch-cuda" else "cpu"
-                run([sys.executable, "-m", "demucs.separate", "--two-stems=vocals", "--device", dev,
-                     "-n", c["demucs_model"], "-o", tmp, wav])
-            sd = os.path.join(tmp, c["demucs_model"], "source")
-            if not os.path.isdir(sd):
-                sd = os.path.join(tmp, "source")
-            voc = load(os.path.join(sd, "vocals.wav"))
-            no_voc = os.path.join(sd, "no_vocals.wav")
-            acc = load(no_voc) if os.path.exists(no_voc) else sum(load(os.path.join(sd, f"{s}.wav")) for s in ("drums", "bass", "other"))
-    _write_wav16(os.path.join(d, "vocals.wav"), voc, SR)
-    _write_wav16(os.path.join(d, "accomp.wav"), acc, SR)
-    aicn.jdump(meta_p, {"key": key, "source": src, "model": c["demucs_model"], "backend": bk["engine"], "seconds": round(time.time() - t0, 1)})
-    print(f"[separate] {c['demucs_model']} ({bk['label']}) -> media/stems in {time.time() - t0:.1f}s")
+
+    misses = []
+    for ws in units:
+        ws = os.path.abspath(ws)
+        _assert_voice_dub(ws)
+        c = cfg(ws)
+        src = source_path(ws)
+        if not src or not os.path.exists(src):
+            sys.exit(f"[aicn-audio] no source video in {ws} (source/master_source.mp4)")
+        src_sha = _hash_file(src, fh)
+        s_key = ap.stems_key(src_sha, c["demucs_model"], STEMS_VERSION)
+        d = os.path.join(ws, "media", "stems")
+        meta_p = os.path.join(d, "stems.json")
+        g_dir = ap.global_cache_path("stems", s_key, "", hint_path=ws)
+        g_voc, g_acc = os.path.join(g_dir, "vocals.wav"), os.path.join(g_dir, "accomp.wav")
+        u_voc, u_acc = os.path.join(d, "vocals.wav"), os.path.join(d, "accomp.wav")
+
+        if not force and _jload(meta_p, {}).get("key") == s_key and os.path.exists(u_voc) and os.path.exists(u_acc):
+            print(f"[separate] cached ({os.path.basename(ws)}, key={s_key[:12]})")
+            continue
+        if not force and os.path.exists(g_voc) and os.path.exists(g_acc):
+            _link_or_copy(g_voc, u_voc)
+            _link_or_copy(g_acc, u_acc)
+            _jdump(meta_p, {"key": s_key, "src_sha": src_sha, "model": c["demucs_model"], "backend": "global-cache", "seconds": 0.0})
+            print(f"[separate] global-cache hit ({os.path.basename(ws)}, key={s_key[:12]})")
+            continue
+        misses.append((ws, c, src, src_sha, s_key, g_dir, g_voc, g_acc, u_voc, u_acc, meta_p))
+
+    if not misses:
+        return
+
+    slot_ctx = ap.gpu_slot("demucs", vram_mb=1024, label="DEMUCS") if bk["engine"] in ("mlx", "torch-cuda") else contextlib.nullcontext()
+    with slot_ctx:
+        if bk["engine"] == "mlx":
+            for ws, c, src, src_sha, s_key, g_dir, g_voc, g_acc, u_voc, u_acc, meta_p in misses:
+                if not force and os.path.exists(g_voc) and os.path.exists(g_acc):
+                    _link_or_copy(g_voc, u_voc)
+                    _link_or_copy(g_acc, u_acc)
+                    _jdump(meta_p, {"key": s_key, "src_sha": src_sha, "model": c["demucs_model"], "backend": "global-cache", "seconds": 0.0})
+                    continue
+                t0 = time.time()
+                voc, acc = _separate_with_mlx(src, c["demucs_model"])
+                os.makedirs(g_dir, exist_ok=True)
+                _write_wav16(g_voc, voc, SR)
+                _write_wav16(g_acc, acc, SR)
+                _link_or_copy(g_voc, u_voc)
+                _link_or_copy(g_acc, u_acc)
+                _jdump(meta_p, {"key": s_key, "src_sha": src_sha, "model": c["demucs_model"], "backend": bk["engine"], "seconds": round(time.time() - t0, 1)})
+                print(f"[separate] {os.path.basename(ws)} {c['demucs_model']} ({bk['label']}) -> media/stems in {time.time() - t0:.1f}s")
+        else:
+            import demucs.api
+            import torch
+
+            dev = "cuda" if bk["engine"] == "torch-cuda" else "cpu"
+            by_model = defaultdict(list)
+            for item in misses:
+                by_model[item[1]["demucs_model"]].append(item)
+            for model_name, items in by_model.items():
+                sep = demucs.api.Separator(model=model_name, device=dev, shifts=1, split=True, overlap=0.25, progress=False)
+                try:
+                    for ws, c, src, src_sha, s_key, g_dir, g_voc, g_acc, u_voc, u_acc, meta_p in items:
+                        if not force and os.path.exists(g_voc) and os.path.exists(g_acc):
+                            _link_or_copy(g_voc, u_voc)
+                            _link_or_copy(g_acc, u_acc)
+                            _jdump(meta_p, {"key": s_key, "src_sha": src_sha, "model": model_name, "backend": "global-cache", "seconds": 0.0})
+                            print(f"[separate] batch global-cache hit ({os.path.basename(ws)}, key={s_key[:12]})")
+                            continue
+                        t0 = time.time()
+                        voc, acc = _separate_with_separator(sep, src, SR)
+                        os.makedirs(g_dir, exist_ok=True)
+                        _write_wav16(g_voc, voc, SR)
+                        _write_wav16(g_acc, acc, SR)
+                        _link_or_copy(g_voc, u_voc)
+                        _link_or_copy(g_acc, u_acc)
+                        _jdump(meta_p, {"key": s_key, "src_sha": src_sha, "model": model_name, "backend": bk["engine"], "seconds": round(time.time() - t0, 1)})
+                        print(f"[separate] {os.path.basename(ws)} {model_name} ({bk['label']}) -> media/stems in {time.time() - t0:.1f}s")
+                finally:
+                    del sep
+                    if dev == "cuda" and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
 
-# ---------------------------------------------------------------- dub
-def group_lines(segs, max_gap, max_group_segs=4, max_group_dur=8.0):
-    """Comma-chained clauses of one speaker become one sentence (TTS reads short fragments badly),
-    capped in count and span so prosody stays natural without risking multi-clause drift."""
+def cmd_separate(ws, c, fh=None):
+    batch_separate([ws], force=bool(c.get("_force")), fh=fh)
+
+
+# ---------------------------------------------------------------- dub (indivisible utterances)
+def group_lines(segs, max_gap=None, max_group_segs=None, max_group_dur=None):
+    """Group adjacent clauses ONLY when continuous same-speaker/voice speech (gap <= 0.12s, <= 3 clauses, <= 4.5s)."""
+    mg = DEFAULTS["group_max_gap_s"] if max_gap is None else float(max_gap)
+    mc = DEFAULTS["max_group_clauses"] if max_group_segs is None else int(max_group_segs)
+    md = DEFAULTS["max_group_span_s"] if max_group_dur is None else float(max_group_dur)
     groups, cur = [], []
     for i, s in enumerate(segs):
         if cur:
             p = segs[cur[-1]]
             chained = not re.search(r"[.!?…]\s*$", p["tts_text"].strip())
-            span_ok = (float(s["end"]) - float(segs[cur[0]]["start"])) <= max_group_dur
-            if (chained and len(cur) < max_group_segs and span_ok
-                    and s.get("speaker") == p.get("speaker") and float(s["start"]) - float(p["end"]) < max_gap):
-                cur.append(i); continue
+            same_spk = s.get("speaker") == p.get("speaker") and s.get("voice") == p.get("voice")
+            gap = float(s["start"]) - float(p["end"])
+            span = float(s["end"]) - float(segs[cur[0]]["start"])
+            if chained and len(cur) < mc and span <= md and same_spk and gap <= mg:
+                cur.append(i)
+                continue
             groups.append(cur)
         cur = [i]
     if cur:
@@ -205,40 +488,48 @@ def group_lines(segs, max_gap, max_group_segs=4, max_group_dur=8.0):
 
 def stretch(w, tempo):
     if abs(tempo - 1.0) < 0.005:
-        return w
+        return np.asarray(w, dtype=np.float32)
     with tempfile.TemporaryDirectory() as tmp:
         a, b = os.path.join(tmp, "a.wav"), os.path.join(tmp, "b.wav")
-        sf.write(a, w, SR, subtype="FLOAT")
+        sf.write(a, np.asarray(w, dtype=np.float32), SR, subtype="FLOAT")
         run([ap.find_tool("rubberband"), "-3", "-F", "-q", "--tempo", f"{tempo:.4f}", a, b])
         out, _ = sf.read(b, dtype="float32")
     return out if out.ndim == 1 else out.mean(1)
 
 
+def _cosine_edge_fade(w, fade_s=0.010):
+    out = np.asarray(w, dtype=np.float32).copy()
+    f = min(int(fade_s * SR), len(out) // 4)
+    if f > 0:
+        ramp = (0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, f, dtype=np.float32))).astype(np.float32)
+        out[:f] *= ramp
+        out[-f:] *= ramp[::-1]
+    return out
+
+
 def clean(w, c):
-    w = w.astype(np.float32)
-    on = np.flatnonzero(np.abs(w) > 0.008)
+    """Trim silence cleanly (|w| > 0.006 with 5ms guard, NO 30ms dead-silence pad), gate hiss, apply 10ms cosine fade."""
+    w = np.asarray(w, dtype=np.float32)
+    if w.ndim > 1:
+        w = w.mean(1)
+    on = np.flatnonzero(np.abs(w) > 0.006)
     if not len(on):
-        return w
-    w = w[max(0, on[0] - int(0.03 * SR)): on[-1] + int(0.03 * SR)]
-    k = int(0.01 * SR)
-    env = np.convolve(np.abs(w), np.ones(k) / k, "same")
-    g = np.where(env < 10 ** (c["expander_thresh_db"] / 20), 10 ** (c["expander_depth_db"] / 20), 1.0)
-    w = w * np.convolve(g, np.ones(k) / k, "same").astype(np.float32)
-    f = min(int(0.015 * SR), len(w) // 4)
-    if f:
-        w[:f] *= np.linspace(0, 1, f); w[-f:] *= np.linspace(1, 0, f)
-    return w
+        return np.zeros(0, dtype=np.float32)
+    guard = int(0.005 * SR)
+    w = w[max(0, int(on[0]) - guard): min(len(w), int(on[-1]) + guard + 1)]
+    k = max(1, int(0.01 * SR))
+    env = np.convolve(np.abs(w), np.ones(k, dtype=np.float32) / k, "same")
+    g = np.where(env < 10.0 ** (c["expander_thresh_db"] / 20.0), 10.0 ** (c["expander_depth_db"] / 20.0), 1.0).astype(np.float32)
+    w = w * np.convolve(g, np.ones(k, dtype=np.float32) / k, "same").astype(np.float32)
+    return _cosine_edge_fade(w, fade_s=0.010)
 
 
-def split_points(w, weights):
-    """Cut a sentence into its clauses: proportional to syllables, snapped to the quietest 10 ms nearby."""
-    k = int(0.01 * SR); env = np.convolve(np.abs(w), np.ones(k) / k, "same")
-    cuts, tot, acc = [0], sum(weights), 0
-    for wt in weights[:-1]:
-        acc += wt; guess = int(len(w) * acc / tot); r = int(0.25 * SR)
-        lo, hi = max(cuts[-1] + k, guess - r), min(len(w) - k, guess + r)
-        cuts.append(lo + int(np.argmin(env[lo:hi])) if hi > lo else guess)
-    return cuts + [len(w)]
+def _count_syllables(text):
+    en_spans = re.findall(r"<en>(.*?)</en>", text)
+    en_words = sum(len(s.split()) for s in en_spans)
+    vi_clean = re.sub(r"[^\w\sÀ-ỹ]", " ", re.sub(r"<en>.*?</en>", "", text))
+    vi_syls = len([w for w in vi_clean.split() if w])
+    return max(1, vi_syls + en_words)
 
 
 _TTS = None
@@ -271,25 +562,20 @@ def _tts_job(job):
 
 
 def presynth(jobs, workers, threads=0, batch_size=16):
-    """Synthesize missing sentences.
-    - CUDA GPU: single in-process PyTorch instance under machine-wide gpu_lock using infer_batch()
-      (avoids multi-process RAM/VRAM duplication & ~3-4x faster at ~0.5 GB VRAM).
-    - CPU / Apple Silicon: ONNX fp32 ProcessPoolExecutor when >=8 jobs."""
+    """Synthesize missing utterances under VRAM-aware gpu_slot (CUDA infer_batch) or CPU ONNX."""
     if not jobs:
         return
     if _tts_cuda_available():
         bs = max(1, int(batch_size or 16))
-        from collections import defaultdict
         by_cfg = defaultdict(list)
-        for j in jobs:
-            text, voice, temp, top_k, path = j
+        for text, voice, temp, top_k, path in jobs:
             by_cfg[(voice, temp, top_k)].append((text, path))
-        with ap.gpu_lock():
+        with ap.gpu_slot("vieneu", vram_mb=1024, label="VIENEU-TTS"):
             if _TTS is None:
                 _tts_init(device="cuda", max_batch_size=bs)
             for (voice, temp, top_k), items in by_cfg.items():
                 for start in range(0, len(items), bs):
-                    chunk = items[start:start + bs]
+                    chunk = items[start: start + bs]
                     texts = [t for t, _ in chunk]
                     wavs = _TTS.infer_batch(texts=texts, voice=voice, temperature=temp, top_k=top_k, batch_size=bs)
                     for (_, path), w in zip(chunk, wavs):
@@ -305,32 +591,39 @@ def presynth(jobs, workers, threads=0, batch_size=16):
     from concurrent.futures import ProcessPoolExecutor
     n_w = min(workers, len(jobs))
     t_per_w = int(threads) if threads else max(1, (os.cpu_count() or 4) // n_w)
-    with ProcessPoolExecutor(max_workers=n_w, mp_context=mp.get_context("spawn"),
-                             initializer=_tts_init, initargs=(t_per_w, "cpu")) as ex:
+    with ProcessPoolExecutor(
+        max_workers=n_w, mp_context=mp.get_context("spawn"),
+        initializer=_tts_init, initargs=(t_per_w, "cpu"),
+    ) as ex:
         list(ex.map(_tts_job, jobs))
 
 
-def _tts_cache_dir(ws):
-    """Return persistent cross-series TTS cache (<project_root>/.cache/tts_sent) so pruning a series hub never wipes cached voices."""
-    d = os.path.join(ap.global_cache_dir(ws), "tts_sent")
-    os.makedirs(d, exist_ok=True)
-    return d
+def _resolve_hub(ws):
+    pc = _jload(os.path.join(ws, "config", "project_config.json"), {}) or {}
+    rel = pc.get("series_hub_rel")
+    if rel:
+        cand = os.path.normpath(os.path.join(ws, rel))
+        if os.path.isdir(cand):
+            return cand
+    hub = pc.get("series_hub_dir") or ""
+    if hub and os.path.isdir(hub):
+        return hub
+    cand = os.path.dirname(os.path.dirname(os.path.abspath(ws)))
+    if os.path.basename(os.path.dirname(os.path.abspath(ws))) == "units" and os.path.isdir(os.path.join(cand, "units")):
+        return cand
+    return ""
 
 
-def _resolve_tts_cached_path(ws, cache_dir, key):
-    """Return target cache path, migrating from legacy <hub>/.cache/tts_sent or <ws>/.cache/tts_sent if present."""
-    dst = os.path.join(cache_dir, key + ".wav")
+def _resolve_tts_cached_path(ws, key):
+    """Return global content-addressed tts_sent path, migrating legacy unit/hub copies if present."""
+    dst = ap.global_cache_path("tts_sent", key, ".wav", hint_path=ws)
     if os.path.exists(dst):
         return dst
-    hub = aicn.resolve_unit_hub(ws)
+    hub = _resolve_hub(ws)
     for leg_base in ([os.path.join(hub, ".cache", "tts_sent")] if hub else []) + [os.path.join(ws, ".cache", "tts_sent")]:
         leg = os.path.join(leg_base, key + ".wav")
         if os.path.exists(leg) and os.path.abspath(leg) != os.path.abspath(dst):
-            try:
-                os.link(leg, dst)
-            except OSError:
-                import shutil
-                shutil.copy2(leg, dst)
+            _link_or_copy(leg, dst)
             return dst
     return dst
 
@@ -346,161 +639,332 @@ def _resolve_tts_parallelism(c):
     return w, th
 
 
-def _audio_state_load(ws):
-    return aicn.jload(os.path.join(ws, ".cache", "audio_state.json"), {}) or {}
+def _dub_cache_key(ws, c, script_p, dur):
+    return ap.hash_obj({
+        "v": AUDIO_VERSION,
+        "script": ap.content_sha256(script_p),
+        "dur": round(dur, 3),
+        "cfg": {
+            k: c.get(k) for k in (
+                "voice", "temperature", "top_k", "group_max_gap_s", "max_group_clauses",
+                "max_group_span_s", "base_tempo", "max_tempo", "max_tempo_short",
+                "lead_gap_s", "max_overhang_s", "min_utterance_s",
+                "expander_thresh_db", "expander_depth_db",
+            )
+        },
+    })
 
 
-def _audio_state_save(ws, st):
-    aicn.jdump(os.path.join(ws, ".cache", "audio_state.json"), st)
-
-
-def cmd_dub(ws, c, fh):
-    script_p = os.path.join(ws, "data", "02_bilingual_script.json")
-    segs = aicn.jload(script_p)
-    dur = float(profile(ws)["duration"]); n = int(round(dur * SR))
+def _dub_outputs_valid(ws, n_segs):
     dub_wav_p = os.path.join(ws, "media", "audio", "dub_voice_48k.wav")
     aligned_p = os.path.join(ws, "data", "03_aligned_subtitles.json")
     log_p = os.path.join(ws, "data", "03_dub_sentences.json")
     srt_p = os.path.join(ws, "data", "subtitles_full.srt")
-    wav_dir = os.path.join(ws, "media", "tts_segments"); os.makedirs(wav_dir, exist_ok=True)
-    dub_key = None
-    if fh is not None and os.path.exists(script_p):
-        dub_key = aicn.h_obj({
-            "v": AUDIO_VERSION, "script": fh(script_p), "dur": round(dur, 3),
-            "cfg": {k: c.get(k) for k in ("voice", "temperature", "top_k", "group_max_gap_s", "base_tempo",
-                                          "max_tempo", "lead_gap_s", "expander_thresh_db", "expander_depth_db")},
-        })
-        st_cache = _audio_state_load(ws)
-        outs_ok = (
-            all(os.path.exists(p) for p in (dub_wav_p, aligned_p, log_p, srt_p))
-            and all(os.path.exists(os.path.join(wav_dir, f"seg_{i:04d}.wav")) for i in range(len(segs)))
-        )
-        if not c.get("_force") and st_cache.get("dub_key") == dub_key and outs_ok:
-            print(f"[dub] cached ({len(segs)} lines, key={dub_key[:12]})")
-            return
+    if not all(os.path.exists(p) for p in (dub_wav_p, aligned_p, log_p, srt_p)):
+        return False
+    log = _jload(log_p, []) or []
+    aligned = _jload(aligned_p, []) or []
+    if len(aligned) != n_segs or not log:
+        return False
+    for it in log:
+        u_rel = it.get("utterance_wav") or f"media/tts_segments/utt_{int(it['utterance_id']):04d}.wav"
+        if not os.path.exists(os.path.join(ws, u_rel)):
+            return False
+        if it.get("overflow_s", 0.0) > 0.05 or it.get("tempo", 1.0) > it.get("cap_tempo", 1.28) + 0.005:
+            return False
+    return True
 
-    groups = group_lines(segs, c["group_max_gap_s"])
-    cache = _tts_cache_dir(ws)
-    rb_cache = os.path.join(ws, ".cache", "rb_clause"); os.makedirs(rb_cache, exist_ok=True)
-    track = np.zeros(n, np.float32); aligned = [None] * len(segs); log = []; synth = 0; t0 = time.time()
-    jobs, seen = [], set()
-    for g in groups:
-        text = " ".join(segs[i]["tts_text"].strip() for i in g)
-        voice = segs[g[0]].get("voice") or c["voice"]
-        key = aicn.h_obj({"t": text, "v": voice, "e": aicn.TTS_ENGINE_TAG, "temp": c["temperature"], "k": c["top_k"]})
-        p_ = _resolve_tts_cached_path(ws, cache, key)
-        if not os.path.exists(p_) and p_ not in seen:
-            seen.add(p_); jobs.append((text, voice, c["temperature"], c["top_k"], p_))
-    tts_w, tts_th = _resolve_tts_parallelism(c)
-    presynth(jobs, tts_w, tts_th, batch_size=c.get("tts_batch_size", 16)); synth = len(jobs)
-    # Prepare raw cleaned waves, split into per-clause pieces, and run rubberband time-stretch with per-clause cache
-    prep_clauses = []
-    group_meta = []
+
+def _plan_unit_dub(ws, c):
+    """Load script, group continuous clauses, and enumerate TTS cache keys/paths for one unit."""
+    _assert_voice_dub(ws)
+    script_p = os.path.join(ws, "data", "02_bilingual_script.json")
+    segs = _jload(script_p)
+    if not segs:
+        sys.exit(f"[aicn-audio] missing or empty {script_p}")
+    dur = float(profile(ws)["duration"])
+    dub_key = _dub_cache_key(ws, c, script_p, dur)
+    st_cache = _audio_state_load(ws)
+    if not c.get("_force") and st_cache.get("dub_key") == dub_key and _dub_outputs_valid(ws, len(segs)):
+        return {"cached": True, "ws": ws, "c": c, "segs": segs, "dur": dur, "dub_key": dub_key, "items": []}
+
+    groups = group_lines(segs, c["group_max_gap_s"], c["max_group_clauses"], c["max_group_span_s"])
+    items = []
     for gi, g in enumerate(groups):
         text = " ".join(segs[i]["tts_text"].strip() for i in g)
         voice = segs[g[0]].get("voice") or c["voice"]
-        key = aicn.h_obj({"t": text, "v": voice, "e": aicn.TTS_ENGINE_TAG, "temp": c["temperature"], "k": c["top_k"]})
-        raw_p = _resolve_tts_cached_path(ws, cache, key)
+        t_key = ap.tts_sent_key(text, voice, TTS_ENGINE_TAG, c["temperature"], c["top_k"])
+        raw_p = _resolve_tts_cached_path(ws, t_key)
+        items.append((gi, g, text, voice, t_key, raw_p))
+    return {"cached": False, "ws": ws, "c": c, "segs": segs, "dur": dur, "dub_key": dub_key, "items": items}
+
+
+def _assemble_unit_dub(plan, allow_overflow=False):
+    """Clean raw WAVs, stretch once via global rb_stretch cache, place once onto dub_voice_48k.wav."""
+    ws, c, segs, dur, dub_key, items = plan["ws"], plan["c"], plan["segs"], plan["dur"], plan["dub_key"], plan["items"]
+    if plan["cached"]:
+        print(f"[dub] cached ({os.path.basename(ws)}, {len(segs)} lines, key={dub_key[:12]})")
+        return True, []
+
+    t0 = time.time()
+    n = int(round(dur * SR))
+    wav_dir = os.path.join(ws, "media", "tts_segments")
+    os.makedirs(wav_dir, exist_ok=True)
+    # Remove legacy seg_*.wav or stale utt_*.wav left from earlier runs
+    for fn in os.listdir(wav_dir):
+        if fn.startswith("seg_") or (fn.startswith("utt_") and fn.endswith(".wav")):
+            try:
+                os.remove(os.path.join(wav_dir, fn))
+            except OSError:
+                pass
+
+    base_t = float(c["base_tempo"])
+    lead_gap = float(c["lead_gap_s"])
+    max_overhang = float(c["max_overhang_s"])
+    min_utt_s = float(c["min_utterance_s"])
+
+    prep = []
+    prev_est_end = -1.0
+    for idx_pos, (gi, g, text, voice, t_key, raw_p) in enumerate(items):
         w_raw = clean(sf.read(raw_p, dtype="float32")[0], c)
-        st = float(segs[g[0]]["start"])
-        nxt_grp = float(segs[groups[gi + 1][0]]["start"]) if gi + 1 < len(groups) else dur - 0.05
-        window = max(0.25, nxt_grp - c["lead_gap_s"] - st)
-        natural = len(w_raw) / SR
-        cuts = split_points(w_raw, [max(1, len(segs[i]["tts_text"].split())) for i in g])
-        c_start_idx = len(prep_clauses)
-        for j, i in enumerate(g):
-            raw_piece = w_raw[cuts[j]:cuts[j + 1]]
-            s0 = float(segs[i]["start"])
-            nxt_line = float(segs[i + 1]["start"]) if i + 1 < len(segs) else dur - 0.05
-            gap = c["lead_gap_s"] if (j + 1 == len(g)) else 0.03
-            win_j = max(0.25, nxt_line - gap - s0)
-            nat_j = len(raw_piece) / SR
-            tempo_j = max(c["base_tempo"], min(c["max_tempo"], nat_j / win_j)) if len(raw_piece) > 480 else 1.0
-            rb_k = aicn.h_obj({"sk": key, "a": int(cuts[j]), "b": int(cuts[j + 1]), "t": round(tempo_j, 4)})[:20]
-            prep_clauses.append((gi, j, i, raw_piece, tempo_j, os.path.join(rb_cache, rb_k + ".wav")))
-        group_meta.append((gi, g, text, st, window, natural, c_start_idx, len(prep_clauses)))
+        raw_dur = len(w_raw) / SR
+        s0 = float(segs[g[0]]["start"])
+        g_end = float(segs[g[-1]]["end"])
+        start_u = s0 if prev_est_end < 0.0 else max(s0, prev_est_end + 0.03)
+        next_start = float(segs[items[idx_pos + 1][1][0]]["start"]) if idx_pos + 1 < len(items) else dur
+        eff_ceil = min(next_start - lead_gap, g_end + max_overhang) if idx_pos + 1 < len(items) else min(dur, g_end + max_overhang)
+        avail_raw = eff_ceil - start_u
+        avail = max(0.12, avail_raw)
+        syl_cnt = _count_syllables(text)
+        cap = float(c["max_tempo_short"]) if syl_cnt <= 2 else float(c["max_tempo"])
+        req_tempo = raw_dur / avail if raw_dur > 0 else 1.0
+        target_tempo = max(base_t, req_tempo) if raw_dur > 0 else 1.0
+        stretch_tempo = min(cap, target_tempo)
+        prev_est_end = start_u + (raw_dur / max(0.5, stretch_tempo))
+        raw_wav_sha = hashlib.sha256(np.ascontiguousarray(w_raw, dtype=np.float32).tobytes()).hexdigest()
+        rb_key = ap.rb_stretch_key(raw_wav_sha, stretch_tempo, RB_STRETCH_VERSION)
+        rb_p = ap.global_cache_path("rb_stretch", rb_key, ".wav", hint_path=ws)
+        prep.append((gi, g, text, w_raw, raw_dur, s0, g_end, next_start, eff_ceil, avail_raw, syl_cnt, cap, req_tempo, stretch_tempo, rb_p))
 
-    rb_hits = 0
+    unique_jobs = {}
+    for it in prep:
+        cp = it[14]
+        if cp not in unique_jobs:
+            unique_jobs[cp] = (it[3], it[13], cp)
 
-    def _stretch_cached(it):
-        raw_p, tempo_j, cp = it[3], it[4], it[5]
-        if len(raw_p) <= 480:
-            return raw_p, True
+    def _stretch_cached(job):
+        w_raw, st_tempo, cp = job
+        if len(w_raw) == 0:
+            return w_raw, True
         if not c.get("_force") and os.path.exists(cp):
             return sf.read(cp, dtype="float32")[0], True
-        out = stretch(raw_p, tempo_j)
+        out = stretch(w_raw, st_tempo)
         _write_wav16(cp, out, SR)
         return out, False
 
-    rb_workers = min(8, os.cpu_count() or 4, max(1, len(prep_clauses)))
+    job_list = list(unique_jobs.values())
+    rb_workers = min(8, os.cpu_count() or 4, max(1, len(job_list)))
     with ThreadPoolExecutor(max_workers=rb_workers) as ex:
-        res_clauses = list(ex.map(_stretch_cached, prep_clauses))
-    stretched_clauses = [r[0] for r in res_clauses]
-    rb_hits = sum(1 for r in res_clauses if r[1])
+        unique_res = dict(zip((j[2] for j in job_list), ex.map(_stretch_cached, job_list)))
+    stretched_res = [unique_res[it[14]] for it in prep]
+    rb_hits = sum(1 for it in prep if unique_res[it[14]][1])
+
+    track = np.zeros(n, dtype=np.float32)
+    aligned = [None] * len(segs)
+    log = []
     prev_sp_e = -1.0
-    for gi, g, text, st, window, natural, c0, c1 in group_meta:
-        piece_tempos = []
-        piece_durs = 0.0
-        for idx_c in range(c0, c1):
-            _, j, i, _raw_p, tempo_j, _cp = prep_clauses[idx_c]
-            piece = stretched_clauses[idx_c].astype(np.float32, copy=True)
-            f = min(int(0.005 * SR), len(piece) // 4)
-            if f > 0:
-                piece[:f] *= np.linspace(0, 1, f, dtype=np.float32)
-                piece[-f:] *= np.linspace(1, 0, f, dtype=np.float32)
-            s0, e0 = float(segs[i]["start"]), float(segs[i]["end"])
-            sp_s = max(s0, prev_sp_e + 0.02) if prev_sp_e >= 0.0 else s0
-            a = min(n, max(0, int(round(sp_s * SR)))); b = min(n, a + len(piece))
-            if b > a:
-                track[a:b] += piece[: b - a]
-            sf.write(os.path.join(wav_dir, f"seg_{i:04d}.wav"), piece if len(piece) > 480 else np.zeros(4800, np.float32), SR)
-            sp_e = sp_s + len(piece) / SR
-            prev_sp_e = sp_e
-            piece_tempos.append(tempo_j)
-            piece_durs += len(piece) / SR
+    over_entries = []
+
+    for idx_pos, (it, (piece_raw, _)) in enumerate(zip(prep, stretched_res)):
+        gi, g, text, _w_raw, raw_dur, s0, g_end, next_start, eff_ceil, avail_raw, syl_cnt, cap, req_tempo, stretch_tempo, _cp = it
+        piece = _cosine_edge_fade(piece_raw, fade_s=0.010)
+        piece_dur = len(piece) / SR
+        sp_s = s0 if prev_sp_e < 0.0 else max(s0, prev_sp_e + 0.03)
+        a = min(n, max(0, int(round(sp_s * SR))))
+        b = min(n, a + len(piece))
+        if b > a:
+            track[a:b] += piece[: b - a]
+        sp_e = sp_s + piece_dur
+        prev_sp_e = sp_e
+
+        utt_rel = f"media/tts_segments/utt_{gi:04d}.wav"
+        _write_wav16(os.path.join(ws, utt_rel), piece, SR)
+
+        # Map clause start/end proportionally across the continuous indivisible group span for SRT/metadata
+        g_span = max(0.05, g_end - s0)
+        for j, i in enumerate(g):
+            seg_s0, seg_e0 = float(segs[i]["start"]), float(segs[i]["end"])
+            frac0 = max(0.0, min(1.0, (seg_s0 - s0) / g_span))
+            frac1 = max(frac0, min(1.0, (seg_e0 - s0) / g_span))
+            cl_sp_s = sp_s + frac0 * piece_dur
+            cl_sp_e = sp_s + frac1 * piece_dur
             nxt_line = float(segs[i + 1]["start"]) if i + 1 < len(segs) else dur
-            slot_end = max(s0 + 0.15, min(max(e0, sp_e), nxt_line - 0.04))
-            aligned[i] = {"id": i, "slot_start": round(s0, 3), "slot_end": round(slot_end, 3),
-                          "speech_start": round(sp_s, 3), "speech_end": round(sp_e, 3), "audio_end": round(sp_e, 3),
-                          "pause_after": round(max(0.0, nxt_line - sp_e), 3), "tempo": round(tempo_j, 3),
-                          "group": gi, "zh_text": segs[i].get("zh_text", ""), "sub_text": segs[i]["sub_text"],
-                          "tts_text": segs[i]["tts_text"]}
-        overflow = prev_sp_e - (st + window)
-        syl = len(text.split())
-        log.append({"group": gi, "ids": g, "start": round(st, 3), "natural_s": round(natural, 2), "window_s": round(window, 2),
-                    "tempo": round(max(piece_tempos, default=1.0), 3), "overflow_s": round(overflow, 2),
-                    "syl_per_s": round(syl / max(0.05, piece_durs), 2), "text": text})
-    os.makedirs(os.path.dirname(dub_wav_p), exist_ok=True)
+            slot_end = min(dur, max(seg_e0, sp_e)) if i + 1 == len(segs) else max(seg_s0 + 0.05, min(max(seg_e0, cl_sp_e), nxt_line - 0.02))
+            pause_after = max(0.0, nxt_line - sp_e) if (j + 1 == len(g)) else max(0.0, float(segs[i + 1]["start"]) - seg_e0)
+            aligned[i] = {
+                "id": segs[i].get("id", i),
+                "slot_start": round(seg_s0, 3),
+                "slot_end": round(slot_end, 3),
+                "speech_start": round(cl_sp_s, 3),
+                "speech_end": round(cl_sp_e, 3),
+                "audio_end": round(cl_sp_e, 3),
+                "utterance_id": gi,
+                "group": gi,
+                "utterance_wav": utt_rel,
+                "utt_speech_start": round(sp_s, 3),
+                "utt_speech_end": round(sp_e, 3),
+                "pause_after": round(pause_after, 3),
+                "tempo": round(stretch_tempo, 3),
+                "tempo_ratio": round(stretch_tempo, 3),
+                "zh_text": segs[i].get("zh_text", ""),
+                "sub_text": segs[i]["sub_text"],
+                "tts_text": segs[i]["tts_text"],
+            }
+
+        has_next = idx_pos + 1 < len(prep)
+        over_ceil = sp_e - eff_ceil
+        over_next = (sp_e - (next_start - 0.03)) if has_next else (sp_e - dur - 0.05)
+        overflow_s = max(over_ceil, over_next)
+        if req_tempo > cap + 0.005:
+            overflow_s = max(overflow_s, raw_dur / cap - max(0.05, avail_raw))
+        trim_syls = max(1, int(np.ceil(max(0.0, overflow_s) * 5.2 * cap))) if overflow_s > 0.0 else 0
+        runt_bad = piece_dur < min_utt_s
+        is_bad = runt_bad or (req_tempo > cap + 0.005) or (over_ceil > 0.05) or (over_next > 0.0)
+        entry = {
+            "utterance_id": gi,
+            "group": gi,
+            "ids": g,
+            "utterance_wav": utt_rel,
+            "start": round(s0, 3),
+            "script_start": round(s0, 3),
+            "script_end": round(g_end, 3),
+            "speech_start": round(sp_s, 3),
+            "speech_end": round(sp_e, 3),
+            "natural_s": round(raw_dur, 3),
+            "stretched_s": round(piece_dur, 3),
+            "window_s": round(avail_raw, 3),
+            "tempo": round(stretch_tempo, 3),
+            "required_tempo": round(req_tempo, 3),
+            "cap_tempo": round(cap, 3),
+            "overflow_s": round(overflow_s, 3),
+            "syl_count": syl_cnt,
+            "syl_per_s": round(syl_cnt / max(0.05, piece_dur), 2),
+            "suggested_trim_syls": trim_syls,
+            "runt": runt_bad,
+            "text": text,
+        }
+        log.append(entry)
+        if is_bad:
+            over_entries.append(entry)
+
+    dub_wav_p = os.path.join(ws, "media", "audio", "dub_voice_48k.wav")
+    aligned_p = os.path.join(ws, "data", "03_aligned_subtitles.json")
+    log_p = os.path.join(ws, "data", "03_dub_sentences.json")
+    srt_p = os.path.join(ws, "data", "subtitles_full.srt")
     _write_wav16(dub_wav_p, track, SR)
-    aicn.jdump(aligned_p, aligned)
-    aicn.jdump(log_p, log)
-    with open(srt_p, "w", encoding="utf-8") as f:
-        for k, it in enumerate(aligned, 1):
-            f.write(f"{k}\n{srt_t(it['slot_start'])} --> {srt_t(it['slot_end'])}\n{it['sub_text']}\n\n")
-    if dub_key is not None:
+    _jdump(aligned_p, aligned)
+    _jdump(log_p, log)
+    tmp_srt = _tmp_path(srt_p, "tmp")
+    try:
+        with open(tmp_srt, "w", encoding="utf-8") as f:
+            for k, it in enumerate(aligned, 1):
+                f.write(f"{k}\n{srt_t(it['slot_start'])} --> {srt_t(it['slot_end'])}\n{it['sub_text']}\n\n")
+        _atomic_replace(tmp_srt, srt_p)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_srt)
+        raise
+
+    rates = [l["syl_per_s"] for l in log] or [0.0]
+    tempos = [l["tempo"] for l in log] or [1.0]
+    print(
+        f"[dub] {os.path.basename(ws)}: {len(segs)} lines -> {len(items)} indivisible utterances, "
+        f"rb_cached {rb_hits}/{len(prep)} in {time.time() - t0:.1f}s; "
+        f"tempo median {np.median(tempos):.2f}x max {max(tempos):.2f}x; "
+        f"rate median {np.median(rates):.2f} syl/s; overflow/runt {len(over_entries)}"
+    )
+    for l in over_entries[:10]:
+        why = f"RUNT {l['stretched_s']:.3f}s < {min_utt_s}s" if l["runt"] else f"+{l['overflow_s']:.2f}s (req {l['required_tempo']:.2f}x > cap {l['cap_tempo']:.2f}x, trim ~{l['suggested_trim_syls']} syl)"
+        print(f"   OVERFLOW utt {l['utterance_id']} ids {l['ids']} {why}: {l['text']}", file=sys.stderr)
+
+    if over_entries and not allow_overflow:
         st_cache = _audio_state_load(ws)
-        st_cache["dub_key"] = dub_key
+        st_cache.pop("dub_key", None)
         _audio_state_save(ws, st_cache)
-    over = [l for l in log if l["overflow_s"] > 0.05]
-    rates = [l["syl_per_s"] for l in log]
-    print(f"[dub] {len(segs)} lines -> {len(groups)} sentences, synth {synth}, rb_cached {rb_hits}/{len(prep_clauses)} in {time.time() - t0:.1f}s; "
-          f"tempo median {np.median([l['tempo'] for l in log]):.2f}x max {max(l['tempo'] for l in log):.2f}x; "
-          f"rate median {np.median(rates):.2f} syl/s; overflow {len(over)}")
-    for l in over[:10]:
-        print(f"   OVERFLOW group {l['group']} ids {l['ids']} +{l['overflow_s']}s at max tempo: shorten -> {l['text']}")
+        return False, over_entries
+
+    st_cache = _audio_state_load(ws)
+    st_cache["dub_key"] = dub_key
+    _audio_state_save(ws, st_cache)
+    return True, over_entries
+
+
+def batch_dub(units, force=False, allow_overflow=False, exit_on_overflow=True):
+    """Synthesize missing utterances ONCE in GPU memory across all units, then assemble in parallel."""
+    plans = []
+    for ws in units:
+        ws = os.path.abspath(ws)
+        c = cfg(ws)
+        if force:
+            c["_force"] = True
+        plans.append(_plan_unit_dub(ws, c))
+
+    jobs, seen = [], set()
+    ref_c = plans[0]["c"] if plans else DEFAULTS
+    for pl in plans:
+        if pl["cached"]:
+            continue
+        c = pl["c"]
+        for _gi, _g, text, voice, _t_key, raw_p in pl["items"]:
+            if not os.path.exists(raw_p) and raw_p not in seen:
+                seen.add(raw_p)
+                jobs.append((text, voice, c["temperature"], c["top_k"], raw_p))
+    if jobs:
+        tts_w, tts_th = _resolve_tts_parallelism(ref_c)
+        presynth(jobs, tts_w, tts_th, batch_size=ref_c.get("tts_batch_size", 16))
+
+    results = {}
+    for pl in plans:
+        ok, overs = _assemble_unit_dub(pl, allow_overflow=allow_overflow)
+        results[pl["ws"]] = (ok, overs)
+    bad = [os.path.basename(u) for u, (ok, _) in results.items() if not ok]
+    if bad and exit_on_overflow:
+        print(f"[aicn-audio] dub fail-fast OVERFLOW in units {bad} (aborted before mix/master; trim tts_text in Stage 2).", file=sys.stderr)
+        sys.exit(2)
+    return results
+
+
+def cmd_dub(ws, c, fh=None):
+    ws = os.path.abspath(ws)
+    pl = _plan_unit_dub(ws, c)
+    if not pl["cached"]:
+        jobs, seen = [], set()
+        for _gi, _g, text, voice, _t_key, raw_p in pl["items"]:
+            if not os.path.exists(raw_p) and raw_p not in seen:
+                seen.add(raw_p)
+                jobs.append((text, voice, c["temperature"], c["top_k"], raw_p))
+        if jobs:
+            tts_w, tts_th = _resolve_tts_parallelism(c)
+            presynth(jobs, tts_w, tts_th, batch_size=c.get("tts_batch_size", 16))
+    ok, _ = _assemble_unit_dub(pl, allow_overflow=bool(c.get("_allow_overflow")))
+    if not ok:
+        sys.exit(2)
 
 
 def srt_t(s):
-    ms = int(round(s * 1000)); h, ms = divmod(ms, 3600000); m, ms = divmod(ms, 60000); sec, ms = divmod(ms, 1000)
+    ms = int(round(s * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    sec, ms = divmod(ms, 1000)
     return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
 
-# ---------------------------------------------------------------- mix
+# ---------------------------------------------------------------- mix (single-STFT + C-speed DSP)
 NFFT, HOP = 2048, 512
 EDGES = [0, 150, 300, 500, 800, 1200, 1800, 2600, 3600, 5000, 7000, 10000, 24001]
-BAND_W = np.array([0.3, 0.5, 0.8, 1, 1, 1, 1, 1, 1, 0.8, 0.5, 0.3])   # speech bands get full treatment
+BAND_W = np.array([0.3, 0.5, 0.8, 1, 1, 1, 1, 1, 1, 0.8, 0.5, 0.3])
+BAND_W_VOCAL = np.array([0.35, 0.60, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.85, 0.55, 0.35])
 SPEECH = slice(3, 9)   # 500 Hz - 5 kHz
-
 
 SPEC_BANDS = [
     ("sub_rumble", 0, 80),
@@ -514,19 +978,26 @@ SPEC_BANDS = [
     ("ultrasonic", 16000, 24001),
 ]
 
+_WIN_HANN = get_window("hann", NFFT, fftbins=True).astype(np.float32)
+_WIN_SUM = np.float32(_WIN_HANN.sum())
+_WIN_SQ = (_WIN_HANN * _WIN_HANN).astype(np.float32)
+_FFT_WORKERS = min(4, os.cpu_count() or 1)
+_WIN_HANN_T = torch.from_numpy(_WIN_HANN) if torch is not None else None
+
 
 def apply_hp_lp(x, hp_hz=0.0, lp_hz=0.0, order=2):
-    """Apply clean Butterworth high-pass and/or low-pass conditioning along time axis 0."""
-    from scipy.signal import butter, sosfilt
+    """Apply Butterworth high-pass and/or low-pass conditioning in one combined SOS pass along axis 0."""
     y = np.asarray(x, dtype=np.float32)
     nyq = 0.5 * SR
+    sos_parts = []
     if hp_hz and 1.0 < float(hp_hz) < nyq * 0.95:
-        sos_hp = butter(order, float(hp_hz), "hp", fs=SR, output="sos").astype(np.float32)
-        y = sosfilt(sos_hp, y, axis=0).astype(np.float32)
+        sos_parts.append(butter(order, float(hp_hz), "hp", fs=SR, output="sos"))
     if lp_hz and 10.0 < float(lp_hz) < nyq * 0.98:
-        sos_lp = butter(order, float(lp_hz), "lp", fs=SR, output="sos").astype(np.float32)
-        y = sosfilt(sos_lp, y, axis=0).astype(np.float32)
-    return y
+        sos_parts.append(butter(order, float(lp_hz), "lp", fs=SR, output="sos"))
+    if not sos_parts:
+        return y
+    sos = np.vstack(sos_parts).astype(np.float32)
+    return _sosfilt_parallel(sos, y).astype(np.float32, copy=False)
 
 
 def hangover_hold(mask, fps, hold_s):
@@ -551,26 +1022,19 @@ def hangover_hold(mask, fps, hold_s):
 
 
 def _biquad_peaking(f0, gain_db, q, sr=SR):
-    """RBJ Audio EQ Cookbook peaking biquad returned as a (1, 6) SOS array (zero comb-filtering)."""
     A = 10.0 ** (float(gain_db) / 40.0)
     w0 = 2.0 * np.pi * float(f0) / float(sr)
     alpha = np.sin(w0) / (2.0 * float(q))
     cw = np.cos(w0)
-    b0 = 1.0 + alpha * A
-    b1 = -2.0 * cw
-    b2 = 1.0 - alpha * A
-    a0 = 1.0 + alpha / A
-    a1 = -2.0 * cw
-    a2 = 1.0 - alpha / A
+    b0, b1, b2 = 1.0 + alpha * A, -2.0 * cw, 1.0 - alpha * A
+    a0, a1, a2 = 1.0 + alpha / A, -2.0 * cw, 1.0 - alpha / A
     return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
 
 
 def _biquad_highshelf(f0, gain_db, slope=0.7, sr=SR):
-    """RBJ Audio EQ Cookbook high-shelf biquad returned as a (1, 6) SOS array."""
     A = 10.0 ** (float(gain_db) / 40.0)
     w0 = 2.0 * np.pi * float(f0) / float(sr)
-    cw = np.cos(w0)
-    sw = np.sin(w0)
+    cw, sw = np.cos(w0), np.sin(w0)
     alpha = sw / 2.0 * np.sqrt(max(1e-6, (A + 1.0 / A) * (1.0 / float(slope) - 1.0) + 2.0))
     sq = 2.0 * np.sqrt(A) * alpha
     b0 = A * ((A + 1.0) + (A - 1.0) * cw + sq)
@@ -582,38 +1046,65 @@ def _biquad_highshelf(f0, gain_db, slope=0.7, sr=SR):
     return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
 
 
-def spectral_profile(x, sr=SR):
-    """Measure active-frame multi-band spectral share, centroid, RMS/Peak dBFS, and crest factor."""
-    from scipy.signal import stft
-    arr = np.asarray(x, dtype=np.float32)
-    mono = arr if arr.ndim == 1 else arr.mean(axis=1)
-    if len(mono) < NFFT:
-        mono = np.pad(mono, (0, NFFT - len(mono)))
-    peak = float(np.max(np.abs(mono)) + 1e-12)
-    peak_db = round(20.0 * np.log10(peak), 2)
-
-    # Measure RMS and spectrum on active frames (> -55 dBFS) so silence padding does not skew speech stats
-    blk = max(1, sr // 50)  # 20 ms blocks
-    n_blk = len(mono) // blk
-    if n_blk > 0:
-        b_rms = np.sqrt(np.mean(mono[: n_blk * blk].reshape(n_blk, blk) ** 2, axis=1) + 1e-15)
-        act_b = b_rms > max(10.0 ** (-55.0 / 20.0), peak * 1e-3)
-        active_ratio = float(act_b.mean())
-        rms = float(np.sqrt(np.mean(b_rms[act_b] ** 2) + 1e-12)) if act_b.any() else float(np.sqrt(np.mean(mono ** 2) + 1e-12))
+def spectral_profile_fast(x, sr=SR):
+    """Fast non-overlapping strided Welch spectral balance, RMS/Peak dBFS, and crest factor (<0.25s on 10-min audio)."""
+    arr = np.ascontiguousarray(x, dtype=np.float32)
+    if torch is not None:
+        xt = torch.from_numpy(arr)
+        mt = xt if xt.ndim == 1 else ((xt[:, 0] + xt[:, 1]).mul_(0.5) if xt.shape[1] == 2 else xt.mean(dim=1))
+        if len(mt) < NFFT:
+            mt = F.pad(mt, (0, NFFT - len(mt)))
+        peak = float(mt.abs().max() + 1e-12)
+        peak_db = round(20.0 * np.log10(peak), 2)
+        blk = max(1, sr // 50)
+        n_blk = len(mt) // blk
+        if n_blk > 0:
+            b_rms_t = torch.sqrt(mt[: n_blk * blk].view(n_blk, blk).square().sum(dim=1).mul_(1.0 / blk) + 1e-15)
+            act_b = b_rms_t > max(10.0 ** (-55.0 / 20.0), peak * 1e-3)
+            act_n = int(act_b.sum())
+            active_ratio = float(act_n / n_blk)
+            rms = float(torch.sqrt(b_rms_t[act_b].square().sum() * (1.0 / act_n) + 1e-12)) if act_n else float(torch.sqrt(mt.square().sum() * (1.0 / len(mt)) + 1e-12))
+        else:
+            active_ratio = 1.0
+            rms = float(torch.sqrt(mt.square().sum() * (1.0 / len(mt)) + 1e-12))
+        rms_db = round(20.0 * np.log10(rms), 2)
+        crest_db = round(peak_db - rms_db, 2)
+        nf = len(mt) // NFFT
+        step_f = max(1, nf // 2048) if nf > 4096 else 1
+        Z_t = torch.fft.rfft(mt[: nf * NFFT].view(nf, NFFT)[::step_f] * _WIN_HANN_T, dim=1)
+        Z2_t = Z_t.real * Z_t.real + Z_t.imag * Z_t.imag
+        frame_e_t = Z2_t.sum(dim=1)
+        act_f = frame_e_t > max(float(frame_e_t.max()) * 1e-5, 1e-12)
+        fn = int(act_f.sum())
+        mag2 = ((Z2_t[act_f].sum(dim=0, dtype=torch.float64) / fn) if fn else (Z2_t.sum(dim=0, dtype=torch.float64) / max(1, nf))).numpy()
     else:
-        active_ratio = 1.0
-        rms = float(np.sqrt(np.mean(mono ** 2) + 1e-12))
-    rms_db = round(20.0 * np.log10(rms), 2)
-    crest_db = round(peak_db - rms_db, 2)
-
-    f, _, Z = stft(mono, sr, nperseg=NFFT, noverlap=NFFT - HOP)
-    Z2 = Z.real * Z.real + Z.imag * Z.imag
-    frame_e = Z2.sum(axis=0)
-    act_f = frame_e > max(float(frame_e.max()) * 1e-5, 1e-12)
-    mag2 = Z2[:, act_f].mean(axis=1) if act_f.any() else Z2.mean(axis=1)
+        mono = arr if arr.ndim == 1 else arr.mean(axis=1)
+        if len(mono) < NFFT:
+            mono = np.pad(mono, (0, NFFT - len(mono)))
+        peak = float(np.max(np.abs(mono)) + 1e-12)
+        peak_db = round(20.0 * np.log10(peak), 2)
+        blk = max(1, sr // 50)
+        n_blk = len(mono) // blk
+        if n_blk > 0:
+            b_rms = np.sqrt(np.mean(mono[: n_blk * blk].reshape(n_blk, blk) ** 2, axis=1) + 1e-15)
+            act_b = b_rms > max(10.0 ** (-55.0 / 20.0), peak * 1e-3)
+            active_ratio = float(act_b.mean())
+            rms = float(np.sqrt(np.mean(b_rms[act_b] ** 2) + 1e-12)) if act_b.any() else float(np.sqrt(np.mean(mono ** 2) + 1e-12))
+        else:
+            active_ratio = 1.0
+            rms = float(np.sqrt(np.mean(mono ** 2) + 1e-12))
+        rms_db = round(20.0 * np.log10(rms), 2)
+        crest_db = round(peak_db - rms_db, 2)
+        nf = len(mono) // NFFT
+        frames = np.ascontiguousarray(mono[: nf * NFFT].reshape(nf, NFFT)) * _WIN_HANN[None, :]
+        Z = sp_fft.rfft(frames, axis=1, workers=_FFT_WORKERS)
+        Z2 = (Z.real * Z.real + Z.imag * Z.imag).astype(np.float64)
+        frame_e = Z2.sum(axis=1)
+        act_f = frame_e > max(float(frame_e.max()) * 1e-5, 1e-12)
+        mag2 = Z2[act_f].mean(axis=0) if act_f.any() else Z2.mean(axis=0)
+    f = np.fft.rfftfreq(NFFT, 1.0 / sr)
     tot = float(mag2.sum() + 1e-15)
-    bands_pct = {}
-    bands_db = {}
+    bands_pct, bands_db = {}, {}
     for name, lo, hi in SPEC_BANDS:
         sel = (f >= lo) & (f < hi)
         p = float(mag2[sel].sum()) if sel.any() else 0.0
@@ -631,8 +1122,10 @@ def spectral_profile(x, sr=SR):
     }
 
 
+spectral_profile = spectral_profile_fast
+
+
 def resolve_spectral_plan(stems_profiles, c, user_keys=None):
-    """Derive adaptive HP/LP cutoffs and subtle mud trim from spectral analysis while strictly respecting user overrides."""
     ukeys = set(user_keys or ())
     dub_p = stems_profiles.get("dub", {})
     voc_p = stems_profiles.get("vocals", {})
@@ -655,7 +1148,7 @@ def resolve_spectral_plan(stems_profiles, c, user_keys=None):
     if "vocal_high_dip_db" not in ukeys and (
         voc_p.get("bands_pct", {}).get("sibilance", 0.0) + voc_p.get("bands_pct", {}).get("air", 0.0) > 14.0
     ):
-        voc_high_dip_db = min(voc_high_dip_db, -4.5)
+        voc_high_dip_db = min(voc_high_dip_db, -5.5)
 
     bgm_hp = float(c.get("bgm_hp_hz", DEFAULTS["bgm_hp_hz"]))
     bgm_lp = float(c.get("bgm_lp_hz", DEFAULTS["bgm_lp_hz"]))
@@ -673,9 +1166,8 @@ def resolve_spectral_plan(stems_profiles, c, user_keys=None):
 
 
 def analyze_stems_and_dub(ws, c, V=None, B=None, T=None):
-    """Run frequency analysis on stems + dub and save data/03_spectral_analysis.json."""
     stems_dir = os.path.join(ws, "media", "stems")
-    raw_user = aicn.jload(os.path.join(ws, "config", "audio_mix.json"), {}) or {}
+    raw_user = _jload(os.path.join(ws, "config", "audio_mix.json"), {}) or {}
     profiles = {}
     if V is None and os.path.exists(os.path.join(stems_dir, "vocals.wav")):
         V = sf.read(os.path.join(stems_dir, "vocals.wav"), dtype="float32", always_2d=True)[0]
@@ -685,13 +1177,13 @@ def analyze_stems_and_dub(ws, c, V=None, B=None, T=None):
     if T is None and os.path.exists(dub_p):
         T = sf.read(dub_p, dtype="float32")[0]
     if V is not None and len(V):
-        profiles["vocals"] = spectral_profile(V)
+        profiles["vocals"] = spectral_profile_fast(V)
     if B is not None and len(B):
-        profiles["accomp"] = spectral_profile(B)
+        profiles["accomp"] = spectral_profile_fast(B)
     if T is not None and len(T):
-        profiles["dub"] = spectral_profile(T)
+        profiles["dub"] = spectral_profile_fast(T)
     if not profiles and os.path.exists(source_path(ws) or ""):
-        profiles["source"] = spectral_profile(load(source_path(ws)))
+        profiles["source"] = spectral_profile_fast(load(source_path(ws)))
     plan = resolve_spectral_plan(profiles, c, user_keys=raw_user.keys())
     report = {
         "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -699,11 +1191,11 @@ def analyze_stems_and_dub(ws, c, V=None, B=None, T=None):
         "stems": profiles,
         "filter_plan": plan,
     }
-    aicn.jdump(os.path.join(ws, "data", "03_spectral_analysis.json"), report)
+    _jdump(os.path.join(ws, "data", "03_spectral_analysis.json"), report)
     return report
 
 
-def cmd_analyze(ws, c, fh):
+def cmd_analyze(ws, c, fh=None):
     rep = analyze_stems_and_dub(ws, c)
     fp = rep["filter_plan"]
     print(f"[analyze] saved data/03_spectral_analysis.json | dub HP/LP={fp['dub_hp_hz']}/{fp['dub_lp_hz']} Hz, "
@@ -712,65 +1204,218 @@ def cmd_analyze(ws, c, fh):
 
 
 def voice_chain(x, hp_hz=90.0, lp_hz=16000.0, mud_cut_db=0.0):
-    from scipy.signal import sosfilt
-    x = apply_hp_lp(x, hp_hz=hp_hz, lp_hz=lp_hz, order=2).astype(np.float64)
+    arr = np.asarray(x, dtype=np.float32)
+    nyq = 0.5 * SR
     sos_list = []
+    if hp_hz and 1.0 < float(hp_hz) < nyq * 0.95:
+        sos_list.append(butter(2, float(hp_hz), "hp", fs=SR, output="sos"))
+    if lp_hz and 10.0 < float(lp_hz) < nyq * 0.98:
+        sos_list.append(butter(2, float(lp_hz), "lp", fs=SR, output="sos"))
     if mud_cut_db < -0.1:
         sos_list.append(_biquad_peaking(380.0, mud_cut_db, q=1.1, sr=SR))
     sos_list.append(_biquad_peaking(3100.0, 2.5, q=0.9, sr=SR))
     sos_list.append(_biquad_highshelf(8000.0, -2.0, slope=0.7, sr=SR))
-    x = sosfilt(np.vstack(sos_list), x).astype(np.float32)
-    # 100 Hz envelope (10 ms step matches 10 ms attack; 10x faster than 1 kHz Python loop)
+    x = sosfilt(np.vstack(sos_list).astype(np.float32), _anti_denormal(arr, dtype=np.float32)).astype(np.float32)
     step = 480
     pad_n = (-len(x)) % step
     sq = np.pad(x * x, (0, pad_n)).reshape(-1, step).mean(axis=1)
-    env = np.sqrt(follow(sq[None, :], SR / step, 0.01, 0.15)[0] + 1e-12).repeat(step)[: len(x)]
-    lvl = 20.0 * np.log10(env + 1e-9)
-    return (x * 10.0 ** (np.where(lvl > -20.0, (lvl + 20.0) * (1.0 / 3.0 - 1.0), 0.0) / 20.0)).astype(np.float32)
+    env_blk = np.sqrt(follow(sq[None, :], SR / step, 0.01, 0.15)[0] + 1e-12)
+    lvl_blk = 20.0 * np.log10(env_blk + 1e-9)
+    g_blk = 10.0 ** (np.where(lvl_blk > -20.0, (lvl_blk + 20.0) * (1.0 / 3.0 - 1.0), 0.0) / 20.0)
+    return (x * g_blk.astype(np.float32).repeat(step)[: len(x)]).astype(np.float32)
+
+
+_BAND_CACHE = None
 
 
 def _band_indices():
-    f = np.fft.rfftfreq(NFFT, 1 / SR)
-    idx = [np.flatnonzero((f >= a) & (f < b)) for a, b in zip(EDGES[:-1], EDGES[1:])]
-    band_of_bin = np.zeros(len(f), dtype=np.int32)
-    for k, ii in enumerate(idx):
-        band_of_bin[ii] = k
-    return idx, band_of_bin
+    global _BAND_CACHE
+    if _BAND_CACHE is None:
+        f = np.fft.rfftfreq(NFFT, 1 / SR)
+        idx = [np.flatnonzero((f >= a) & (f < b)) for a, b in zip(EDGES[:-1], EDGES[1:])]
+        band_of_bin = np.zeros(len(f), dtype=np.int32)
+        slices = []
+        contiguous = True
+        for k, ii in enumerate(idx):
+            band_of_bin[ii] = k
+            if len(ii) and np.array_equal(ii, np.arange(ii[0], ii[-1] + 1)):
+                slices.append((int(ii[0]), int(ii[-1]) + 1))
+            else:
+                contiguous = False
+        _BAND_CACHE = (idx, band_of_bin, tuple(slices) if contiguous else None)
+    return _BAND_CACHE[0], _BAND_CACHE[1]
 
 
-def stft_and_power(x, idx=None):
-    """Compute complex64 STFT once and return ((bands, frames) power, list of Z per channel, idx)."""
-    from scipy.signal import stft
-    if idx is None:
-        idx, _ = _band_indices()
-    x = x if x.ndim == 2 else x[:, None]
-    Zs, P = [], None
-    for ch in range(x.shape[1]):
-        _, _, Z = stft(x[:, ch], SR, nperseg=NFFT, noverlap=NFFT - HOP)
-        Z = Z.astype(np.complex64, copy=False)
-        Zs.append(Z)
-        Z2 = Z.real * Z.real + Z.imag * Z.imag
-        pc = np.stack([Z2[i].sum(0) for i in idx])
-        P = pc if P is None else (P + pc)
-    return P / x.shape[1], Zs, idx
+def _torch_istft(Z_stack, length, scale_win_sum=True):
+    """Run C++ PyTorch center=True iSTFT with exact right-pad length alignment."""
+    Z_in = (Z_stack * float(_WIN_SUM)) if scale_win_sum else Z_stack
+    extra_r = _extra_right_pad(length)
+    y = torch.istft(
+        Z_in, n_fft=NFFT, hop_length=HOP, window=_WIN_HANN_T,
+        center=True, length=length + extra_r,
+    )[:, :length]
+    return np.ascontiguousarray(y.t().numpy(), dtype=np.float32)
 
 
-def band_power(x):
-    """x: (n,) or (n, ch). Returns (bands, frames) power, summed over channels."""
-    P, _, idx = stft_and_power(x)
-    return P, idx
+def _ola_from_Zs(Z_list, length):
+    """Overlap-add iSTFT (PyTorch C++ center=True when available, SciPy OLA fallback) matching scipy.signal.istft to <1e-6."""
+    n_ch = len(Z_list)
+    if torch is not None:
+        Z_stack = torch.stack([z if isinstance(z, torch.Tensor) else torch.from_numpy(np.asarray(z)) for z in Z_list], dim=0)
+        return _torch_istft(Z_stack, length, scale_win_sum=True)
+
+    nf = Z_list[0].shape[1]
+    pad_l, pad_r = _pad_for_stft(length)
+    total_len = length + pad_l + pad_r
+    out = np.zeros((total_len, n_ch), dtype=np.float32)
+    norm = np.zeros(total_len, dtype=np.float32)
+    n_phases = NFFT // HOP
+    for p in range(n_phases):
+        cnt = len(range(p, nf, n_phases))
+        if cnt:
+            start = p * HOP
+            norm[start: start + cnt * NFFT] += np.tile(_WIN_SQ, cnt)
+    norm = np.maximum(norm, 1e-12)
+    for ch, Z in enumerate(Z_list):
+        y_f = sp_fft.irfft(Z.T * _WIN_SUM, n=NFFT, axis=1, workers=_FFT_WORKERS).astype(np.float32) * _WIN_HANN[None, :]
+        for p in range(n_phases):
+            sl = y_f[p::n_phases]
+            if len(sl):
+                start = p * HOP
+                out[start: start + len(sl) * NFFT, ch] += sl.reshape(-1)
+    return (out[pad_l: pad_l + length] / norm[pad_l: pad_l + length, None]).astype(np.float32)
 
 
 def istft_from_Z(Zs, g, band_of_bin, length):
-    """Apply per-band gains directly to cached complex64 STFTs and run iSTFT (avoids duplicate STFT)."""
-    from scipy.signal import istft
-    out = np.empty((length, len(Zs)), dtype=np.float32)
-    nf = Zs[0].shape[1]
-    G = g[band_of_bin, :nf].astype(np.float32)
-    for ch, Z in enumerate(Zs):
-        _, y = istft(Z * G, SR, nperseg=NFFT, noverlap=NFFT - HOP)
-        out[:, ch] = y[:length]
-    return out
+    return istft_combined([(Zs, g)], band_of_bin, length)
+
+
+def istft_combined(stem_gain_pairs, band_of_bin, length):
+    """Combine weighted STFTs linearly via contiguous band slices BEFORE running ONE iSTFT."""
+    n_ch = len(stem_gain_pairs[0][0])
+    nf = stem_gain_pairs[0][0][0].shape[1]
+    if torch is not None:
+        _band_indices()
+        _, def_bob, band_slices = _BAND_CACHE
+        use_slices = (
+            band_slices is not None
+            and len(stem_gain_pairs[0][1]) == len(band_slices)
+            and np.array_equal(band_of_bin, def_bob)
+        )
+        Z_first = stem_gain_pairs[0][0]
+        F_bins = Z_first[0].shape[0]
+        if use_slices:
+            Z_acc = torch.empty((n_ch, F_bins, nf), dtype=torch.complex64)
+            g0_t = torch.from_numpy(np.ascontiguousarray(stem_gain_pairs[0][1][:, :nf], dtype=np.float32))
+            Z0_st = Z_first if isinstance(Z_first, torch.Tensor) else torch.stack(
+                [z if isinstance(z, torch.Tensor) else torch.from_numpy(np.asarray(z)) for z in Z_first], dim=0
+            )
+            for ch in range(n_ch):
+                for k, (s, e) in enumerate(band_slices):
+                    torch.mul(Z0_st[ch, s:e], g0_t[k], out=Z_acc[ch, s:e])
+            if len(stem_gain_pairs) > 1:
+                tmp_slice = torch.empty((max(e - s for s, e in band_slices), nf), dtype=torch.complex64)
+            for Zs, g in stem_gain_pairs[1:]:
+                gk_t = torch.from_numpy(np.ascontiguousarray(g[:, :nf], dtype=np.float32))
+                Z_st = Zs if isinstance(Zs, torch.Tensor) else torch.stack(
+                    [z if isinstance(z, torch.Tensor) else torch.from_numpy(np.asarray(z)) for z in Zs], dim=0
+                )
+                for ch in range(n_ch):
+                    for k, (s, e) in enumerate(band_slices):
+                        buf = tmp_slice[: e - s]
+                        torch.mul(Z_st[ch, s:e], gk_t[k], out=buf)
+                        Z_acc[ch, s:e].add_(buf)
+        else:
+            bob_t = torch.from_numpy(np.asarray(band_of_bin, dtype=np.int64))
+            Z_acc = None
+            for Zs, g in stem_gain_pairs:
+                G_t = torch.from_numpy(np.ascontiguousarray(g[:, :nf], dtype=np.float32))[bob_t]
+                Z_st = Zs if isinstance(Zs, torch.Tensor) else torch.stack(
+                    [z if isinstance(z, torch.Tensor) else torch.from_numpy(np.asarray(z)) for z in Zs], dim=0
+                )
+                term = Z_st * G_t
+                Z_acc = term if Z_acc is None else Z_acc.add_(term)
+        Z_acc.mul_(float(_WIN_SUM))
+        return _torch_istft(Z_acc, length, scale_win_sum=False)
+
+    Z_sum = [None] * n_ch
+    for Zs, g in stem_gain_pairs:
+        G = g[band_of_bin, :nf].astype(np.float32)
+        for ch in range(n_ch):
+            term = Zs[ch] * G
+            Z_sum[ch] = term if Z_sum[ch] is None else (Z_sum[ch] + term)
+    return _ola_from_Zs(Z_sum, length)
+
+
+def _pad_for_stft(length):
+    pad_l = NFFT // 2
+    rem = (length + pad_l - NFFT) % HOP
+    pad_r = (HOP - rem) % HOP + NFFT // 2
+    return pad_l, pad_r
+
+
+def _extra_right_pad(length):
+    pad_l = NFFT // 2
+    rem = (length + pad_l - NFFT) % HOP
+    return (HOP - rem) % HOP
+
+
+def _band_matrix(idx):
+    bmat = np.zeros((NFFT // 2 + 1, len(idx)), dtype=np.float32)
+    for k, ii in enumerate(idx):
+        bmat[ii, k] = 1.0
+    return bmat
+
+
+def stft_and_power(x, idx=None):
+    """Compute complex64 STFT once (PyTorch C++ CPU with SciPy fallback) and return ((bands, frames) power, Zs, idx)."""
+    if idx is None:
+        idx, _ = _band_indices()
+    arr = np.ascontiguousarray(x, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    n_raw, n_ch = arr.shape
+    if torch is not None:
+        extra_r = _extra_right_pad(n_raw)
+        xt = torch.from_numpy(arr[:, 0]).unsqueeze(0) if n_ch == 1 else torch.from_numpy(arr).t().contiguous()
+        xp = F.pad(xt, (0, extra_r)) if extra_r else xt
+        Zt = torch.stft(
+            xp, n_fft=NFFT, hop_length=HOP, window=_WIN_HANN_T,
+            center=True, pad_mode="constant", return_complex=True,
+        ) / float(_WIN_SUM)
+        rv = torch.view_as_real(Zt)
+        z2_all = rv[..., 0].square().add_(rv[..., 1].square())
+        if n_ch == 1:
+            Z2 = z2_all[0]
+        elif n_ch == 2:
+            Z2 = z2_all[0].add_(z2_all[1]).mul_(0.5)
+        else:
+            Z2 = z2_all.mean(dim=0)
+        bmat_t = torch.from_numpy(_band_matrix(idx))
+        P = (bmat_t.T @ Z2).numpy()
+        return P, Zt, idx
+
+    pad_l, pad_r = _pad_for_stft(n_raw)
+    xp = np.pad(arr, ((pad_l, pad_r), (0, 0)))
+    nf = (len(xp) - NFFT) // HOP + 1
+    s0, s1 = xp.strides
+    frames = np.lib.stride_tricks.as_strided(xp, shape=(nf, NFFT, n_ch), strides=(HOP * s0, s0, s1))
+    Zs = []
+    P = None
+    bmat = _band_matrix(idx)
+    for ch in range(n_ch):
+        Z_ch = (sp_fft.rfft(frames[:, :, ch] * _WIN_HANN[None, :], axis=1, workers=_FFT_WORKERS) / _WIN_SUM).T
+        Z_ch = np.ascontiguousarray(Z_ch, dtype=np.complex64)
+        Zs.append(Z_ch)
+        Z2 = Z_ch.real * Z_ch.real + Z_ch.imag * Z_ch.imag
+        pc = bmat.T @ Z2
+        P = pc if P is None else (P + pc)
+    return P / n_ch, Zs, idx
+
+
+def band_power(x):
+    P, _, idx = stft_and_power(x)
+    return P, idx
 
 
 def apply_gain(x, g, idx):
@@ -779,130 +1424,171 @@ def apply_gain(x, g, idx):
     return istft_from_Z(Zs, g, band_of_bin, len(x))
 
 
-def cmd_mix(ws, c, fh):
+def cmd_mix(ws, c, fh=None):
+    _assert_voice_dub(ws)
     sd = os.path.join(ws, "media", "stems")
     voc_p, acc_p = os.path.join(sd, "vocals.wav"), os.path.join(sd, "accomp.wav")
     for f, p in (("vocals.wav", voc_p), ("accomp.wav", acc_p)):
         if not os.path.exists(p):
-            sys.exit(f"[aicn-audio] missing media/stems/{f}: run `separate` (the original audio is never replaced by silence)")
+            sys.exit(f"[aicn-audio] missing media/stems/{f}: run `separate` (original audio is never replaced by silence)")
     dub_p = os.path.join(ws, "media", "audio", "dub_voice_48k.wav")
     pre_p = os.path.join(ws, "media", "audio", "premaster_48k.wav")
     stats_p = os.path.join(ws, "data", "03_mix_stats.json")
     spec_p = os.path.join(ws, "data", "03_spectral_analysis.json")
     dur = float(profile(ws)["duration"])
-    mix_key = None
-    if fh is not None and os.path.exists(dub_p):
-        mix_key = aicn.h_obj({
-            "v": AUDIO_VERSION, "voc": fh(voc_p), "acc": fh(acc_p), "dub": fh(dub_p), "dur": round(dur, 3),
-            "cfg": {k: c.get(k) for k in ("dub_over_vocal_lu", "snr_vocal_db", "snr_bgm_db", "floor_vocal_db",
-                                          "floor_bgm_db", "base_vocal_db", "vocal_high_dip_db", "attack_s", "hold_s",
-                                          "release_s", "dub_hp_hz", "dub_lp_hz", "vocal_hp_hz", "vocal_lp_hz",
-                                          "bgm_hp_hz", "bgm_lp_hz")},
-        })
-        st_cache = _audio_state_load(ws)
-        if not c.get("_force") and st_cache.get("mix_key") == mix_key and all(os.path.exists(p) for p in (pre_p, stats_p, spec_p)):
-            print(f"[mix] cached (key={mix_key[:12]})")
-            return
+    if fh is None:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            hv, ha, hd = ex.submit(_hash_file, voc_p, fh), ex.submit(_hash_file, acc_p, fh), ex.submit(_hash_file, dub_p, fh)
+            voc_h, acc_h, dub_h = hv.result(), ha.result(), hd.result()
+    else:
+        voc_h, acc_h, dub_h = _hash_file(voc_p, fh), _hash_file(acc_p, fh), _hash_file(dub_p, fh)
+    mix_key = ap.hash_obj({
+        "v": AUDIO_VERSION,
+        "voc": voc_h,
+        "acc": acc_h,
+        "dub": dub_h,
+        "dur": round(dur, 3),
+        "cfg": {
+            k: c.get(k) for k in (
+                "dub_over_vocal_lu", "snr_vocal_db", "snr_bgm_db", "floor_vocal_db",
+                "floor_bgm_db", "base_vocal_db", "speech_vocal_dip_db", "vocal_high_dip_db",
+                "attack_s", "hold_s", "release_s", "dub_hp_hz", "dub_lp_hz",
+                "vocal_hp_hz", "vocal_lp_hz", "bgm_hp_hz", "bgm_lp_hz",
+            )
+        },
+    })
+    st_cache = _audio_state_load(ws)
+    if not c.get("_force") and st_cache.get("mix_key") == mix_key and all(os.path.exists(p) for p in (pre_p, stats_p, spec_p)):
+        print(f"[mix] cached ({os.path.basename(ws)}, key={mix_key[:12]})")
+        return
+
     n = int(round(dur * SR))
-    fit = lambda a: np.pad(a, ((0, max(0, n - len(a))), (0, 0)))[:n]
-    V, B = fit(sf.read(voc_p, dtype="float32", always_2d=True)[0]), \
-        fit(sf.read(acc_p, dtype="float32", always_2d=True)[0])
-    T = sf.read(dub_p, dtype="float32")[0]
-    T = np.pad(T, (0, max(0, n - len(T))))[:n]
+    fit = lambda a: a if len(a) == n else (a[:n] if len(a) > n else np.pad(a, ((0, n - len(a)), (0, 0))))
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fv_r = ex.submit(lambda: fit(sf.read(voc_p, dtype="float32", always_2d=True)[0]))
+        fb_r = ex.submit(lambda: fit(sf.read(acc_p, dtype="float32", always_2d=True)[0]))
+        ft_r = ex.submit(lambda: sf.read(dub_p, dtype="float32")[0])
+        V, B, T = fv_r.result(), fb_r.result(), ft_r.result()
+    if T.ndim > 1:
+        T = T.mean(1)
+    if len(T) > n:
+        T = T[:n]
+    elif len(T) < n:
+        T = np.pad(T, (0, n - len(T)))
+
     t0 = time.time()
     spec_rep = analyze_stems_and_dub(ws, c, V=V, B=B, T=T)
     fp = spec_rep["filter_plan"]
-    V = apply_hp_lp(V, hp_hz=fp["vocal_hp_hz"], lp_hz=fp["vocal_lp_hz"], order=2)
-    B = apply_hp_lp(B, hp_hz=fp["bgm_hp_hz"], lp_hz=fp["bgm_lp_hz"], order=2)
-    T = voice_chain(T, hp_hz=fp["dub_hp_hz"], lp_hz=fp["dub_lp_hz"], mud_cut_db=fp["dub_mud_cut_db"])
-    lv = lufs(V); gain = lv + c["dub_over_vocal_lu"] - lufs(T[:, None]); T = T * np.float32(10 ** (gain / 20))
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fv = ex.submit(apply_hp_lp, V, hp_hz=fp["vocal_hp_hz"], lp_hz=fp["vocal_lp_hz"], order=2)
+        fb = ex.submit(apply_hp_lp, B, hp_hz=fp["bgm_hp_hz"], lp_hz=fp["bgm_lp_hz"], order=2)
+        ft = ex.submit(voice_chain, T, hp_hz=fp["dub_hp_hz"], lp_hz=fp["dub_lp_hz"], mud_cut_db=fp["dub_mud_cut_db"])
+        V, B, T = fv.result(), fb.result(), ft.result()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        flv = ex.submit(lufs, V)
+        flt = ex.submit(lufs, T[:, None])
+        lv = flv.result()
+        gain = lv + float(c["dub_over_vocal_lu"]) - flt.result()
+    T = T * np.float32(10.0 ** (gain / 20.0))
+
     idx, band_of_bin = _band_indices()
     PT, _, _ = stft_and_power(T, idx)
     PV, ZV, _ = stft_and_power(V, idx)
+    del V
     PB, ZB, _ = stft_and_power(B, idx)
-    fps = SR / HOP; W = BAND_W[:, None]
-    hold_s = float(c.get("hold_s", 0.35))
-    raw_active = PT > PT.max(1, keepdims=True) * 10 ** (-45 / 10)
+    del B
+    fps = SR / HOP
+    hold_s = float(c.get("hold_s", 0.30))
+
+    pt_speech = PT[SPEECH].sum(0)
+    pos_sp = pt_speech[pt_speech > 0.0]
+    p95_sp = float(np.percentile(pos_sp, 95)) if len(pos_sp) else 0.0
+    active_speech = pt_speech > max(p95_sp * 1e-3, 1e-10)
+    raw_active = PT > np.maximum(PT.max(1, keepdims=True) * 10.0 ** (-45.0 / 10.0), 1e-12)
+    speech_bands_mask = ((np.arange(len(BAND_W))[:, None] >= 2) & (np.arange(len(BAND_W))[:, None] < 10))
+    raw_active_v = raw_active | (active_speech[None, :] & speech_bands_mask)
+
     tot = PT.sum(0)
-    talk_mask = hangover_hold(tot > tot.max() * 1e-4, fps, hold_s)
+    talk_mask = hangover_hold(tot > max(float(tot.max()) * 1e-4, 1e-10), fps, hold_s)
     talk = follow(talk_mask.astype(float)[None], fps, c["attack_s"], max(c["release_s"], 0.40))[0]
 
-    def need(Pc, snr, floor):
-        g = np.sqrt(np.clip(PT / (Pc * 10 ** (snr / 10) + 1e-12), 10 ** (floor / 10), 1.0))
-        return np.where(raw_active, g, 1.0)
-    base_dip = 1.0 - talk * (1.0 - 10.0 ** (c["base_vocal_db"] / 20.0))
-    hi_dip_db = float(fp.get("vocal_high_dip_db", c.get("vocal_high_dip_db", -3.5)))
+    def need(Pc, snr, floor, act_mask, ref_P=PT):
+        g = np.sqrt(np.clip(ref_P / (Pc * 10.0 ** (snr / 10.0) + 1e-12), 10.0 ** (floor / 10.0), 1.0))
+        return np.where(act_mask, g, 1.0)
+
+    # Strong clean vocal carving whenever Vietnamese dub speaks, clamped directly at floor_vocal_db (no stacking)
+    pt_v_ref = np.where(active_speech[None, :] & speech_bands_mask, np.maximum(PT, 0.15 * pt_speech[None, :]), PT)
+    need_v = need(PV, c["snr_vocal_db"], c["floor_vocal_db"], raw_active_v, ref_P=pt_v_ref)
+
+    base_dip = 1.0 - talk * (1.0 - 10.0 ** (float(c["base_vocal_db"]) / 20.0))
+    sp_dip = np.ones((len(BAND_W), len(talk)), dtype=np.float64)
+    sp_dip[2:9, :] = 1.0 - talk[None, :] * (1.0 - 10.0 ** (float(c["speech_vocal_dip_db"]) / 20.0))
+    hi_dip_db = float(fp.get("vocal_high_dip_db", c.get("vocal_high_dip_db", -4.5)))
     hi_band = np.ones((len(BAND_W), len(talk)), dtype=np.float64)
     if hi_dip_db < -0.1:
         hi_band[9:, :] = 1.0 - talk[None, :] * (1.0 - 10.0 ** (hi_dip_db / 20.0))
-    voc_floor_lin = 10.0 ** ((c["floor_vocal_db"] + c["base_vocal_db"]) / 20.0)
-    gV_raw = np.maximum(voc_floor_lin, need(PV, c["snr_vocal_db"], c["floor_vocal_db"]) * base_dip * hi_band)
-    gB_raw = need(PB, c["snr_bgm_db"], c["floor_bgm_db"])
-    gV = follow_hold(1 - W * (1 - gV_raw), fps, c["attack_s"], hold_s, c["release_s"])
-    gB = follow_hold(1 - W * (1 - gB_raw), fps, c["attack_s"], hold_s, c["release_s"])
-    mix = istft_from_Z(ZV, gV, band_of_bin, n) + istft_from_Z(ZB, gB, band_of_bin, n) + T[:, None]
+
+    voc_floor_lin = 10.0 ** (float(c["floor_vocal_db"]) / 20.0)
+    gV_raw = np.maximum(voc_floor_lin, np.minimum(need_v, np.minimum(base_dip[None, :], sp_dip)) * hi_band)
+    gB_raw = need(PB, c["snr_bgm_db"], c["floor_bgm_db"], raw_active)
+
+    gV = follow_hold(1.0 - BAND_W_VOCAL[:, None] * (1.0 - gV_raw), fps, c["attack_s"], hold_s, c["release_s"])
+    gB = follow_hold(1.0 - BAND_W[:, None] * (1.0 - gB_raw), fps, c["attack_s"], hold_s, c["release_s"])
+
+    mix = istft_combined([(ZV, gV), (ZB, gB)], band_of_bin, n)
+    del ZV, ZB
+    if torch is not None and len(mix) >= SR * 10:
+        torch.from_numpy(mix).add_(torch.from_numpy(np.ascontiguousarray(T, dtype=np.float32)).unsqueeze(1))
+    else:
+        mix += T[:, None]
     os.makedirs(os.path.join(ws, "media", "audio"), exist_ok=True)
-    _write_wav16(os.path.join(ws, "media", "audio", "premaster_48k.wav"), mix.astype(np.float32), SR)
-    on = talk > 0.5
+    _write_wav16(pre_p, mix, SR, inplace=True)
+
+    on = active_speech
+    snr_on = pt_speech > max(p95_sp * 10.0 ** (-15.0 / 10.0), 1e-10)
+    snr_sel = snr_on if snr_on.any() else active_speech
     comp = (PV[SPEECH] * gV[SPEECH] ** 2 + PB[SPEECH] * gB[SPEECH] ** 2).sum(0)
-    snr = 10 * np.log10(PT[SPEECH].sum(0)[on] / (comp[on] + 1e-12) + 1e-12) if on.any() else np.array([99.0])
-    stats = {"dub_gain_db": round(gain, 2), "orig_vocal_lufs": round(lv, 2), "dub_active_share": round(float(on.mean()), 3),
-             "dub_snr_speech_db_median": round(float(np.median(snr)), 2),
-             "dub_snr_speech_db_p10": round(float(np.percentile(snr, 10)), 2),
-             "orig_vocal_atten_db_median_during_dub": round(float(np.median(20 * np.log10(gV[SPEECH][:, on].mean(0)))), 2) if on.any() else 0,
-             "orig_vocal_atten_db_min": round(float(20 * np.log10(gV.min())), 2),
-             "bgm_atten_db_median_during_dub": round(float(np.median(20 * np.log10(gB[SPEECH][:, on].mean(0)))), 2) if on.any() else 0,
-             "bgm_atten_db_min": round(float(20 * np.log10(gB.min())), 2),
-             "filter_plan": fp, "seconds": round(time.time() - t0, 1)}
-    aicn.jdump(stats_p, stats)
-    if mix_key is not None:
-        st_cache = _audio_state_load(ws)
-        st_cache["mix_key"] = mix_key
-        _audio_state_save(ws, st_cache)
-    print("[mix] " + json.dumps(stats))
+    snr = 10.0 * np.log10(PT[SPEECH].sum(0)[snr_sel] / (comp[snr_sel] + 1e-12) + 1e-12) if snr_sel.any() else np.array([99.0])
+    stats = {
+        "dub_gain_db": round(gain, 2),
+        "orig_vocal_lufs": round(lv, 2),
+        "dub_active_share": round(float(on.mean()), 3),
+        "dub_snr_speech_db_median": round(float(np.median(snr)), 2),
+        "dub_snr_speech_db_p10": round(float(np.percentile(snr, 10)), 2),
+        "orig_vocal_atten_db_median_during_dub": round(float(np.median(20.0 * np.log10(gV[SPEECH][:, on].mean(0)))), 2) if on.any() else 0.0,
+        "orig_vocal_atten_db_min": round(float(20.0 * np.log10(gV.min())), 2),
+        "bgm_atten_db_median_during_dub": round(float(np.median(20.0 * np.log10(gB[SPEECH][:, on].mean(0)))), 2) if on.any() else 0.0,
+        "bgm_atten_db_min": round(float(20.0 * np.log10(gB.min())), 2),
+        "filter_plan": fp,
+        "seconds": round(time.time() - t0, 1),
+    }
+    _jdump(stats_p, stats)
+    st_cache = _audio_state_load(ws)
+    st_cache["mix_key"] = mix_key
+    _audio_state_save(ws, st_cache)
+    print(f"[mix] {os.path.basename(ws)} " + json.dumps(stats))
 
 
 # ---------------------------------------------------------------- master
-def write_sub_only_alignment(ws):
-    """Build 03_aligned_subtitles.json and subtitles_full.srt directly from Stage 2 in sub_only mode."""
-    segs = aicn.jload(os.path.join(ws, "data", "02_bilingual_script.json"), [])
-    dur = float(profile(ws).get("duration", 0.0))
-    aligned = []
-    for i, s in enumerate(segs):
-        s0, e0 = float(s["start"]), float(s["end"])
-        nxt = float(segs[i + 1]["start"]) if i + 1 < len(segs) else dur
-        slot_end = max(s0 + 0.15, min(e0, nxt - 0.005)) if i + 1 < len(segs) else e0
-        aligned.append({
-            "id": s.get("id", i), "slot_start": round(s0, 3), "slot_end": round(slot_end, 3),
-            "speech_start": round(s0, 3), "speech_end": round(slot_end, 3), "audio_end": round(slot_end, 3),
-            "pause_after": round(max(0.0, nxt - slot_end), 3), "tempo": 1.0,
-            "zh_text": s.get("zh_text", ""), "sub_text": s["sub_text"], "tts_text": s.get("tts_text", s["sub_text"]),
-        })
-    aicn.jdump(os.path.join(ws, "data", "03_aligned_subtitles.json"), aligned)
-    with open(os.path.join(ws, "data", "subtitles_full.srt"), "w", encoding="utf-8") as f:
-        for k, it in enumerate(aligned, 1):
-            f.write(f"{k}\n{srt_t(it['slot_start'])} --> {srt_t(it['slot_end'])}\n{it['sub_text']}\n\n")
-    return len(aligned)
-
-
-def write_stage3_report(ws, mode, checks, c):
+def write_stage3_report(ws, checks, c):
     """Write 03_pacing_and_audio_report.md so verify_stage_3.py always hashes an up-to-date report."""
-    spec = aicn.jload(os.path.join(ws, "data", "03_spectral_analysis.json"), {}) or {}
+    spec = _jload(os.path.join(ws, "data", "03_spectral_analysis.json"), {}) or {}
     fp = spec.get("filter_plan", {})
     stems = spec.get("stems", {})
     lines = [
-        f"# Stage 3 Pacing & Audio Report ({mode})",
+        "# Stage 3 Pacing & Audio Report (`voice_dub`)",
         "",
-        f"- Engine: `{AUDIO_VERSION}`",
-        f"- Target loudness: `{c['target_lufs']} LUFS`, peak `<= {c['true_peak_db']} dBFS`",
+        f"- Engine: `{AUDIO_VERSION}` (indivisible utterances, single-STFT spectral mix)",
+        f"- Target loudness: `{c['target_lufs']} LUFS`, peak `<= {GATE['true_peak_max_db']} dBFS`",
     ]
     if fp:
         lines += [
             "",
             "## Frequency Analysis & Pre-Mix HP/LP Conditioning (`data/03_spectral_analysis.json`)",
             f"- Dub HP/LP: `{fp.get('dub_hp_hz')} Hz` / `{fp.get('dub_lp_hz')} Hz` (mud trim `{fp.get('dub_mud_cut_db', 0.0)} dB`)",
-            f"- Original Vocal HP/LP: `{fp.get('vocal_hp_hz')} Hz` / `{fp.get('vocal_lp_hz')} Hz`, base dip `{c.get('base_vocal_db')} dB`",
-            f"- SFX/Music HP/LP: `{fp.get('bgm_hp_hz')} Hz` / `{fp.get('bgm_lp_hz')} Hz`, envelope hold `{c.get('hold_s', 0.35)}s`, release `{c.get('release_s')}s`",
+            f"- Original Vocal HP/LP: `{fp.get('vocal_hp_hz')} Hz` / `{fp.get('vocal_lp_hz')} Hz`, base dip `{c.get('base_vocal_db')} dB`, speech dip `{c.get('speech_vocal_dip_db')} dB`, floor `{c.get('floor_vocal_db')} dB`",
+            f"- SFX/Music HP/LP: `{fp.get('bgm_hp_hz')} Hz` / `{fp.get('bgm_lp_hz')} Hz`, envelope hold `{c.get('hold_s', 0.30)}s`, release `{c.get('release_s')}s`",
         ]
         for sname in ("vocals", "accomp", "dub"):
             sp = stems.get(sname)
@@ -914,166 +1600,272 @@ def write_stage3_report(ws, mode, checks, c):
                     f"speech500-5k `{bp.get('vocal_fund', 0) + bp.get('presence', 0):.1f}%`, "
                     f"high>5k `{bp.get('sibilance', 0) + bp.get('air', 0):.1f}%`"
                 )
-    lines += [
-        "",
-        "## Audio Gate Checks",
-        "",
-    ]
+    lines += ["", "## Audio Gate Checks", ""]
     for x in checks:
         lines.append(f"- [{'PASS' if x['passed'] else 'FAIL'}] **{x['id']}**: {x['detail']}")
-    with open(os.path.join(ws, "03_pacing_and_audio_report.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    report_p = os.path.join(ws, "03_pacing_and_audio_report.md")
+    tmp_p = _tmp_path(report_p, "tmp")
+    try:
+        with open(tmp_p, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        _atomic_replace(tmp_p, report_p)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_p)
+        raise
 
 
-def cmd_master(ws, c, fh):
+def cmd_master(ws, c, fh=None):
+    _assert_voice_dub(ws)
     ff = ap.find_tool("ffmpeg")
-    mode = profile(ws).get("localization_mode", "voice_dub")
     src = os.path.join(ws, "media", "audio", "premaster_48k.wav")
     out = os.path.join(ws, "media", "master_audio_48k.wav")
     dur = float(profile(ws)["duration"])
-    script_p = os.path.join(ws, "data", "02_bilingual_script.json")
-    master_key = None
-    if fh is not None:
-        in_ref = source_path(ws) if mode == "sub_only" else src
-        if in_ref and os.path.exists(in_ref):
-            master_key = aicn.h_obj({
-                "v": AUDIO_VERSION, "mode": mode, "src": fh(in_ref),
-                "script": fh(script_p) if (mode == "sub_only" and os.path.exists(script_p)) else None,
-                "dur": round(dur, 3),
-                "cfg": {k: c.get(k) for k in ("target_lufs", "true_peak_db", "lra", "master_mode")},
-            })
-            st_cache = _audio_state_load(ws)
-            sub_ok = (mode != "sub_only") or (
-                os.path.exists(os.path.join(ws, "data", "03_aligned_subtitles.json"))
-                and os.path.exists(os.path.join(ws, "data", "subtitles_full.srt"))
-            )
-            if not c.get("_force") and st_cache.get("master_key") == master_key and os.path.exists(out) and sub_ok:
-                print(f"[master] cached (key={master_key[:12]})")
-                return
-    if mode == "sub_only":
-        n_cues = write_sub_only_alignment(ws)
-        print(f"[master] sub_only: aligned {n_cues} cues -> 03_aligned_subtitles.json & subtitles_full.srt")
-        os.makedirs(os.path.dirname(src), exist_ok=True)
-        run([ff, "-v", "error", "-y", "-i", source_path(ws), "-vn", "-ac", "2", "-ar", str(SR), "-c:a", "pcm_f32le", src])
     if not os.path.exists(src):
         sys.exit("[aicn-audio] no premaster: run `mix`")
+
+    master_key = ap.hash_obj({
+        "v": AUDIO_VERSION,
+        "src": _hash_file(src, fh),
+        "dur": round(dur, 3),
+        "cfg": {k: c.get(k) for k in ("target_lufs", "true_peak_db", "lra", "master_mode")},
+    })
+    st_cache = _audio_state_load(ws)
+    if not c.get("_force") and st_cache.get("master_key") == master_key and os.path.exists(out):
+        print(f"[master] cached ({os.path.basename(ws)}, key={master_key[:12]})")
+        return
+
     pre = "acompressor=threshold=-18dB:ratio=2:attack=20:release=250:makeup=1"
     t0 = time.time()
-    if c.get("master_mode", "fast") == "loudnorm":
-        ln = f"loudnorm=I={c['target_lufs']}:TP={c['true_peak_db']}:LRA={c['lra']}"
-        o = subprocess.run([ff, "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},{ln}:print_format=json", "-f", "null", "-"],
-                           capture_output=True, text=True).stderr
-        m = json.loads(o[o.rindex("{"): o.rindex("}") + 1])
-        ln2 = (f"{ln}:measured_I={m['input_i']}:measured_TP={m['input_tp']}:measured_LRA={m['input_lra']}"
-               f":measured_thresh={m['input_thresh']}:offset={m['target_offset']}:linear=true")
-        run([ff, "-v", "error", "-y", "-i", src, "-af", f"{pre},{ln2},aresample={SR},apad", "-t", f"{dur:.3f}",
-             "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
-        i, pk = lufs_file(out)
-    else:
-        # Native 48 kHz linear EBU R128 master (~28x faster than 192 kHz loudnorm; identical linear gain + lookahead limiter)
-        o = subprocess.run([ff, "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},ebur128=peak=true", "-f", "null", "-"],
-                           capture_output=True, text=True).stderr
-        hits = re.findall(r"I:\s+(-?[\d.]+) LUFS", o)
-        meas_i = float(hits[-1]) if hits else float(c["target_lufs"])
-        gain_db = float(c["target_lufs"]) - meas_i
-        # -0.55 dB sample-peak margin guarantees 4x oversampled true peak stays comfortably below true_peak_db + 0.3
-        lim = 10.0 ** ((float(c["true_peak_db"]) - 0.55) / 20.0)
-        af2 = f"{pre},volume={gain_db:.3f}dB,alimiter=limit={lim:.5f}:level=false:attack=5:release=50:asc=false,apad"
-        run([ff, "-v", "error", "-y", "-i", src, "-af", af2, "-t", f"{dur:.3f}",
-             "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
-        i, pk = lufs_file(out)
-        if pk > float(c["true_peak_db"]) + 0.2:
-            # Rare extreme inter-sample transient: 4x oversampled true-peak limit (~2s)
-            lim_tp = 10.0 ** ((float(c["true_peak_db"]) - 0.1) / 20.0)
-            af_tp = f"{pre},volume={gain_db:.3f}dB,aresample=192000,alimiter=limit={lim_tp:.5f}:level=false:attack=5:release=50:asc=false,aresample={SR},apad"
-            run([ff, "-v", "error", "-y", "-i", src, "-af", af_tp, "-t", f"{dur:.3f}",
-                 "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", out])
+    tmp_out = _tmp_path(out, "part.wav")
+    try:
+        if c.get("master_mode", "fast") == "loudnorm":
+            ln = f"loudnorm=I={c['target_lufs']}:TP={c['true_peak_db']}:LRA={c['lra']}"
+            o = subprocess.run([ff, "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},{ln}:print_format=json", "-f", "null", "-"],
+                               capture_output=True, text=True).stderr
+            m = json.loads(o[o.rindex("{"): o.rindex("}") + 1])
+            ln2 = (f"{ln}:measured_I={m['input_i']}:measured_TP={m['input_tp']}:measured_LRA={m['input_lra']}"
+                   f":measured_thresh={m['input_thresh']}:offset={m['target_offset']}:linear=true")
+            run([ff, "-v", "error", "-y", "-i", src, "-af", f"{pre},{ln2},aresample={SR},apad", "-t", f"{dur:.3f}",
+                 "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", tmp_out])
+            _atomic_replace(tmp_out, out)
             i, pk = lufs_file(out)
-    if master_key is not None:
-        st_cache = _audio_state_load(ws)
-        st_cache["master_key"] = master_key
-        _audio_state_save(ws, st_cache)
+        else:
+            o = subprocess.run([ff, "-hide_banner", "-nostats", "-i", src, "-af", f"{pre},ebur128=peak=true", "-f", "null", "-"],
+                               capture_output=True, text=True).stderr
+            hits = re.findall(r"I:\s+(-?[\d.]+) LUFS", o)
+            meas_i = float(hits[-1]) if hits else float(c["target_lufs"])
+            gain_db = float(c["target_lufs"]) - meas_i
+            lim = 10.0 ** ((float(c["true_peak_db"]) - 0.55) / 20.0)
+            af2 = f"{pre},volume={gain_db:.3f}dB,alimiter=limit={lim:.5f}:level=false:attack=5:release=50:asc=false,apad"
+            run([ff, "-v", "error", "-y", "-i", src, "-af", af2, "-t", f"{dur:.3f}",
+                 "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", tmp_out])
+            _atomic_replace(tmp_out, out)
+            i, pk = lufs_file(out)
+            if pk > float(GATE["true_peak_max_db"]):
+                lim_tp = 10.0 ** ((float(c["true_peak_db"]) - 0.1) / 20.0)
+                af_tp = f"{pre},volume={gain_db:.3f}dB,aresample=192000,alimiter=limit={lim_tp:.5f}:level=false:attack=5:release=50:asc=false,aresample={SR},apad"
+                run([ff, "-v", "error", "-y", "-i", src, "-af", af_tp, "-t", f"{dur:.3f}",
+                     "-ar", str(SR), "-ac", "2", "-c:a", "pcm_s24le", tmp_out])
+                _atomic_replace(tmp_out, out)
+                i, pk = lufs_file(out)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_out)
+        raise
+
+    st_cache = _audio_state_load(ws)
+    st_cache["master_key"] = master_key
+    _audio_state_save(ws, st_cache)
     print(f"[master] {out}: {i:.1f} LUFS, peak {pk:.1f} dBFS ({time.time() - t0:.1f}s)")
 
 
 # ---------------------------------------------------------------- verify
-def cmd_verify(ws, c, fh):
-    mode = profile(ws).get("localization_mode", "voice_dub")
+def _run_audio_checks(ws, c, fh=None):
     out = os.path.join(ws, "media", "master_audio_48k.wav")
     checks = []
+
     def chk(name, ok, detail):
         checks.append({"id": name, "passed": bool(ok), "detail": detail})
-    i, pk = lufs_file(out) if os.path.exists(out) else (-99, 0)
-    chk("loudness", abs(i - c["target_lufs"]) <= GATE["lufs_tol"] and pk <= c["true_peak_db"] + 0.3,
-        f"{i:.1f} LUFS (target {c['target_lufs']}), peak {pk:.1f} dBFS")
-    if mode != "sub_only":
-        meta = aicn.jload(os.path.join(ws, "media", "stems", "stems.json"), {})
-        cur = aicn.h_obj({"src": fh(source_path(ws)), "model": c["demucs_model"], "v": STEMS_VERSION})
-        chk("stems_match_source", meta.get("key") == cur, "media/stems built from the current source")
-        st = aicn.jload(os.path.join(ws, "data", "03_mix_stats.json"), {})
-        chk("dub_intelligible", st.get("dub_snr_speech_db_median", -99) >= GATE["dub_snr_min_db"],
-            f"dub over original in 500 Hz-5 kHz: median {st.get('dub_snr_speech_db_median')} dB (min {GATE['dub_snr_min_db']})")
-        chk("original_never_muted",
-            st.get("orig_vocal_atten_db_min", -99) >= c["floor_vocal_db"] + c["base_vocal_db"] - GATE["vocal_floor_margin_db"]
-            and st.get("bgm_atten_db_min", -99) >= c["floor_bgm_db"] - GATE["vocal_floor_margin_db"],
-            f"deepest cut: vocal {st.get('orig_vocal_atten_db_min')} dB, music/sfx {st.get('bgm_atten_db_min')} dB")
-        # original audio really present in the master where nobody dubs (catches a silent-BGM fallback)
-        acc = sf.read(os.path.join(ws, "media", "stems", "accomp.wav"), dtype="float32", always_2d=True)[0]
-        voc = sf.read(os.path.join(ws, "media", "stems", "vocals.wav"), dtype="float32", always_2d=True)[0]
-        dub = sf.read(os.path.join(ws, "media", "audio", "dub_voice_48k.wav"), dtype="float32")[0]
-        mst = sf.read(out, dtype="float32", always_2d=True)[0]
-        n = min(len(acc), len(voc), len(dub), len(mst)); k = SR // 10
+
+    i, pk = lufs_file(out) if os.path.exists(out) else (-99.0, 0.0)
+    chk("loudness", abs(i - float(c["target_lufs"])) <= GATE["lufs_tol"] and pk <= GATE["true_peak_max_db"],
+        f"{i:.1f} LUFS (target {c['target_lufs']}±{GATE['lufs_tol']}), peak {pk:.1f} dBFS (max {GATE['true_peak_max_db']})")
+
+    meta = _jload(os.path.join(ws, "media", "stems", "stems.json"), {}) or {}
+    cur = ap.stems_key(_hash_file(source_path(ws), fh), c["demucs_model"], STEMS_VERSION)
+    chk("stems_match_source", meta.get("key") == cur, "media/stems built from the current source")
+
+    st = _jload(os.path.join(ws, "data", "03_mix_stats.json"), {}) or {}
+    snr_med = float(st.get("dub_snr_speech_db_median", -99.0))
+    snr_p10 = float(st.get("dub_snr_speech_db_p10", -99.0))
+    chk("dub_intelligible",
+        snr_med >= GATE["dub_snr_median_min_db"] and snr_p10 >= GATE["dub_snr_p10_min_db"],
+        f"dub over original in 500 Hz-5 kHz (active speech): median {snr_med} dB (>={GATE['dub_snr_median_min_db']}), p10 {snr_p10} dB (>={GATE['dub_snr_p10_min_db']})")
+
+    chk("original_never_muted",
+        st.get("orig_vocal_atten_db_min", -99.0) >= float(c["floor_vocal_db"]) - GATE["vocal_floor_margin_db"]
+        and st.get("bgm_atten_db_min", -99.0) >= float(c["floor_bgm_db"]) - GATE["vocal_floor_margin_db"],
+        f"deepest cut: vocal {st.get('orig_vocal_atten_db_min')} dB (floor {c['floor_vocal_db']}), music/sfx {st.get('bgm_atten_db_min')} dB (floor {c['floor_bgm_db']})")
+
+    acc = sf.read(os.path.join(ws, "media", "stems", "accomp.wav"), dtype="float32", always_2d=True)[0]
+    voc = sf.read(os.path.join(ws, "media", "stems", "vocals.wav"), dtype="float32", always_2d=True)[0]
+    dub = sf.read(os.path.join(ws, "media", "audio", "dub_voice_48k.wav"), dtype="float32")[0]
+    mst = sf.read(out, dtype="float32", always_2d=True)[0] if os.path.exists(out) else np.zeros((1, 2), dtype=np.float32)
+    n = min(len(acc), len(voc), len(dub), len(mst))
+    k = SR // 10
+    if n >= k:
         e = lambda x: (x[: n // k * k] ** 2).reshape(-1, k, x.shape[1] if x.ndim > 1 else 1).mean((1, 2))
-        quiet = e(dub[:n, None]) < 1e-7; orig_e = e(acc[:n] + voc[:n]); m_e = e(mst[:n])
+        quiet = e(dub[:n, None]) < 1e-7
+        orig_e = e(acc[:n] + voc[:n])
+        m_e = e(mst[:n])
         sel = quiet & (orig_e > np.percentile(orig_e, 30))
-        ratio = 10 * np.log10(m_e[sel].mean() / (orig_e[sel].mean() + 1e-12) + 1e-12) if sel.any() else -99
-        chk("original_present", ratio >= GATE["orig_presence_min_db"],
-            f"master vs original where no dub: {ratio:.1f} dB (min {GATE['orig_presence_min_db']})")
-        log = aicn.jload(os.path.join(ws, "data", "03_dub_sentences.json"), [])
-        over = [l for l in log if l["overflow_s"] > 0.05]
-        chk("dub_fits", not over and all(l["tempo"] <= c["max_tempo"] + 1e-6 for l in log),
-            f"{len(log)} sentences, max tempo {max([l['tempo'] for l in log], default=0):.2f}x, overflow {[l['ids'] for l in over][:5]}")
-        script_segs = aicn.jload(os.path.join(ws, "data", "02_bilingual_script.json"), [])
-        aligned_segs = aicn.jload(os.path.join(ws, "data", "03_aligned_subtitles.json"), [])
-        sync_bad = []
-        min_d, max_d = 0.0, 0.0
-        for idx, (s0_it, al_it) in enumerate(zip(script_segs, aligned_segs)):
-            d = float(al_it.get("speech_start", al_it["slot_start"])) - float(s0_it["start"])
+        ratio = 10.0 * np.log10(m_e[sel].mean() / (orig_e[sel].mean() + 1e-12) + 1e-12) if sel.any() else -99.0
+    else:
+        ratio = -99.0
+    chk("original_present", ratio >= GATE["orig_presence_min_db"],
+        f"master vs original where no dub: {ratio:.1f} dB (min {GATE['orig_presence_min_db']})")
+
+    log = _jload(os.path.join(ws, "data", "03_dub_sentences.json"), []) or []
+    min_utt_s = float(c.get("min_utterance_s", 0.12))
+    over = [l for l in log if float(l.get("overflow_s", 0.0)) > 0.05]
+    tempo_bad = [l for l in log if float(l.get("tempo", 1.0)) > float(l.get("cap_tempo", c["max_tempo"])) + 0.005]
+    runt_bad = []
+    utt_overlap_bad = []
+    for idx_u, l in enumerate(log):
+        u_rel = l.get("utterance_wav") or f"media/tts_segments/utt_{int(l.get('utterance_id', idx_u)):04d}.wav"
+        up = os.path.join(ws, u_rel)
+        if not os.path.exists(up):
+            runt_bad.append((idx_u, "missing"))
+        else:
+            info_u = sf.info(up)
+            u_arr = sf.read(up, dtype="float32")[0]
+            u_pk = float(np.max(np.abs(u_arr))) if len(u_arr) else 0.0
+            if info_u.duration < min_utt_s or u_pk <= 0.005:
+                runt_bad.append((idx_u, round(info_u.duration, 3), round(u_pk, 4)))
+        if idx_u + 1 < len(log):
+            e_cur = float(l.get("speech_end", 0.0))
+            s_nxt = float(log[idx_u + 1].get("speech_start", 0.0))
+            if e_cur > s_nxt - 0.02 + 1e-6:
+                utt_overlap_bad.append((idx_u, round(e_cur, 3), round(s_nxt, 3)))
+
+    chk("dub_fits_and_intact",
+        bool(log) and not over and not tempo_bad and not runt_bad and not utt_overlap_bad,
+        f"{len(log)} utterances, max tempo {max([l.get('tempo', 1.0) for l in log], default=0):.2f}x, "
+        f"overflow={len(over)}, tempo_bad={len(tempo_bad)}, runt_bad={runt_bad[:3]}, utt_overlaps={utt_overlap_bad[:3]}")
+
+    script_segs = _jload(os.path.join(ws, "data", "02_bilingual_script.json"), []) or []
+    aligned_segs = _jload(os.path.join(ws, "data", "03_aligned_subtitles.json"), []) or []
+    sync_bad = []
+    slot_overlap_bad = []
+    min_d, max_d = 0.0, 0.0
+    if log:
+        for l in log:
+            d = float(l["speech_start"]) - float(l["script_start"])
             min_d, max_d = min(min_d, d), max(max_d, d)
-            if d < -0.15 or d > 0.75:
-                sync_bad.append((idx, round(d, 3)))
-        chk("dub_sync", len(aligned_segs) == len(script_segs) and not sync_bad,
-            f"speech_start vs script start in [{min_d:+.3f}s, {max_d:+.3f}s] (allowed [-0.15, +0.75]), bad={sync_bad[:5]}")
+            if d < -0.10 or d > 0.50:
+                sync_bad.append((l.get("utterance_id"), round(d, 3)))
+    for idx in range(len(aligned_segs) - 1):
+        if float(aligned_segs[idx]["slot_end"]) > float(aligned_segs[idx + 1]["slot_start"]) - 0.005:
+            slot_overlap_bad.append(idx)
+    chk("dub_sync",
+        len(aligned_segs) == len(script_segs) and not sync_bad and not slot_overlap_bad,
+        f"utterance speech_start vs script_start in [{min_d:+.3f}s, {max_d:+.3f}s] (allowed [-0.10, +0.50]), bad={sync_bad[:5]}, slot_overlaps={slot_overlap_bad[:5]}")
+
+    return checks
+
+
+def cmd_verify(ws, c, fh=None):
+    _assert_voice_dub(ws)
+    checks = _run_audio_checks(ws, c, fh)
     passed = all(x["passed"] for x in checks)
     pub_params = {k: v for k, v in c.items() if not k.startswith("_")}
-    aicn.jdump(os.path.join(ws, "data", "03_mix_report.json"), {"passed": passed, "version": AUDIO_VERSION, "checks": checks,
-                                                                 "params": pub_params})
-    write_stage3_report(ws, mode, checks, pub_params)
+    _jdump(os.path.join(ws, "data", "03_mix_report.json"), {
+        "passed": passed,
+        "version": AUDIO_VERSION,
+        "checks": checks,
+        "params": pub_params,
+    })
+    write_stage3_report(ws, checks, pub_params)
     for x in checks:
         print(f"  [{'PASS' if x['passed'] else 'FAIL'}] {x['id']}: {x['detail']}")
     if not passed:
         sys.exit("[aicn-audio] audio gate FAILED: Stage 3 not signed")
-    sys.path.insert(0, os.path.join(aicn.VENDOR, "vieneu-voice-pacing-mixer", "scripts"))
-    sys.path.insert(0, os.path.join(aicn.VENDOR, "video-localization-orchestrator", "scripts"))
+    for p in (os.path.join(VENDOR, "vieneu-voice-pacing-mixer", "scripts"), os.path.join(VENDOR, "video-localization-orchestrator", "scripts")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
     from verify_stage_3 import run_stage_3_verification
     run_stage_3_verification(ws)
 
 
+def cmd_batch_all(units, force=False, allow_overflow=False):
+    """Warm multi-unit pipeline: batch-separate -> batch-dub (fail-fast per unit) -> parallel CPU mix/master/verify."""
+    units = [os.path.abspath(u) for u in units]
+    batch_separate(units, force=force)
+    dub_res = batch_dub(units, force=force, allow_overflow=allow_overflow, exit_on_overflow=False)
+    ready = [u for u in units if dub_res[u][0]]
+    failed = [os.path.basename(u) for u in units if not dub_res[u][0]]
+
+    def _finish_one(ws):
+        c = cfg(ws)
+        if force:
+            c["_force"] = True
+        cmd_mix(ws, c)
+        cmd_master(ws, c)
+        cmd_verify(ws, c)
+        return os.path.basename(ws)
+
+    if ready:
+        workers = min(4, os.cpu_count() or 2, len(ready))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_finish_one, ready))
+    if failed:
+        print(f"[aicn-audio] batch-all aborted mix/master for overflowing units {failed}; trim tts_text in Stage 2.", file=sys.stderr)
+        sys.exit(2)
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["separate", "dub", "analyze", "mix", "master", "verify", "all"])
-    ap.add_argument("--unit", required=True)
-    ap.add_argument("--force", action="store_true", help="Ignore step/clause content-hash caches and recompute")
-    a = ap.parse_args()
-    ws = os.path.abspath(a.unit); c = cfg(ws); fh = aicn.FastHash(ws)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("cmd", choices=["separate", "dub", "analyze", "mix", "master", "verify", "all",
+                                        "batch-separate", "batch-dub", "batch-all"])
+    parser.add_argument("--unit", default=None, help="Single unit workspace path")
+    parser.add_argument("--units", default=None, help="Comma-separated unit workspace paths for batch-* commands")
+    parser.add_argument("--force", action="store_true", help="Ignore content-hash caches and recompute")
+    parser.add_argument("--allow-overflow", action="store_true", help="Write dub output even on overflow (diagnostics only)")
+    a = parser.parse_args()
+
+    if a.cmd.startswith("batch-"):
+        if not a.units:
+            sys.exit(f"[aicn-audio] {a.cmd} requires --units u1,u2,...")
+        units = [x.strip() for x in a.units.split(",") if x.strip()]
+        if a.cmd == "batch-separate":
+            batch_separate(units, force=a.force)
+        elif a.cmd == "batch-dub":
+            batch_dub(units, force=a.force, allow_overflow=a.allow_overflow, exit_on_overflow=not a.allow_overflow)
+        else:
+            cmd_batch_all(units, force=a.force, allow_overflow=a.allow_overflow)
+        return
+
+    if not a.unit:
+        sys.exit(f"[aicn-audio] {a.cmd} requires --unit <workspace>")
+    ws = os.path.abspath(a.unit)
+    _assert_voice_dub(ws)
+    c = cfg(ws)
     if a.force:
         c["_force"] = True
-    mode = profile(ws).get("localization_mode", "voice_dub")
-    steps = {"separate": [cmd_separate], "dub": [cmd_dub], "analyze": [cmd_analyze], "mix": [cmd_mix], "master": [cmd_master], "verify": [cmd_verify],
-             "all": ([cmd_master, cmd_verify] if mode == "sub_only" else [cmd_separate, cmd_dub, cmd_mix, cmd_master, cmd_verify])}
+    if a.allow_overflow:
+        c["_allow_overflow"] = True
+    steps = {
+        "separate": [cmd_separate],
+        "dub": [cmd_dub],
+        "analyze": [cmd_analyze],
+        "mix": [cmd_mix],
+        "master": [cmd_master],
+        "verify": [cmd_verify],
+        "all": [cmd_separate, cmd_dub, cmd_mix, cmd_master, cmd_verify],
+    }
     for f in steps[a.cmd]:
-        f(ws, c, fh)
-    fh.save()
+        f(ws, c, None)
 
 
 if __name__ == "__main__":

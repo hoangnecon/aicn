@@ -1,8 +1,8 @@
-# Chinese-to-Vietnamese AI/LLM Glossary & `VieNeu-TTS` `<en>` Reference
+# Chinese-to-Vietnamese AI/LLM Glossary & `VieNeu-TTS` `<en>` Reference (`v3.0.0`)
 
 ## 1. Core AI / Deep Learning Terminology
 
-| Chinese Source (`zh_text`) | Common Bad Machine Translation | Canonical Vietnamese Tech Reviewer Term (`sub_text`) | `VieNeu-TTS` Phonetic Tagging (`tts_text`) |
+| Chinese Source (`zh_text`) | Common Bad Machine Translation | Canonical Vietnamese Term (`sub_text`) | `VieNeu-TTS` Phonetic Tagging (`tts_text`) |
 | :--- | :--- | :--- | :--- |
 | `模型蒸馏` / `蒸馏` | chưng cất mô hình (out of context) | `chưng cất mô hình` | `chưng cất mô hình` |
 | `思维链` | 4 năm / dây chuyền tư duy | `chuỗi suy luận` | `chuỗi suy luận` |

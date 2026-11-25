@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-Stage 1B+: Multi-Band Acoustic Waveform, Visual Sub-Clause & Premature Lead-In / Silent Gap Validator (analyze_voice_waveform.py).
+Stage 1B+: Multi-Band Acoustic Waveform, Onset Alignment & Monotonic Guard (analyze_voice_waveform.py, v3.0.0).
 Analyzes:
-  1. 50ms-hop RMS waveform envelope + Zero-Crossing Rate (ZCR) on Demucs vocals.wav (or raw audio)
-     AND 300-3400Hz telephone/formant bandpass-boosted audio (dynaudnorm).
-  2. Fine-grained BBox-Jump + Glyph-IoU visual sub-clauses from 01_zh_bbox_scan.json.
+  1. 50ms-hop RMS waveform envelope + ZCR across Demucs vocals.wav and 300-3400Hz formant-boosted raw audio.
+  2. Gap-first multi-band uncovered speech detection with +0.08s protective collar around Pass 1 spans.
   3. Cross-checks ASR/Script segments for:
-     - Uncovered visual sub-clauses (<60% temporal overlap)
+     - Timestamp overlaps, inverted spans, and <0.15s runt stubs
+     - Boundary duplicate/echo fragments within 0.35s
      - Bloated segment durations (dur > char_count * 0.35 + 1.4s)
-     - Premature lead-in (subtitle appearing >0.18s before BOTH the Chinese hardsub AND the acoustic voice onset during a silent establishing shot)
-     - Lingering tail-out (subtitle staying on screen >0.35s after BOTH the Chinese hardsub disappears AND the voice ends)
-     - Unsplit internal silent gaps (>=0.40s blank gap inside a segment where neither hardsub nor voice is active)
-  4. Provides `--snap-and-split` mode to automatically split compound multi-interval segments and clamp every segment's
-     [start, end] to the true active onset/offset of its visual hardsub and acoustic voice waveform.
+     - Premature lead-in (>0.30s before acoustic voice onset)
+     - Uncovered acoustic voice bursts and longest unprobed vocal gap
+  4. Provides `--snap-and-split` to absorb <0.25s micro-fragments, deduplicate boundary echoes,
+     clamp segments to acoustic voice onset/offset, and enforce strict monotonic non-overlapping
+     timestamps: 0.0 <= start[i] < end[i] <= start[i+1] - 0.02 and (end[i] - start[i]) >= 0.15.
 Writes data/01_waveform_voice_audit.json.
 """
 import argparse
+import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -37,6 +37,9 @@ except ImportError:
     ap = None
 
 
+WAVEFORM_CACHE_VERSION = "wf-4.0"
+
+
 def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
     cmd = [ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y", "-i", input_path]
     if af_filter:
@@ -46,80 +49,142 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-WAVEFORM_CACHE_VERSION = "wf-3.2"
-
-
 def _fast_file_sig(path: str) -> str:
-    """Content-addressed SHA-256 signature (stat-cached via aicn_platform so moving/rebuilding identical media hits cache)."""
+    """Pure content-addressed SHA-256 signature (zero path/mtime dependence)."""
     if not path or not os.path.exists(path):
         return "missing"
     if ap is not None and hasattr(ap, "content_sha256"):
         return ap.content_sha256(path)
-    st = os.stat(path)
-    return f"{os.path.abspath(path)}:{st.st_size}:{st.st_mtime_ns}"
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def compute_audio_spectral_profile(audio_arr: np.ndarray, sr: int = 16000) -> dict:
-    """Compute active-frame 5-band frequency share (respecting Nyquist sr/2), centroid, RMS/Peak/Crest, and HP hint."""
-    x = np.asarray(audio_arr, dtype=np.float32)
-    if x.size == 0:
-        return {}
-    peak = float(np.max(np.abs(x)) + 1e-12)
-    peak_db = round(20.0 * np.log10(peak), 2)
+def _atomic_write_json(path: str, obj) -> None:
+    if ap is not None and hasattr(ap, "atomic_write_json"):
+        ap.atomic_write_json(path, obj)
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
-    win = min(len(x), 4096)
-    n_blocks = max(1, len(x) // win)
-    blk = x[: n_blocks * win].reshape(n_blocks, win)
-    b_rms = np.sqrt(np.mean(blk ** 2, axis=1) + 1e-15)
-    act = b_rms > max(10.0 ** (-55.0 / 20.0), peak * 1e-3)
-    active_blk = blk[act] if act.any() else blk
-    rms = float(np.sqrt(np.mean(active_blk ** 2) + 1e-12))
-    rms_db = round(20.0 * np.log10(rms), 2)
-    crest_db = round(peak_db - rms_db, 2)
 
-    hann = np.hanning(win).astype(np.float32)[None, :]
-    spec = np.fft.rfft(active_blk * hann, axis=1)
-    mag2 = (spec.real ** 2 + spec.imag ** 2).mean(axis=0)
-    freqs = np.fft.rfftfreq(win, 1.0 / sr)
-    tot = float(mag2.sum() + 1e-15)
-    nyq = sr / 2.0
+def cjk_chars(text: str) -> str:
+    """Return all CJK unified ideograph characters in text."""
+    return "".join(c for c in (text or "") if "\u4e00" <= c <= "\u9fff")
 
-    def band_pct(lo, hi):
-        m = (freqs >= lo) & (freqs < min(hi, nyq + 1.0))
-        return round(100.0 * float(mag2[m].sum()) / tot, 2) if m.any() else 0.0
 
-    sub_pct = band_pct(0, 120)
-    low_pct = band_pct(120, 300)
-    speech_pct = band_pct(300, 3400)
-    pres_pct = band_pct(3400, 6500)
-    high_pct = band_pct(6500, nyq + 1.0)
-    centroid_hz = round(float((freqs * mag2).sum() / tot), 1)
-    rec_hp = 110 if sub_pct > 18.0 else (95 if sub_pct > 10.0 else 85)
+def cjk_alnum_chars(text: str) -> str:
+    """Return normalized lowercase CJK + alphanumeric characters in text."""
+    return "".join(c.lower() for c in (text or "") if ("\u4e00" <= c <= "\u9fff") or c.isalnum())
 
-    return {
-        "sample_rate_hz": sr,
-        "nyquist_hz": int(nyq),
-        "waveform": {
-            "rms_dbfs": rms_db,
-            "peak_dbfs": peak_db,
-            "crest_factor_db": crest_db,
-            "active_block_ratio": round(float(act.mean()), 3),
-        },
-        "frequency_bands_pct": {
-            "sub_lt120hz": sub_pct,
-            "low_mid_120_300hz": low_pct,
-            "speech_300_3400hz": speech_pct,
-            "presence_3400_6500hz": pres_pct,
-            "high_6500_nyquist": high_pct,
-        },
-        "spectral_centroid_hz": centroid_hz,
-        "recommended_hp_hz": rec_hp,
-        "lp_note": "Full-band LP cutoff is analyzed at 48 kHz in Stage 3 (aicn_audio.py analyze).",
-    }
+
+def is_boundary_duplicate_pair(
+    left_seg: dict,
+    right_seg: dict,
+    gap_thresh_s: float = 0.35,
+    strict: bool | None = None,
+) -> tuple[bool, str]:
+    """
+    Detect boundary duplicate/echo fragments between two temporally adjacent segments (gap <= gap_thresh_s).
+    When either segment comes from Pass 2B (or source is unspecified), enforces strict v3.0.0 Pass 2B dedup
+    (<=2-char shared CJK char or >=0.55 CJK character containment + containment/affix checks).
+    """
+    gap = float(right_seg.get("start", 0.0)) - float(left_seg.get("end", 0.0))
+    if gap > gap_thresh_s + 1e-6:
+        return False, ""
+
+    lt = (left_seg.get("text", left_seg.get("sub_text", "")) or "").strip()
+    rt = (right_seg.get("text", right_seg.get("sub_text", "")) or "").strip()
+    la, ra = cjk_alnum_chars(lt), cjk_alnum_chars(rt)
+    lc, rc = cjk_chars(lt), cjk_chars(rt)
+    if not la or not ra:
+        return False, ""
+
+    src_l = str(left_seg.get("source", "") or "")
+    src_r = str(right_seg.get("source", "") or "")
+    if strict is None:
+        involves_p2b = ("pass2b" in src_l) or ("pass2b" in src_r) or (not src_l and not src_r)
+    else:
+        involves_p2b = bool(strict)
+
+    if la == ra:
+        return True, "exact_duplicate"
+
+    if (la in ra or ra in la) and (min(len(la), len(ra)) >= 2 or gap <= 0.20 or involves_p2b):
+        return True, "substring_containment"
+
+    max_k = min(len(la), len(ra))
+    for k in range(max_k, 0, -1):
+        if la[-k:] == ra[:k]:
+            if k >= 2 or (min(len(la), len(ra)) <= 2 and (involves_p2b or gap <= 0.15)):
+                return True, f"affix_overlap({la[-k:]})"
+            break
+
+    if involves_p2b and lc and rc:
+        sa, sb = set(lc), set(rc)
+        # Only flag <=2-char shared char when the <=2-char side is a Pass 2B fragment/echo
+        # or shares a boundary char (prevents false positive on valid turns like '我是谢谢' + '你是').
+        l_is_short_p2b = len(lc) <= 2 and ("pass2b" in src_l or (not src_l and not src_r))
+        r_is_short_p2b = len(rc) <= 2 and ("pass2b" in src_r or (not src_l and not src_r))
+        if (l_is_short_p2b or r_is_short_p2b) and (sa & sb):
+            return True, f"short_shared_char({''.join(sorted(sa & sb))})"
+        cont = len(sa & sb) / max(1, min(len(sa), len(sb)))
+        if cont >= 0.55:
+            return True, f"cjk_containment({cont:.2f})"
+
+    return False, ""
+
+
+def find_boundary_duplicate_pairs(segments: list, gap_thresh_s: float = 0.35) -> list:
+    """Return list of adjacent boundary duplicate pairs for Stage 1 verification."""
+    hits = []
+    for i in range(len(segments) - 1):
+        flag, reason = is_boundary_duplicate_pair(segments[i], segments[i + 1], gap_thresh_s=gap_thresh_s)
+        if flag:
+            hits.append({
+                "left_id": segments[i].get("id", i),
+                "right_id": segments[i + 1].get("id", i + 1),
+                "gap_s": round(float(segments[i + 1]["start"]) - float(segments[i]["end"]), 3),
+                "left_text": segments[i].get("text", segments[i].get("sub_text", ""))[:30],
+                "right_text": segments[i + 1].get("text", segments[i + 1].get("sub_text", ""))[:30],
+                "reason": reason,
+            })
+    return hits
+
+
+def find_timestamp_violations(segments: list, min_dur_s: float = 0.15, min_gap_s: float = 0.02) -> list:
+    """Check strict monotonic non-overlapping invariant: 0 <= start[i] < end[i] <= start[i+1] - 0.02 and dur >= 0.15s."""
+    violations = []
+    eps = 1e-6
+    for i, s in enumerate(segments):
+        st = float(s.get("start", -1.0))
+        et = float(s.get("end", -1.0))
+        sid = s.get("id", i)
+        if st < 0.0 or et <= st:
+            violations.append({"id": sid, "kind": "inverted_or_negative", "start": st, "end": et})
+        elif (et - st) < (min_dur_s - eps):
+            violations.append({"id": sid, "kind": "runt_lt_min_dur", "start": st, "end": et, "dur": round(et - st, 3)})
+        if i + 1 < len(segments):
+            nxt_st = float(segments[i + 1].get("start", 0.0))
+            if et > nxt_st - min_gap_s + eps:
+                violations.append({
+                    "id": sid,
+                    "next_id": segments[i + 1].get("id", i + 1),
+                    "kind": "overlap_or_gap_violation",
+                    "end": et,
+                    "next_start": nxt_st,
+                    "gap": round(nxt_st - et, 3),
+                })
+    return violations
 
 
 def _bandpass_in_ram(x: np.ndarray, lo_hz: float, hi_hz: float, sr: int = 16000, order: int = 4) -> np.ndarray:
-    """Fast zero-disk 4th-order Butterworth SOS bandpass filter in RAM (-24 dB/oct isolation, zero ffmpeg spawns)."""
+    """Fast zero-disk 4th-order Butterworth SOS bandpass filter in RAM (-24 dB/oct isolation)."""
     from scipy.signal import butter, sosfilt
     nyq = 0.5 * sr
     sos = butter(order, [max(10.0, lo_hz) / nyq, min(nyq * 0.95, hi_hz) / nyq], btype="band", output="sos")
@@ -127,7 +192,7 @@ def _bandpass_in_ram(x: np.ndarray, lo_hz: float, hi_hz: float, sr: int = 16000,
 
 
 def _local_rms_norm(x: np.ndarray, sr: int = 16000, win_s: float = 0.10, floor: float = 0.035) -> np.ndarray:
-    """Fast in-RAM dynamic gain normalization (replaces slow ffmpeg dynaudnorm passes)."""
+    """Fast in-RAM dynamic gain normalization."""
     arr = np.asarray(x, dtype=np.float32)
     if arr.size == 0:
         return arr
@@ -139,12 +204,11 @@ def _local_rms_norm(x: np.ndarray, sr: int = 16000, win_s: float = 0.10, floor: 
 def build_multiband_audio_streams(voc_arr: np.ndarray, raw_arr: np.ndarray, sr: int = 16000) -> dict:
     """
     Decompose vocals + raw full-mix audio into 4 speech-targeted frequency bands + clean raw reference:
-      - full_vocal (120-7500 Hz, 70% voc + 30% raw): clean full-spectrum speech (VAD recovery)
-      - high       (900-7500 Hz, 55% voc + 45% raw): child/cartoon high-pitch voices, bright female voices, breathy whispers
-      - mid        (300-3400 Hz, 35% voc + 65% raw): core speech formants, phone/radio/PA comms (immune to Demucs phone loss)
-      - low        ( 85-1400 Hz, 75% voc + 25% raw): deep male voices & muffled speech drowned by high-frequency SFX
-      - raw_clean  (100-7500 Hz, 100% raw):          reverse cross-check stream when Demucs strips a voice into accomp
-    Returns both raw band waveforms (`<band>_raw`) for energy measurement and locally-normalized (`<band>`) for ASR.
+      - full_vocal (120-7500 Hz, 70% voc + 30% raw): clean full-spectrum speech
+      - high       (900-7500 Hz, 55% voc + 45% raw): child/cartoon high-pitch voices & breathy whispers
+      - mid        (300-3400 Hz, 35% voc + 65% raw): core speech formants, phone/radio/PA comms
+      - low        ( 85-1400 Hz, 75% voc + 25% raw): deep male voices & muffled speech under high-freq SFX
+      - raw_clean  (100-7500 Hz, 100% raw):          reverse cross-check stream
     """
     min_len = min(len(voc_arr), len(raw_arr))
     v = np.asarray(voc_arr[:min_len], dtype=np.float32)
@@ -207,13 +271,12 @@ def detect_uncovered_multiband_gaps(
     min_gap_s: float = 0.35,
 ) -> list:
     """
-    Gap-First Multi-Band Uncovered Speech Scanner (independent of hardsubs):
-      1. Masks out timeline regions ALREADY covered by `existing_segments` FIRST (eliminating giant-blob swallowing).
-      2. Scans EVERY uncovered 50ms hop across 4 frequency bands (full_vocal, high, mid, low) with adaptive per-band
-         noise floors and syllable modulation checks — eliminating the old 0.024-0.080 RMS dead zone.
-      3. Automatically splits any contiguous uncovered speech region longer than `max_window_s` (default 10s) at its
-         lowest-energy valley so Whisper never suffers 30s window drift.
-      4. Annotates each gap with per-band normalized dominance scores and recommended probe order.
+    Gap-First Multi-Band Uncovered Speech Scanner (v3.0.0):
+      1. Masks out Pass 1 covered timeline regions with a +0.08s outward protective collar so Pass 2B
+         never bleeds into Pass 1 boundary syllables, while trimming bloated spans (> max_cov_dur)
+         to their primary active speech cluster so adjacent uncovered utterances stay exposed.
+      2. Scans EVERY uncovered 50ms hop across 4 frequency bands (full_vocal, high, mid, low).
+      3. Splits uncovered regions > max_window_s at lowest-energy valleys.
     """
     if streams is None:
         streams = build_multiband_audio_streams(voc_arr, raw_arr, sr=sr)
@@ -223,10 +286,10 @@ def detect_uncovered_multiband_gaps(
     n_hops = n_samples // hop
     if n_hops <= 0:
         return []
+    total_dur = n_hops * 0.05
 
-    # 1. Per-band 50ms RMS, ZCR, and local syllable modulation CV
     voc_rms, voc_zcr = _hop_rms_and_zcr(streams["voc_raw"], n_hops, hop)
-    full_rms, full_zcr = _hop_rms_and_zcr(streams["full_vocal_raw"], n_hops, hop)
+    full_rms, _ = _hop_rms_and_zcr(streams["full_vocal_raw"], n_hops, hop)
     hi_rms, hi_zcr = _hop_rms_and_zcr(streams["high_raw"], n_hops, hop)
     mid_rms, mid_zcr = _hop_rms_and_zcr(streams["mid_raw"], n_hops, hop)
     lo_rms, lo_zcr = _hop_rms_and_zcr(streams["low_raw"], n_hops, hop)
@@ -238,7 +301,6 @@ def detect_uncovered_multiband_gaps(
     voc_lo_rms, _ = _hop_rms_and_zcr(voc_lo_bp, n_hops, hop)
 
     voc_mod = _sliding_mod_cv(voc_rms, 10)
-    full_mod = _sliding_mod_cv(full_rms, 10)
     hi_mod = _sliding_mod_cv(hi_rms, 10)
     mid_mod = _sliding_mod_cv(mid_rms, 10)
     lo_mod = _sliding_mod_cv(lo_rms, 10)
@@ -251,23 +313,22 @@ def detect_uncovered_multiband_gaps(
     mid_fl = _floor(mid_rms, 0.0025, 0.0100)
     lo_fl = _floor(lo_rms, 0.0025, 0.0100)
 
-    # 2. Build covered mask from existing ASR segments. When a bloated Pass 1 span (> n_chars * 0.35 + 1.35s)
-    # bridges across a >= 0.45s silent gap into an adjacent speech cluster (or carries long leading/trailing silence),
-    # restrict `covered` to the primary active speech cluster(s) fitting <= max_cov_dur so adjacent utterances stay exposed!
+    # Build covered mask with +0.08s outward protective collar (replacing old -0.05s shrink)
     covered = np.zeros(n_hops, dtype=bool)
     seg_act_mask = (voc_rms > max(0.0080, voc_fl * 2.1)) | (full_rms > max(0.0100, voc_fl * 2.5))
     for s in existing_segments or []:
         raw_st = float(s.get("start", 0.0))
         raw_et = float(s.get("end", 0.0))
+        if raw_et <= raw_st:
+            continue
         txt_s = s.get("zh_text", s.get("text", "")) or ""
-        n_ch = len([c for c in txt_s if ("\u4e00" <= c <= "\u9fff") or c.isalnum()])
+        n_ch = len(cjk_alnum_chars(txt_s))
         max_cov_dur = (n_ch * 0.35 + 1.35) if n_ch > 0 else (raw_et - raw_st)
         if n_ch > 0 and (raw_et - raw_st) > max_cov_dur:
             a0 = max(0, int(round(raw_st / 0.05)))
             a1 = min(n_hops, int(round(raw_et / 0.05)))
             act_idx = [k for k in range(a0, a1) if seg_act_mask[k]]
             if act_idx:
-                # Group active hops into clusters separated by >= 0.45s (9 hops) of non-vocal silence
                 cl_list = [[act_idx[0], act_idx[0] + 1, float(full_rms[act_idx[0]])]]
                 for k in act_idx[1:]:
                     if (k - cl_list[-1][1]) < 9:
@@ -276,7 +337,6 @@ def detect_uncovered_multiband_gaps(
                     else:
                         cl_list.append([k, k + 1, float(full_rms[k])])
                 if len(cl_list) >= 2:
-                    # Multiple clusters bridged across >=0.45s silence: pick highest-energy contiguous cluster range <= max_cov_dur
                     best_e, best_pair = -1.0, None
                     for ci in range(len(cl_list)):
                         acc_e = 0.0
@@ -287,28 +347,23 @@ def detect_uncovered_multiband_gaps(
                             if acc_e > best_e:
                                 best_e, best_pair = acc_e, (ci, cj)
                     if best_pair is not None:
-                        raw_st = max(raw_st, cl_list[best_pair[0]][0] * 0.05 - 0.10)
-                        raw_et = min(raw_et, cl_list[best_pair[1]][1] * 0.05 + 0.10)
+                        raw_st = max(raw_st, cl_list[best_pair[0]][0] * 0.05 - 0.05)
+                        raw_et = min(raw_et, cl_list[best_pair[1]][1] * 0.05 + 0.05)
                 else:
-                    # Single cluster with bloated leading/trailing silence: trim dead silence outside cluster
-                    raw_st = max(raw_st, cl_list[0][0] * 0.05 - 0.10)
-                    raw_et = min(raw_et, cl_list[0][1] * 0.05 + 0.10)
-        st = raw_st + 0.05
-        et = raw_et - 0.05
-        if et <= st:
-            st, et = raw_st, raw_et
-        i0 = max(0, int(round(st / 0.05)))
-        i1 = min(n_hops, int(round(et / 0.05)))
+                    raw_st = max(raw_st, cl_list[0][0] * 0.05 - 0.05)
+                    raw_et = min(raw_et, cl_list[0][1] * 0.05 + 0.05)
+        st = max(0.0, raw_st - 0.08)
+        et = min(total_dur, raw_et + 0.08)
+        i0 = max(0, int(st / 0.05))
+        i1 = min(n_hops, int(np.ceil(et / 0.05)))
         if i1 > i0:
             covered[i0:i1] = True
 
-    # Active speech masks across all 4 bands (zero dead zone between whisper and loud speech!)
     is_full = (voc_rms > max(0.0075, voc_fl * 2.1)) & (voc_zcr >= 0.015) & (
         (voc_zcr <= 0.45) | ((voc_rms > 0.035) & (voc_zcr <= 0.58))
     ) & (
         (voc_rms > max(0.018, voc_fl * 3.2)) | (voc_mod >= 0.14)
     )
-    # High band: child/cartoon voices (high pitch & ZCR up to 0.62) + breathy whispers
     is_high = (
         (hi_rms > max(0.0050, hi_fl * 2.2))
         & (hi_zcr >= 0.04)
@@ -316,7 +371,6 @@ def detect_uncovered_multiband_gaps(
         & (hi_mod >= 0.15)
         & ((voc_hi_rms > max(0.0030, hi_fl * 1.4)) | (hi_rms > max(0.012, hi_fl * 3.5)))
     )
-    # Mid band: telephony/radio/PA (300-3400 Hz roll-off above 3.6 kHz) or strong syllable-modulated mid-band speech
     mid_vs_hi = mid_rms / (raw_hi_rms + 1e-6)
     is_mid = (
         (mid_rms > max(0.0065, mid_fl * 2.2))
@@ -329,7 +383,6 @@ def detect_uncovered_multiband_gaps(
             | ((mid_rms > max(0.015, mid_fl * 3.5)) & (mid_mod >= 0.22))
         )
     )
-    # Low band: deep male voices / muffled speech where vocals stem has strong low-band speech modulation
     is_low = (
         (lo_rms > max(0.0080, lo_fl * 2.2))
         & (voc_lo_rms > max(0.0060, lo_fl * 1.8))
@@ -340,7 +393,6 @@ def detect_uncovered_multiband_gaps(
 
     uncovered_active = (~covered) & (is_full | is_high | is_mid | is_low)
 
-    # 3. Group uncovered active hops across <= 0.25s syllable pauses (never crossing covered hops!)
     raw_spans = []
     i = 0
     while i < n_hops:
@@ -350,7 +402,6 @@ def detect_uncovered_multiband_gaps(
                 if uncovered_active[j]:
                     j += 1
                     continue
-                # Bridge up to 5 hops (0.25s) of silence ONLY if none of those hops are covered
                 bridge = 0
                 while (j + bridge) < n_hops and bridge < 5 and (not uncovered_active[j + bridge]) and (not covered[j + bridge]):
                     bridge += 1
@@ -363,7 +414,6 @@ def detect_uncovered_multiband_gaps(
         else:
             i += 1
 
-    # 4. Split any long uncovered span (> max_window_s) at lowest-energy valleys so Whisper stays in crisp short windows
     min_hops = max(2, int(round(min_gap_s / 0.05)))
     max_hops = max(min_hops + 4, int(round(max_window_s / 0.05)))
     min_split_hops = max(min_hops, int(round(3.5 / 0.05)))
@@ -385,7 +435,6 @@ def detect_uncovered_multiband_gaps(
         if (i1 - cur) >= min_hops:
             split_spans.append((cur, i1))
 
-    # 5. Filter steady sustained instruments/BGM and score dominant frequency bands per gap
     gaps = []
     for i0, i1 in split_spans:
         dur = round((i1 - i0) * 0.05, 2)
@@ -403,11 +452,9 @@ def detect_uncovered_multiband_gaps(
         m_lo = float(np.std(lo_rms[i0:i1]) / (np.mean(lo_rms[i0:i1]) + 1e-6))
         best_mod = max(m_voc, m_hi, m_mid, m_lo)
 
-        # Reject steady unmodulated hum / sustained solo instrument unless vocals stem is clearly loud speech
         if best_mod < 0.14 and p_voc < 0.035:
             continue
 
-        # Short inter-clause pause filter (< 1.0s): reject brief BGM/SFX breath ticks unless vocals stem or phone band is clearly speech
         if dur < 1.0:
             pk_mid_ratio = float(np.max(mid_vs_hi[i0:i1])) if i1 > i0 else 0.0
             has_short_vocal = p_voc >= max(0.018, voc_fl * 3.2)
@@ -415,7 +462,6 @@ def detect_uncovered_multiband_gaps(
             if not (has_short_vocal or has_short_phone):
                 continue
 
-        # Normalized band SNR above floor to rank probe priority (full_vocal, high, mid, low)
         band_snr = {
             "full_vocal": round(float(np.mean(full_rms[i0:i1])) / max(1e-4, voc_fl), 2),
             "high": round(float(np.mean(hi_rms[i0:i1])) / max(1e-4, hi_fl), 2),
@@ -471,11 +517,7 @@ def compute_voice_mask_and_bursts(
     raw_arr: np.ndarray = None,
     sr: int = 16000,
 ):
-    """
-    Detect:
-      - `voice_mask`: clean primary speech mask (for onset clamping without BGM/instrument false positives)
-      - `merged_bursts`: normal, adaptive-floor `whisper`, and modulation-validated `phone_call` bursts
-    """
+    """Detect clean primary `voice_mask` and `merged_bursts` (normal, whisper, phone_call)."""
     hop = int(0.05 * sr)
     lens = [len(voc_arr), len(tel_arr)]
     if raw_tel_arr is not None:
@@ -493,7 +535,6 @@ def compute_voice_mask_and_bursts(
     zcr_arr = np.mean(np.abs(np.diff(np.sign(v_blks), axis=1)), axis=1) / 2.0
     t_zcr_arr = np.mean(np.abs(np.diff(np.sign(t_blks), axis=1)), axis=1) / 2.0
 
-    # Adaptive noise floor & speech reference so detection scales across quiet (-24 LUFS) and loud (-11 LUFS) dramas
     voc_floor = max(0.002, min(0.006, float(np.percentile(v_rms_arr, 15))))
     nz_v = v_rms_arr[v_rms_arr > voc_floor * 1.2]
     voc_ref = max(0.020, float(np.percentile(nz_v, 85))) if nz_v.size >= 10 else 0.035
@@ -504,7 +545,6 @@ def compute_voice_mask_and_bursts(
     if raw_tel_arr is not None and raw_arr is not None:
         rt_blks = raw_tel_arr[: n_hops * hop].reshape(n_hops, hop)
         rt_rms_arr = np.sqrt(np.mean(rt_blks ** 2, axis=1) + 1e-12)
-        # Upper-band (>3.5 kHz) energy on raw audio: real telephone lines roll off sharply above 3.4 kHz
         hi_arr = _bandpass_in_ram(raw_arr[: n_hops * hop], 3600.0, 7200.0, sr=sr)
         hi_rms_arr = np.sqrt(np.mean(hi_arr.reshape(n_hops, hop) ** 2, axis=1) + 1e-12)
         tel_vs_hi_arr = rt_rms_arr / (hi_rms_arr + 1e-6)
@@ -527,11 +567,9 @@ def compute_voice_mask_and_bursts(
     def _finalize_burst(i0, i1, peak_v, peak_t, n_ph, n_wh, n_nm):
         if (i1 - i0) < 2:
             return
-        b_st = i0 * 0.05
-        b_et = i1 * 0.05
         raw_bursts.append({
-            "start": round(b_st, 2),
-            "end": round(b_et, 2),
+            "start": round(i0 * 0.05, 2),
+            "end": round(i1 * 0.05, 2),
             "peak_voc_rms": round(float(peak_v), 4),
             "peak_tel_rms": round(float(peak_t), 4),
             "_i0": int(i0),
@@ -552,7 +590,6 @@ def compute_voice_mask_and_bursts(
         if has_raw_tel:
             rt_rms = float(rt_rms_arr[i])
             tel_vs_hi = float(tel_vs_hi_arr[i])
-            # Works even with bass BGM present because it compares 300-3400Hz telephony vs >3.6kHz roll-off
             is_phone = (
                 rt_rms > max(0.004, voc_floor * 1.8)
                 and rt_rms > v_rms * 1.35
@@ -562,11 +599,9 @@ def compute_voice_mask_and_bursts(
         else:
             is_phone = (t_rms > 0.12 and v_rms > 0.006 and 0.02 <= zcr <= 0.35)
 
-        # Keep voice_mask clean for onset clamping (normal speech + confirmed vocals, not ambient hiss/instruments)
         voice_mask[i] = is_normal or (t_rms > 0.14 and v_rms > max(0.008, voc_floor * 2.5) and 0.02 <= zcr <= 0.32)
 
-        is_candidate = is_normal or is_whisper or is_phone
-        if is_candidate:
+        if is_normal or is_whisper or is_phone:
             if not in_burst:
                 in_burst = True
                 b_i0 = i
@@ -584,15 +619,13 @@ def compute_voice_mask_and_bursts(
                     b_whisper_hits += 1
                 if is_normal:
                     b_normal_hits += 1
-        else:
-            if in_burst:
-                _finalize_burst(b_i0, i, b_peak_voc, b_peak_tel, b_phone_hits, b_whisper_hits, b_normal_hits)
-                in_burst = False
+        elif in_burst:
+            _finalize_burst(b_i0, i, b_peak_voc, b_peak_tel, b_phone_hits, b_whisper_hits, b_normal_hits)
+            in_burst = False
 
     if in_burst:
         _finalize_burst(b_i0, n_hops, b_peak_voc, b_peak_tel, b_phone_hits, b_whisper_hits, b_normal_hits)
 
-    # Merge syllable-level micro-bursts across <=0.22s pauses BEFORE applying duration & modulation checks
     grouped = []
     for b in raw_bursts:
         if grouped and (b["start"] - grouped[-1]["end"]) <= 0.22:
@@ -613,17 +646,14 @@ def compute_voice_mask_and_bursts(
         if (i1 - i0) < 7:
             continue
         n_ph, n_wh, n_nm = b["_ph"], b["_wh"], b["_nm"]
-        # Reject steady hum/sustained solo instruments using syllable envelope modulation CV across the full burst
         if n_ph > n_nm and n_ph >= 3:
             env = rt_rms_arr[i0:i1] if has_raw_tel else t_rms_arr[i0:i1]
-            mod_cv = float(np.std(env) / (np.mean(env) + 1e-6))
-            if mod_cv < 0.16:
+            if float(np.std(env) / (np.mean(env) + 1e-6)) < 0.16:
                 continue
             kind = "phone_call"
         elif n_wh >= 3 and n_nm == 0:
             env = v_rms_arr[i0:i1]
-            mod_cv = float(np.std(env) / (np.mean(env) + 1e-6))
-            if mod_cv < 0.14:
+            if float(np.std(env) / (np.mean(env) + 1e-6)) < 0.14:
                 continue
             kind = "whisper"
         else:
@@ -639,128 +669,231 @@ def compute_voice_mask_and_bursts(
     return voice_mask, merged_bursts
 
 
-def snap_and_split_segments(segments: list, sub_clauses: list, spans: list, voice_mask: np.ndarray, max_syl_rate: float = 7.5) -> list:
-    """
-    1. Splits compound segments that overlap >=2 distinct visual sub-clauses AND contain multi-clause punctuation.
-    2. Clamps each segment's [start, end] to its dominant visual hardsub interval (or acoustic voice onset if no hardsub),
-       eliminating premature subtitle appearance during silent establishing shots and lingering subtitle tails after speech ends.
-    """
-    n_hops = len(voice_mask)
+def _merge_segment_texts(left_text: str, right_text: str) -> str:
+    """Join two adjacent segment texts without duplicating shared boundary substrings."""
+    lt = (left_text or "").strip()
+    rt = (right_text or "").strip()
+    if not lt:
+        return rt
+    if not rt:
+        return lt
+    la, ra = cjk_alnum_chars(lt), cjk_alnum_chars(rt)
+    if la == ra or ra in la:
+        return lt
+    if la in ra:
+        return rt
+    if not any("\u4e00" <= c <= "\u9fff" for c in lt + rt):
+        return f"{lt} {rt}"
+    return f"{lt}{rt}"
 
-    # Remove exact adjacent duplicate segments where the first segment is a premature ghost before the actual hardsub
+
+def _dedup_adjacent_segments(segments: list, gap_thresh_s: float = 0.35) -> list:
+    """Merge/drop adjacent boundary duplicate fragments within gap_thresh_s cleanly."""
     deduped = []
-    i = 0
-    while i < len(segments):
-        s = dict(segments[i])
-        if i + 1 < len(segments):
-            nxt = segments[i + 1]
-            t1 = s.get("sub_text", s.get("text", "")).strip()
-            t2 = nxt.get("sub_text", nxt.get("text", "")).strip()
-            if t1 and t1 == t2 and (float(nxt["start"]) - float(s["end"])) <= 0.25:
-                # Check if next segment aligns better with hardsub
-                merged = dict(nxt)
-                merged["start"] = max(float(s["start"]), float(nxt["start"]) - 0.6)
-                deduped.append(merged)
-                i += 2
+    for raw in segments:
+        s = dict(raw)
+        txt = (s.get("sub_text", s.get("text", "")) or "").strip()
+        if not txt:
+            continue
+        st = round(max(0.0, float(s.get("start", 0.0))), 2)
+        et = round(float(s.get("end", st + 0.20)), 2)
+        if et <= st:
+            et = round(st + 0.20, 2)
+        s["start"], s["end"] = st, et
+
+        if deduped:
+            prev = deduped[-1]
+            is_dup, _ = is_boundary_duplicate_pair(prev, s, gap_thresh_s=gap_thresh_s)
+            if is_dup:
+                pt = (prev.get("sub_text", prev.get("text", "")) or "").strip()
+                pt_len = len(cjk_alnum_chars(pt))
+                ct_len = len(cjk_alnum_chars(txt))
+                prev_p2b = "pass2b" in str(prev.get("source", ""))
+                cur_p2b = "pass2b" in str(s.get("source", ""))
+                if (prev_p2b and not cur_p2b and ct_len >= pt_len) or (not prev_p2b and cur_p2b and ct_len > pt_len + 1) or (prev_p2b == cur_p2b and ct_len > pt_len):
+                    merged = dict(s)
+                    merged["start"] = min(float(prev["start"]), st)
+                    merged["end"] = max(float(prev["end"]), et)
+                    deduped[-1] = merged
+                elif cjk_alnum_chars(txt) in cjk_alnum_chars(pt):
+                    prev["end"] = max(float(prev["end"]), et)
                 continue
         deduped.append(s)
+    return deduped
+
+
+def _absorb_duplicate_and_micro_fragments(segments: list) -> list:
+    """
+    1. Merge/drop adjacent boundary duplicate fragments within 0.35s.
+    2. Absorb ultra-short <0.25s same-speaker stutters/1-char orphans within 0.20s of a neighbor,
+       or drop degenerate <0.15s stubs.
+    """
+    if not segments:
+        return []
+
+    deduped = _dedup_adjacent_segments(segments, gap_thresh_s=0.35)
+
+    # Absorb ultra-short <0.25s stutters / orphans cleanly into adjacent speech when within 0.20s
+    cleaned = []
+    i = 0
+    while i < len(deduped):
+        cur = dict(deduped[i])
+        dur = float(cur["end"]) - float(cur["start"])
+        txt = (cur.get("sub_text", cur.get("text", "")) or "").strip()
+        n_cjk = len(cjk_chars(txt))
+        is_excl = txt.endswith(("！", "!", "？", "?"))
+        if dur < 0.25:
+            prev = cleaned[-1] if cleaned else None
+            nxt = deduped[i + 1] if i + 1 < len(deduped) else None
+            g_prev = (float(cur["start"]) - float(prev["end"])) if prev else 999.0
+            g_next = (float(nxt["start"]) - float(cur["end"])) if nxt else 999.0
+            same_prev = prev is not None and (prev.get("speaker") == cur.get("speaker")) and g_prev <= 0.20
+            same_next = nxt is not None and (nxt.get("speaker") == cur.get("speaker")) and g_next <= 0.20
+
+            cur_a = cjk_alnum_chars(txt)
+            should_absorb = (
+                (dur < 0.15)
+                or (n_cjk <= 1 and not is_excl)
+                or (same_prev and bool(cur_a) and (cur_a in cjk_alnum_chars(prev.get("text", "")) or cjk_alnum_chars(prev.get("text", "")) in cur_a))
+                or (same_next and bool(cur_a) and (cur_a in cjk_alnum_chars(nxt.get("text", "")) or cjk_alnum_chars(nxt.get("text", "")) in cur_a))
+            )
+            if should_absorb and (same_prev or same_next):
+                # Prefer merging 1-char leading orphan forward into nxt if closer or equal
+                if same_next and (not same_prev or g_next <= g_prev):
+                    nxt_m = dict(nxt)
+                    if n_cjk <= 1 or cjk_alnum_chars(txt) not in cjk_alnum_chars(nxt_m.get("text", "")):
+                        merged_txt = _merge_segment_texts(txt, nxt_m.get("text", ""))
+                        if "text" in nxt_m:
+                            nxt_m["text"] = merged_txt
+                        if "sub_text" in nxt_m:
+                            nxt_m["sub_text"] = _merge_segment_texts(cur.get("sub_text", txt), nxt_m.get("sub_text", ""))
+                        if "tts_text" in nxt_m:
+                            nxt_m["tts_text"] = _merge_segment_texts(cur.get("tts_text", txt), nxt_m.get("tts_text", ""))
+                    if dur >= 0.15 or g_next <= 0.08:
+                        nxt_m["start"] = min(float(cur["start"]), float(nxt_m["start"]))
+                    deduped[i + 1] = nxt_m
+                    i += 1
+                    continue
+                if same_prev:
+                    merged_txt = _merge_segment_texts(prev.get("text", ""), txt)
+                    if "text" in prev:
+                        prev["text"] = merged_txt
+                    if "sub_text" in prev:
+                        prev["sub_text"] = _merge_segment_texts(prev.get("sub_text", ""), cur.get("sub_text", txt))
+                    if "tts_text" in prev:
+                        prev["tts_text"] = _merge_segment_texts(prev.get("tts_text", ""), cur.get("tts_text", txt))
+                    prev["end"] = max(float(prev["end"]), float(cur["end"]))
+                    i += 1
+                    continue
+
+            if dur < 0.15:
+                # Isolated degenerate <0.15s stub: drop if tiny noise, or expand to 0.16s if strong standalone exclamation
+                if is_excl and len(cjk_alnum_chars(txt)) >= 1 and float(cur.get("avg_logprob", -0.5)) > -0.40:
+                    cur["end"] = round(float(cur["start"]) + 0.20, 2)
+                else:
+                    i += 1
+                    continue
+
+        cleaned.append(cur)
         i += 1
+    # Re-run boundary deduplication after micro-fragment absorption so merged spans don't expose new boundary echoes
+    final_cleaned = []
+    for s in cleaned:
+        if final_cleaned:
+            is_dup, _ = is_boundary_duplicate_pair(final_cleaned[-1], s, gap_thresh_s=0.35)
+            if is_dup:
+                pt = (final_cleaned[-1].get("sub_text", final_cleaned[-1].get("text", "")) or "").strip()
+                ct = (s.get("sub_text", s.get("text", "")) or "").strip()
+                if len(cjk_alnum_chars(ct)) > len(cjk_alnum_chars(pt)):
+                    s["start"] = min(float(final_cleaned[-1]["start"]), float(s["start"]))
+                    final_cleaned[-1] = s
+                else:
+                    final_cleaned[-1]["end"] = max(float(final_cleaned[-1]["end"]), float(s["end"]))
+                continue
+        final_cleaned.append(s)
+    return final_cleaned
 
-    # Split compound segments spanning 2+ distinct visual sub-clauses
-    expanded = []
-    for s in deduped:
-        st, et = float(s["start"]), float(s["end"])
-        ov_ivs = []
-        for iv in sub_clauses:
-            ist, iet = float(iv["start"]), float(iv["end"])
-            if min(et, iet) - max(st, ist) >= 0.30:
-                ov_ivs.append((max(st, ist), min(et, iet)))
 
-        sub = s.get("sub_text", s.get("text", "")).strip()
-        tts = s.get("tts_text", sub).strip()
-        if not sub or len(ov_ivs) < 2:
-            expanded.append(s)
+def enforce_monotonic_segments(segments: list, min_dur_s: float = 0.15, min_gap_s: float = 0.02) -> list:
+    """
+    Guarantee strict monotonic non-overlapping invariant across ALL segments:
+      0.0 <= start[i] < end[i] <= start[i+1] - min_gap_s  AND  (end[i] - start[i]) >= min_dur_s.
+    """
+    if not segments:
+        return []
+    ordered = sorted((dict(s) for s in segments), key=lambda x: (float(x.get("start", 0.0)), float(x.get("end", 0.0))))
+    out = []
+    for s in ordered:
+        txt = (s.get("sub_text", s.get("text", "")) or "").strip()
+        if not txt:
             continue
+        st = round(max(0.0, float(s.get("start", 0.0))), 2)
+        et = round(max(st + min_dur_s, float(s.get("end", st + min_dur_s))), 2)
+        s["start"], s["end"] = st, et
 
-        strong_sub = [p.strip() for p in re.split(r"(?<=[\.\?\!\:])\s*,?\s+", sub) if p.strip()]
-        strong_tts = [p.strip() for p in re.split(r"(?<=[\.\?\!\:])\s*,?\s+", tts) if p.strip()]
-        comma_sub = [p.strip() for p in re.split(r"(?<=[\.\?\!\:\,])\s+", sub) if p.strip()]
-        comma_tts = [p.strip() for p in re.split(r"(?<=[\.\?\!\:\,])\s+", tts) if p.strip()]
+        if out:
+            prev = out[-1]
+            if float(prev["end"]) > st - min_gap_s:
+                trimmed_prev_end = round(st - min_gap_s, 2)
+                if trimmed_prev_end - float(prev["start"]) >= min_dur_s:
+                    prev["end"] = trimmed_prev_end
+                else:
+                    min_prev_end = round(float(prev["start"]) + min_dur_s, 2)
+                    prev["end"] = min_prev_end
+                    pushed_st = round(min_prev_end + min_gap_s, 2)
+                    if et - pushed_st >= min_dur_s:
+                        s["start"] = pushed_st
+                    else:
+                        # Too tight to hold two >=0.15s non-overlapping segments: merge cleanly
+                        merged_txt = _merge_segment_texts(prev.get("text", ""), txt)
+                        if "text" in prev:
+                            prev["text"] = merged_txt
+                        if "sub_text" in prev:
+                            prev["sub_text"] = _merge_segment_texts(prev.get("sub_text", ""), s.get("sub_text", txt))
+                        if "tts_text" in prev:
+                            prev["tts_text"] = _merge_segment_texts(prev.get("tts_text", ""), s.get("tts_text", txt))
+                        prev["end"] = round(max(float(prev["end"]), et), 2)
+                        continue
+        out.append(s)
 
-        parts_sub, parts_tts = None, None
-        if len(ov_ivs) == 2 and len(strong_sub) == 2 and len(strong_tts) == 2:
-            parts_sub, parts_tts = strong_sub, strong_tts
-        elif len(ov_ivs) == 2 and len(comma_sub) == 2 and len(comma_tts) == 2 and (et - st) >= 1.9:
-            parts_sub, parts_tts = comma_sub, comma_tts
-        elif len(ov_ivs) == 3 and len(strong_sub) == 3 and len(strong_tts) == 3:
-            parts_sub, parts_tts = strong_sub, strong_tts
-        elif len(ov_ivs) == 3 and len(comma_sub) == 3 and len(comma_tts) == 3 and (et - st) >= 2.2:
-            parts_sub, parts_tts = comma_sub, comma_tts
-        elif len(ov_ivs) >= 2 and len(strong_sub) == 2 and len(strong_tts) == 2:
-            r0 = len(strong_sub[0]) / max(1, len(sub))
-            k = max(1, min(len(ov_ivs) - 1, int(round(r0 * len(ov_ivs)))))
-            ov_ivs = [(ov_ivs[0][0], ov_ivs[k - 1][1]), (ov_ivs[k][0], ov_ivs[-1][1])]
-            parts_sub, parts_tts = strong_sub, strong_tts
-        elif len(ov_ivs) >= 2 and len(comma_sub) == 2 and len(comma_tts) == 2 and (et - st) >= 2.0:
-            r0 = len(comma_sub[0]) / max(1, len(sub))
-            k = max(1, min(len(ov_ivs) - 1, int(round(r0 * len(ov_ivs)))))
-            ov_ivs = [(ov_ivs[0][0], ov_ivs[k - 1][1]), (ov_ivs[k][0], ov_ivs[-1][1])]
-            parts_sub, parts_tts = comma_sub, comma_tts
+    for idx, s in enumerate(out, 1):
+        s["id"] = idx
+        s["start"] = round(float(s["start"]), 2)
+        s["end"] = round(float(s["end"]), 2)
+        assert 0.0 <= s["start"] < s["end"], f"Invalid span on seg #{idx}: {s}"
+        assert (s["end"] - s["start"]) >= min_dur_s - 1e-6, f"Runt span on seg #{idx}: {s}"
+        if idx > 1:
+            assert out[idx - 2]["end"] <= s["start"] - min_gap_s + 1e-6, f"Overlap between #{idx-1} and #{idx}"
+    return out
 
-        if not parts_sub:
-            expanded.append(s)
-            continue
 
-        ok = True
-        new_pieces = []
-        for (ist, iet), p_sub, p_tts in zip(ov_ivs, parts_sub, parts_tts):
-            p_sub = re.sub(r"([\.\?\!\:]),$", r"\1", p_sub.strip())
-            p_tts = re.sub(r"([\.\?\!\:]),$", r"\1", p_tts.strip())
-            dur_p = iet - ist
-            if dur_p < 0.55 or (len(p_sub.split()) / dur_p) > max_syl_rate:
-                ok = False
-                break
-            ns = dict(s)
-            ns["start"] = round(ist, 2)
-            ns["end"] = round(iet, 2)
-            if "sub_text" in ns:
-                ns["sub_text"] = p_sub
-                ns["tts_text"] = p_tts
-            if "text" in ns:
-                ns["text"] = p_sub
-            new_pieces.append(ns)
+def snap_and_split_segments(segments: list, voice_mask: np.ndarray, max_syl_rate: float = 7.5) -> list:
+    """
+    1. Deduplicate adjacent boundary fragments and absorb <0.25s micro-fragments/stutters.
+    2. Clamp each segment's [start, end] to active acoustic voice clusters (eliminating premature
+       silent lead-ins and bloated silent spans).
+    3. Enforce strict monotonic non-overlapping invariant:
+       0.0 <= start[i] < end[i] <= start[i+1] - 0.02 and (end[i] - start[i]) >= 0.15.
+    """
+    n_hops = len(voice_mask)
+    cleaned = _absorb_duplicate_and_micro_fragments(segments)
 
-        if ok:
-            expanded.extend(new_pieces)
-        else:
-            expanded.append(s)
-
-    # Clamp start and end of every segment to dominant visual hardsub interval or acoustic voice onset
-    for idx, s in enumerate(expanded):
+    # Acoustic onset/offset clamping per segment
+    meta_list = []
+    for s in cleaned:
         st, et = float(s["start"]), float(s["end"])
-        sub = s.get("sub_text", s.get("text", "")).strip()
+        sub = (s.get("sub_text", s.get("text", "")) or "").strip()
         words = max(1, len(sub.split()))
-        min_dur_needed = max(0.55, words / max_syl_rate + 0.02)
-
-        dom_ivs = []
-        for iv in sub_clauses:
-            ist, iet = float(iv["start"]), float(iv["end"])
-            ov = min(et, iet) - max(st, ist)
-            if ov >= 0.25 or (ov >= 0.15 and (iet - ist) <= 0.6):
-                dom_ivs.append((max(st - 0.05, ist), min(et + 0.15, iet)))
+        min_dur_needed = max(0.25, min(0.55, words / max_syl_rate + 0.02))
 
         a0 = max(0, int(st / 0.05))
-        a1 = min(n_hops - 1, int(et / 0.05))
-        v_times = [round(k * 0.05, 2) for k in range(a0, a1 + 1) if voice_mask[k]]
+        a1 = min(n_hops - 1, int(et / 0.05)) if n_hops > 0 else -1
+        v_times = [round(k * 0.05, 2) for k in range(a0, a1 + 1) if voice_mask[k]] if a1 >= a0 >= 0 else []
         first_v = v_times[0] if v_times else None
-        last_v = round(v_times[-1] + 0.05, 2) if v_times else None
 
-        if dom_ivs:
-            new_st = dom_ivs[0][0]
-            new_et = dom_ivs[-1][1]
-        elif first_v is not None:
+        if first_v is not None:
             zh = s.get("zh_text", s.get("text", ""))
-            n_zh = max(1, len([c for c in zh if "\u4e00" <= c <= "\u9fff" or c.isalnum()]))
+            n_zh = max(1, len(cjk_alnum_chars(zh)))
             max_ok_dur = max(min_dur_needed, n_zh * 0.35 + 1.35)
 
             clusters = []
@@ -771,7 +904,6 @@ def snap_and_split_segments(segments: list, sub_clauses: list, spans: list, voic
                 else:
                     clusters.append([vt, round(vt + 0.05, 2), 1])
 
-            # Trim isolated tiny noise ticks (<=2 hops) separated by >=0.50s gap when stronger clusters exist
             while len(clusters) >= 2 and clusters[0][2] <= 2 and (clusters[1][0] - clusters[0][1]) >= 0.50:
                 clusters.pop(0)
             while len(clusters) >= 2 and clusters[-1][2] <= 2 and (clusters[-1][0] - clusters[-2][1]) >= 0.50:
@@ -780,24 +912,21 @@ def snap_and_split_segments(segments: list, sub_clauses: list, spans: list, voic
             new_st = clusters[0][0]
             new_et = clusters[-1][1]
             if (new_et - new_st) > max_ok_dur:
-                # Choose the contiguous cluster range fitting <= max_ok_dur with maximum active voice hops
-                # (preferring later anchor on tie since Whisper pads segment start back over preceding silence).
                 best_score = -1
                 best_pair = None
-                for i in range(len(clusters)):
+                for ci in range(len(clusters)):
                     acc = 0
-                    for j in range(i, len(clusters)):
-                        if (clusters[j][1] - clusters[i][0]) > max_ok_dur:
+                    for cj in range(i_start := ci, len(clusters)):
+                        if (clusters[cj][1] - clusters[i_start][0]) > max_ok_dur:
                             break
-                        acc += clusters[j][2]
-                        if (acc > best_score) or (acc == best_score and best_pair is not None and i > best_pair[0]):
+                        acc += clusters[cj][2]
+                        if (acc > best_score) or (acc == best_score and best_pair is not None and i_start > best_pair[0]):
                             best_score = acc
-                            best_pair = (i, j)
+                            best_pair = (i_start, cj)
                 if best_pair is not None:
                     new_st = clusters[best_pair[0]][0]
                     new_et = clusters[best_pair[1]][1]
                 else:
-                    # Single long cluster exceeding max_ok_dur: tighten to highest-density window of width max_ok_dur
                     best_c = max(clusters, key=lambda c: (c[2], c[0]))
                     w_hops = max(1, int(max_ok_dur / 0.05))
                     ca0 = max(a0, int(round(best_c[0] / 0.05)))
@@ -817,48 +946,40 @@ def snap_and_split_segments(segments: list, sub_clauses: list, spans: list, voic
                         new_st, new_et = best_c[0], best_c[1]
             new_et = max(new_st + min_dur_needed, new_et)
         else:
-            new_st, new_et = st, et
+            new_st, new_et = st, max(st + min_dur_needed, et)
 
         s["start"] = round(new_st, 2)
         s["end"] = round(new_et, 2)
-        s["_snap_meta"] = (st, et, min_dur_needed, (new_st if first_v is not None else None), bool(dom_ivs))
+        meta_list.append((st, et, min_dur_needed, new_st if first_v is not None else None))
 
-    # Second pass after all segment starts have snapped forward: pad short segments cleanly without premature lead
-    for idx, s in enumerate(expanded):
-        orig_st, orig_et, min_dur_needed, first_v, has_dom = s.pop("_snap_meta")
-        new_st, new_et = float(s["start"]), float(s["end"])
-        if new_et - new_st < min_dur_needed:
-            next_st = float(expanded[idx + 1]["start"]) - 0.02 if idx + 1 < len(expanded) else 99999.0
-            new_et = min(next_st, max(orig_et, new_st + min_dur_needed))
-            if new_et - new_st < min_dur_needed:
-                prev_et = float(expanded[idx - 1]["end"]) + 0.02 if idx > 0 else 0.0
-                lead_floor = (first_v - 0.25) if (not has_dom and first_v is not None) else 0.0
-                new_st = max(prev_et, lead_floor, min(orig_st, new_et - min_dur_needed))
-        s["start"] = round(new_st, 2)
-        s["end"] = round(new_et, 2)
-
-    for i in range(len(expanded) - 1):
-        if expanded[i]["end"] > expanded[i + 1]["start"] - 0.02:
-            expanded[i]["end"] = round(max(expanded[i]["start"] + 0.35, expanded[i + 1]["start"] - 0.02), 2)
-            # Re-check post-clamp premature lead if clamping shortened the end
-            if expanded[i]["end"] - expanded[i]["start"] < 0.05:
-                expanded[i]["end"] = round(expanded[i]["start"] + 0.05, 2)
-
-    # Final safety guard: when padding/clamping pulls an utterance over a newly reached voice onset in v2.0.0 mode,
-    # clamp start to stay within 0.25s of actual voice onset so premature_lead == 0 on first pass.
-    if not sub_clauses:
-        for s in expanded:
-            st_f, et_f = float(s["start"]), float(s["end"])
-            a0_f = max(0, int(st_f / 0.05))
-            a1_f = min(n_hops - 1, int(et_f / 0.05))
+    # Expand short segments into silent slack ONLY when slack actually exists (never invert start > end!)
+    for idx, s in enumerate(cleaned):
+        orig_st, orig_et, min_dur_needed, first_v = meta_list[idx]
+        cur_st, cur_et = float(s["start"]), float(s["end"])
+        if cur_et - cur_st < min_dur_needed:
+            next_st = float(cleaned[idx + 1]["start"]) - 0.02 if idx + 1 < len(cleaned) else 99999.0
+            if next_st > cur_st + 0.15:
+                cur_et = min(next_st, max(orig_et, cur_st + min_dur_needed))
+            if cur_et - cur_st < min_dur_needed:
+                prev_et = float(cleaned[idx - 1]["end"]) + 0.02 if idx > 0 else 0.0
+                lead_floor = (first_v - 0.25) if first_v is not None else 0.0
+                cand_st = max(prev_et, lead_floor, min(orig_st, cur_et - min_dur_needed))
+                if cur_et - cand_st >= 0.15:
+                    cur_st = cand_st
+        # Guard voice onset without breaking invariants
+        if n_hops > 0 and cur_et > cur_st + 0.20:
+            a0_f = max(0, int(cur_st / 0.05))
+            a1_f = min(n_hops - 1, int(cur_et / 0.05))
             vt_f = [round(k * 0.05, 2) for k in range(a0_f, a1_f + 1) if voice_mask[k]]
-            if vt_f and (vt_f[0] - st_f) > 0.28 and (et_f - (vt_f[0] - 0.22)) >= 0.20:
-                s["start"] = round(vt_f[0] - 0.22, 2)
+            if vt_f and (vt_f[0] - cur_st) > 0.28:
+                cand_st = round(vt_f[0] - 0.22, 2)
+                if cur_et - cand_st >= 0.20:
+                    cur_st = cand_st
+        s["start"] = round(cur_st, 2)
+        s["end"] = round(max(cur_st + 0.15, cur_et), 2)
 
-    for idx, s in enumerate(expanded, 1):
-        s["id"] = idx
-
-    return expanded
+    cleaned = _dedup_adjacent_segments(cleaned, gap_thresh_s=0.35)
+    return enforce_monotonic_segments(cleaned, min_dur_s=0.15, min_gap_s=0.02)
 
 
 def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = None, snap_in_place: bool = False) -> dict:
@@ -869,19 +990,19 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
     with open(profile_path, "r", encoding="utf-8") as f:
         profile = json.load(f)
 
-    video_path = profile.get("source_video", os.path.join(ws, "master_source.mp4"))
+    src_rel = profile.get("source_video", "source/master_source.mp4")
+    video_path = src_rel if os.path.isabs(src_rel) else os.path.join(ws, src_rel)
+    if not os.path.exists(video_path):
+        video_path = os.path.join(ws, "source", "master_source.mp4")
     if not os.path.exists(video_path):
         video_path = os.path.join(ws, "master_source.mp4")
 
-    stems_voc = os.path.join(ws, "media", "stems", "vocals.wav")
-    legacy_voc = os.path.join(ws, "media", "demucs", "vocals.wav")
-    vocals_path = stems_voc if os.path.exists(stems_voc) else legacy_voc
+    vocals_path = os.path.join(ws, "media", "stems", "vocals.wav")
     source_audio_path = os.path.join(ws, "media", "source_audio.wav")
     audio_src = source_audio_path if os.path.exists(source_audio_path) else video_path
 
-    print(f"[PLAN] Analyzing Multi-Band Acoustic Waveform (50ms hop) + Visual Sub-Clauses + Onset Sync in {ws}", flush=True)
-    import hashlib as _hashlib
-    wf_sig = _hashlib.sha256(
+    print(f"[PLAN] Analyzing Multi-Band Acoustic Waveform (50ms hop) + Onset Sync in {ws}", flush=True)
+    wf_sig = hashlib.sha256(
         f"{WAVEFORM_CACHE_VERSION}|{_fast_file_sig(audio_src)}|{_fast_file_sig(vocals_path)}".encode()
     ).hexdigest()[:16]
     cache_dir = os.path.join(ws, ".cache")
@@ -893,8 +1014,6 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
             cmeta = json.load(cf)
         voice_mask = np.load(wf_mask_p).astype(bool)
         merged_bursts = cmeta["merged_bursts"]
-        spectral_summary = cmeta["spectral_summary"]
-        vocal_spectral_summary = cmeta["vocal_spectral_summary"]
         print(f"[CACHE] Waveform features hit ({wf_sig}) -> skipped ffmpeg decode", flush=True)
     else:
         tel_arr = decode_audio_16k(
@@ -903,44 +1022,19 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         )
         raw_arr = decode_audio_16k(audio_src)
         raw_tel_arr = _bandpass_in_ram(raw_arr, 300.0, 3400.0, sr=16000)
-        if os.path.exists(vocals_path):
-            voc_arr = decode_audio_16k(vocals_path)
-        else:
-            voc_arr = raw_arr
+        voc_arr = decode_audio_16k(vocals_path) if os.path.exists(vocals_path) else raw_arr
 
         voice_mask, merged_bursts = compute_voice_mask_and_bursts(
             voc_arr, tel_arr, raw_tel_arr=raw_tel_arr, raw_arr=raw_arr, sr=16000
         )
-        spectral_summary = compute_audio_spectral_profile(raw_arr, sr=16000)
-        vocal_spectral_summary = compute_audio_spectral_profile(voc_arr, sr=16000) if os.path.exists(vocals_path) else {}
         os.makedirs(cache_dir, exist_ok=True)
         np.save(wf_mask_p, voice_mask)
-        with open(wf_meta_p, "w", encoding="utf-8") as cf:
-            json.dump({
-                "sig": wf_sig,
-                "version": WAVEFORM_CACHE_VERSION,
-                "merged_bursts": merged_bursts,
-                "spectral_summary": spectral_summary,
-                "vocal_spectral_summary": vocal_spectral_summary,
-            }, cf)
+        _atomic_write_json(wf_meta_p, {
+            "sig": wf_sig,
+            "version": WAVEFORM_CACHE_VERSION,
+            "merged_bursts": merged_bursts,
+        })
     n_hops = len(voice_mask)
-
-    bbox_path = os.path.join(data_dir, "01_zh_bbox_scan.json")
-    if os.path.exists(bbox_path):
-        with open(bbox_path, "r", encoding="utf-8") as f:
-            bdata = json.load(f)
-        from run_asr_and_scan import find_hardsub_intervals
-        spans = bdata.get("spans", [])
-        sub_clauses = bdata.get("hardsub_intervals")
-        if sub_clauses is None:
-            sub_clauses = find_hardsub_intervals(
-                spans,
-                int(bdata.get("fps_scan", 5)),
-                clause_changes=bdata.get("clause_changes"),
-            )
-    else:
-        spans = []
-        sub_clauses = []
 
     if target_segments_path is None:
         s2_path = os.path.join(data_dir, "02_bilingual_script.json")
@@ -952,54 +1046,27 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
     segs = raw_data["segments"] if isinstance(raw_data, dict) else raw_data
 
     if snap_in_place:
-        segs = snap_and_split_segments(segs, sub_clauses, spans, voice_mask)
+        segs = snap_and_split_segments(segs, voice_mask)
         if isinstance(raw_data, dict):
             raw_data["segments"] = segs
             raw_data["total_segments"] = len(segs)
             out_data = raw_data
         else:
             out_data = segs
-        with open(target_segments_path, "w", encoding="utf-8") as f:
-            json.dump(out_data, f, ensure_ascii=False, indent=2)
-        print(f"[SNAP & SPLIT] Updated {target_segments_path} -> {len(segs)} onset-locked fine-grained clauses.", flush=True)
+        _atomic_write_json(target_segments_path, out_data)
+        print(f"[SNAP & ALIGN] Updated {target_segments_path} -> {len(segs)} monotonic onset-locked clauses.", flush=True)
 
-    # 1. Check visual sub-clause coverage
-    uncovered_clauses = []
-    covered_cnt = 0
-    for sc in sub_clauses:
-        sc_st, sc_et = float(sc["start"]), float(sc["end"])
-        sc_dur = max(0.2, sc_et - sc_st)
-        ov = 0.0
-        for s in segs:
-            txt = s.get("text", s.get("sub_text", ""))
-            if "[GAP_VISUAL_SUB" in txt:
-                continue
-            o = max(0.0, min(sc_et, float(s["end"])) - max(sc_st, float(s["start"])))
-            if o > 0.05:
-                ov += o
-        cov_ratio = min(1.0, ov / sc_dur)
-        if cov_ratio >= 0.60:
-            covered_cnt += 1
-        else:
-            uncovered_clauses.append({
-                "start": sc_st,
-                "end": sc_et,
-                "duration": round(sc_dur, 2),
-                "bbox": sc["bbox"],
-                "coverage": round(cov_ratio, 3),
-            })
+    ts_violations = find_timestamp_violations(segs, min_dur_s=0.15, min_gap_s=0.02)
+    dup_pairs = find_boundary_duplicate_pairs(segs, gap_thresh_s=0.35)
 
-    # 2. Check for bloated segment timestamps, premature lead-in (>0.22s before hardsub & voice), and internal silent gaps (>=0.40s)
     bloated_segments = []
     premature_lead_segments = []
-    internal_blank_gap_segments = []
-
     for s in segs:
         st, et = float(s["start"]), float(s["end"])
         dur = et - st
         zh = s.get("zh_text", s.get("text", ""))
         sub = s.get("sub_text", s.get("text", ""))
-        n_zh = max(1, len([c for c in zh if "\u4e00" <= c <= "\u9fff" or c.isalnum()]))
+        n_zh = max(1, len(cjk_alnum_chars(zh)))
         if dur > (n_zh * 0.35 + 1.4):
             bloated_segments.append({
                 "id": s.get("id"),
@@ -1010,52 +1077,22 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
                 "text": zh[:40],
             })
 
-        # Check hardsub and voice onset inside [st, et]
-        dom_ivs = [
-            (float(iv["start"]), float(iv["end"]))
-            for iv in sub_clauses
-            if min(et, float(iv["end"])) - max(st, float(iv["start"])) >= 0.25
-        ]
-        first_hs = dom_ivs[0][0] if dom_ivs else None
+        if n_hops > 0 and et > st:
+            a0 = max(0, int(st / 0.05))
+            a1 = min(n_hops - 1, int(et / 0.05))
+            v_times = [round(k * 0.05, 2) for k in range(a0, a1 + 1) if voice_mask[k]] if a1 >= a0 else []
+            first_v = v_times[0] if v_times else None
+            v_lead = round(first_v - st, 2) if first_v is not None else 0.0
+            if first_v is not None and v_lead > 0.30:
+                premature_lead_segments.append({
+                    "id": s.get("id"),
+                    "start": st,
+                    "end": et,
+                    "first_voice": first_v,
+                    "voice_lead_s": v_lead,
+                    "text": sub[:45],
+                })
 
-        a0 = max(0, int(st / 0.05))
-        a1 = min(n_hops - 1, int(et / 0.05))
-        v_times = [round(k * 0.05, 2) for k in range(a0, a1 + 1) if voice_mask[k]]
-        first_v = v_times[0] if v_times else None
-
-        # Premature lead-in: subtitle starts >0.22s before hardsub AND >0.25s before voice
-        hs_lead = round(first_hs - st, 2) if first_hs is not None else 0.0
-        v_lead = round(first_v - st, 2) if first_v is not None else 0.0
-        if (first_hs is not None and hs_lead > 0.22) or (first_hs is None and first_v is not None and v_lead > 0.30):
-            premature_lead_segments.append({
-                "id": s.get("id"),
-                "start": st,
-                "end": et,
-                "first_hardsub": first_hs,
-                "first_voice": first_v,
-                "hs_lead_s": hs_lead,
-                "voice_lead_s": v_lead,
-                "text": sub[:45],
-            })
-
-        # Unsplit internal silent gap: >=2 dominant sub-clauses separated by >=0.40s TRUE blank gap (where spans[k] is None)
-        if len(dom_ivs) >= 2:
-            for (a_st, a_et), (b_st, b_et) in zip(dom_ivs[:-1], dom_ivs[1:]):
-                if (b_st - a_et) >= 0.40:
-                    g0 = max(0, int(round(a_et * 5)))
-                    g1 = min(len(spans) - 1, int(round(b_st * 5)) - 1)
-                    blank_cnt = sum(1 for k in range(g0, g1 + 1) if spans[k] is None)
-                    if blank_cnt >= 2:
-                        internal_blank_gap_segments.append({
-                            "id": s.get("id"),
-                            "start": st,
-                            "end": et,
-                            "blank_gap": [round(a_et, 2), round(b_st, 2)],
-                            "text": sub[:45],
-                        })
-                        break
-
-    # 3. Check acoustic voice bursts overlapping visual sub-clauses + multi-band Pass 2B recovery audit
     pass2b_report_path = os.path.join(data_dir, "01_pass2b_recovery_report.json")
     pass2b_report = {}
     verified_non_speech = []
@@ -1068,7 +1105,6 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
             pass2b_report = {}
             verified_non_speech = []
 
-    # Build hop-level covered-or-verified mask first so wide BGM-bridged bursts can check exact active vocal coverage
     covered_or_verified = np.zeros(n_hops, dtype=bool)
     for s in segs:
         i0 = max(0, int(round(float(s["start"]) / 0.05)))
@@ -1094,7 +1130,6 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         v_hops = int(voice_mask[bi0:bi1].sum()) if bi1 > bi0 else 0
         v_cov_hops = int((voice_mask[bi0:bi1] & covered_or_verified[bi0:bi1]).sum()) if bi1 > bi0 else 0
         v_cov_ratio = (v_cov_hops / v_hops) if v_hops > 0 else 0.0
-        has_sub_clause = any(max(0.0, min(bet, sc["end"]) - max(bst, sc["start"])) >= 0.25 for sc in sub_clauses)
         ov = sum(max(0.0, min(bet, float(s["end"])) - max(bst, float(s["start"]))) for s in segs)
         ov_ratio = ov / max(0.2, bdur)
         non_speech_ov = sum(
@@ -1102,16 +1137,8 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
             for ns in verified_non_speech
         )
         non_speech_ratio = non_speech_ov / max(0.2, bdur)
-        # Smart Acoustic Gate (v2.6.1): never blindly mark unprobed strong vocal bursts as covered when sub_clauses is empty.
-        # Pure BGM/SFX bursts or steady-BGM-bridged bursts whose active vocal hops were transcribed/probed by Pass 2B
-        # (`verified_non_speech_gaps`) do not deadlock Stage 1 (preserving L-015), while unprobed vocal gaps fail immediately.
-        if has_sub_clause:
-            speech_bursts_total += 1
-            if ov_ratio >= 0.40:
-                speech_bursts_covered += 1
-            else:
-                uncovered_acoustic_bursts.append({**b, "coverage_ratio": round(ov_ratio, 3)})
-        elif b["peak_voc_rms"] >= 0.035:
+
+        if b["peak_voc_rms"] >= 0.035:
             speech_bursts_total += 1
             if (
                 ov_ratio >= 0.40
@@ -1128,7 +1155,6 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
                     "vocal_hop_coverage": round(v_cov_ratio, 3),
                 })
         elif b.get("kind") in ("whisper", "phone_call"):
-            # Skip <1.0s low-vocal BGM breath ticks that Pass 2B's short-pause filter intentionally ignored
             if bdur < 1.0 and b["peak_voc_rms"] < 0.025:
                 continue
             speech_bursts_total += 1
@@ -1146,7 +1172,6 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
                     "probed_non_speech_ratio": round(non_speech_ratio, 3),
                 })
 
-    # Compute longest contiguous unprobed active-vocal gap (catches 20-90s Whisper stalls immediately)
     unprobed_vocal = voice_mask & (~covered_or_verified)
     longest_gap_hops = 0
     cur_run = 0
@@ -1164,7 +1189,6 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
             gap_tol = 0
     longest_uncovered_vocal_gap_s = round(longest_gap_hops * 0.05, 2)
 
-    sc_ratio = (covered_cnt / len(sub_clauses)) if sub_clauses else 1.0
     ac_ratio = (speech_bursts_covered / speech_bursts_total) if speech_bursts_total else 1.0
     seg_durs = [max(0.0, float(s["end"]) - float(s["start"])) for s in segs]
     total_dur_min = max(0.01, float(profile.get("duration", n_hops * 0.05)) / 60.0)
@@ -1174,11 +1198,13 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         "gaps_probed": int(pass2b_report.get("gaps_probed", 0)),
         "recovered_total": int(pass2b_report.get("recovered_total", 0)),
         "recovered_by_band": pass2b_report.get("recovered_by_band", {}),
+        "dedup_rejected": int(pass2b_report.get("dedup_rejected", 0)),
         "verified_non_speech_gaps_count": len(verified_non_speech),
     }
 
     report = {
         "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": WAVEFORM_CACHE_VERSION,
         "target_segments_file": os.path.basename(target_segments_path),
         "total_segments_checked": len(segs),
         "clause_cadence": {
@@ -1188,17 +1214,14 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
             "p90_clause_dur_s": round(float(np.percentile(seg_durs, 90)), 2) if seg_durs else 0.0,
             "short_clauses_lt1s": sum(1 for d in seg_durs if d < 1.0),
         },
-        "total_visual_sub_clauses": len(sub_clauses),
-        "covered_visual_sub_clauses": covered_cnt,
-        "sub_clause_coverage_ratio": round(sc_ratio, 4),
-        "uncovered_sub_clauses_count": len(uncovered_clauses),
-        "uncovered_sub_clauses": uncovered_clauses[:25],
+        "timestamp_violations_count": len(ts_violations),
+        "timestamp_violations": ts_violations[:25],
+        "boundary_duplicates_count": len(dup_pairs),
+        "boundary_duplicates": dup_pairs[:25],
         "bloated_segments_count": len(bloated_segments),
         "bloated_segments": bloated_segments[:20],
         "premature_lead_segments_count": len(premature_lead_segments),
         "premature_lead_segments": premature_lead_segments[:20],
-        "internal_blank_gap_segments_count": len(internal_blank_gap_segments),
-        "internal_blank_gap_segments": internal_blank_gap_segments[:20],
         "acoustic_voice_bursts_count": len(merged_bursts),
         "whisper_bursts_count": whisper_bursts_count,
         "phone_call_bursts_count": phone_call_bursts_count,
@@ -1208,33 +1231,29 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         "uncovered_acoustic_bursts": uncovered_acoustic_bursts[:25],
         "longest_uncovered_vocal_gap_s": longest_uncovered_vocal_gap_s,
         "multiband_pass2b_summary": multiband_summary,
-        "source_spectral_profile": spectral_summary,
-        "vocals_spectral_profile": vocal_spectral_summary,
     }
 
     out_audit = os.path.join(data_dir, "01_waveform_voice_audit.json")
-    with open(out_audit, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(out_audit, report)
 
     print(
-        f"[DONE] Waveform & Spectral Audit: clauses={len(segs)} ({report['clause_cadence']['clauses_per_min']}/min), "
-        f"sub_clauses={covered_cnt}/{len(sub_clauses)} ({sc_ratio*100:.1f}%), "
+        f"[DONE] Acoustic Waveform Audit: clauses={len(segs)} ({report['clause_cadence']['clauses_per_min']}/min), "
         f"whispers={whisper_bursts_count}, phone_calls={phone_call_bursts_count}, "
         f"uncovered_acoustic={len(uncovered_acoustic_bursts)}, max_unprobed_vocal_gap={longest_uncovered_vocal_gap_s}s, "
         f"pass2b_rec={multiband_summary['recovered_total']}, "
-        f"HP/LP_hint={spectral_summary.get('recommended_hp_hz')}/{spectral_summary.get('recommended_lp_hz')}Hz, "
-        f"bloated={len(bloated_segments)}, premature_lead={len(premature_lead_segments)}, "
-        f"internal_blank_gaps={len(internal_blank_gap_segments)} -> {out_audit} in {time.time()-t0:.2f}s",
+        f"ts_violations={len(ts_violations)}, boundary_dups={len(dup_pairs)}, "
+        f"bloated={len(bloated_segments)}, premature_lead={len(premature_lead_segments)} "
+        f"-> {out_audit} in {time.time()-t0:.2f}s",
         flush=True,
     )
     return report
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Multi-Band Acoustic Waveform, Sub-Clause & Premature Lead-In Audit.")
+    parser = argparse.ArgumentParser(description="Run Multi-Band Acoustic Waveform & Monotonic Onset Audit.")
     parser.add_argument("--workspace", required=True, help="Workspace path (workspace/<slug>).")
     parser.add_argument("--segments", required=False, help="Optional path to segments JSON to audit.")
-    parser.add_argument("--snap-and-split", action="store_true", help="Automatically split compound multi-interval segments and clamp [start, end] to active hardsub/voice onset.")
+    parser.add_argument("--snap-and-split", action="store_true", help="Absorb <0.25s micro-fragments, deduplicate echoes, snap to voice onset, and enforce strict monotonic timing.")
     args = parser.parse_args()
     analyze_waveform_and_clauses(args.workspace, args.segments, snap_in_place=args.snap_and_split)
 

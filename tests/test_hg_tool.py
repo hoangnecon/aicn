@@ -308,6 +308,68 @@ class TestHgToolAndRsi(unittest.TestCase):
         self.assertIn("Referer: https://dramadunyam.com/en/series/my-test-series", headers_val)
         self.assertIn("Cookie: dd_bilet=guest_tok_123", headers_val)
 
+    def test_dy_tool_overwrite_and_mix_pagination(self):
+        import types
+        from unittest.mock import patch
+        import dy_tool
+
+        with tempfile.TemporaryDirectory() as td:
+            out_mp4 = Path(td) / "ep01.mp4"
+            out_mp4.write_bytes(b"old-content")
+
+            class _Resp:
+                content = b"new-mp4-bytes"
+                def raise_for_status(self):
+                    return None
+
+            fake_req = types.SimpleNamespace(get=lambda *a, **kw: _Resp())
+            fake_cf = types.SimpleNamespace(requests=fake_req)
+            with patch.dict(sys.modules, {"curl_cffi": fake_cf, "curl_cffi.requests": fake_req}):
+                dy_tool.download_media("https://example.com/v.mp4", out_mp4)
+            self.assertEqual(out_mp4.read_bytes(), b"new-mp4-bytes")
+
+        pages_seen = []
+
+        class _FakeClient:
+            def mix_posts(self, mix_id, cursor=0, count=20):
+                pages_seen.append(cursor)
+                if cursor == 0:
+                    return {
+                        "has_more": True,
+                        "cursor": 20,
+                        "aweme_list": [{"aweme_id": "101", "mix_info": {"statis": {"current_episode": 1}}, "video": {"play_addr": {"url_list": ["u1"]}}}],
+                    }
+                return {
+                    "has_more": False,
+                    "cursor": 21,
+                    "aweme_list": [{"aweme_id": "102", "mix_info": {"statis": {"current_episode": 2}}, "video": {"play_addr": {"url_list": ["u2"]}}}],
+                }
+
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td) / "mix_out"
+            with patch.object(dy_tool, "DouyinClient", return_value=_FakeClient()), \
+                 patch.object(dy_tool, "download_media", side_effect=lambda u, p, **kw: Path(p).write_bytes(b"mp4")), \
+                 patch.object(dy_tool.subprocess, "run", return_value=types.SimpleNamespace(stdout='{"format":{}}', returncode=0)), \
+                 patch("time.sleep"), \
+                 patch.object(sys, "argv", ["dy_tool.py", "download", "777", "--mix", "--out", str(out_dir)]):
+                rc = dy_tool.main()
+            self.assertEqual(rc, 0)
+            self.assertEqual(pages_seen, [0, 20])
+            self.assertTrue((out_dir / "ep_001_101.mp4").exists())
+            self.assertTrue((out_dir / "ep_002_102.mp4").exists())
+
+    def test_aicn_radar_db_busy_timeout_and_wal(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.db"
+            conn = aicn_radar.connect_db(db)
+            try:
+                bt = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                jm = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                self.assertGreaterEqual(int(bt), 15000)
+                self.assertEqual(str(jm).lower(), "wal")
+            finally:
+                conn.close()
+
     def test_hg_tool_is_thin_wrapper_no_hardcoded_upstream_internals(self):
         # Redundant hg_sdk_helper.py must stay retired (upstreamed into hongguo-drama v8.2 resolve_cli.py)
         self.assertFalse(

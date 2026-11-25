@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Stage 0: Initialize standardized workspace directory, project topology (single | series_compilation | series_episodic),
+Stage 0: Initialize standardized v3.0.0 workspace directory, project topology (single | series_compilation | series_episodic),
 multi-episode ingestion/concatenation (`source/episodes/` -> `source/master_source.mp4` + `data/00_episodes_manifest.json`),
 config & JSON schema templates (`config/project_config.json`, `config/series_bible.json`, `config/schemas/*.template.json`),
-genre/mode-matched Markdown logs (`00..04.md`), deliverables vault (`deliverables/{16x9,9x16,subtitles,episodes}`),
-and sign Stage 0 CI/CD gate token (`.cicd/stage_0_gate.json`).
+Markdown logs (`00..04.md`), and sign Stage 0 CI/CD gate token (`.cicd/stage_0_gate.json`).
 """
 import argparse
 import glob
@@ -236,7 +235,7 @@ def ingest_and_build_episodes_manifest(
             "ep_index": idx,
             "ep_id": ep_id,
             "title": f"Episode {idx:02d}",
-            "source_file": os.path.relpath(ep_p, base),
+            "source_file": os.path.relpath(ep_p, base).replace("\\", "/"),
             "duration_s": dur,
             "timeline_start_s": st_s,
             "timeline_end_s": et_s,
@@ -255,7 +254,7 @@ def ingest_and_build_episodes_manifest(
         episodes_meta[-1]["timecode_end"] = format_timecode(master_dur)
 
     manifest = {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "slug": slug,
         "topology": topology,
         "total_episodes": len(episodes_meta),
@@ -282,7 +281,7 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
         "end": 8.60,
         "text": "你好 外卖到了",
         "audio_type": "normal_speech",
-        "source": "whisper_onset_clamped"
+        "source": "pass1_asr"
     }
     bilingual_template = {
         "_comment": "Stage 2 canonical item schema for data/02_bilingual_script.json",
@@ -302,14 +301,16 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
         "id": 0,
         "ep_id": "ep01",
         "speaker": "M1",
+        "utterance_id": 0,
+        "utterance_wav": "media/tts_segments/utt_0000.wav",
         "slot_start": 7.20,
         "slot_end": 8.60,
-        "tts_dur_raw": 1.40,
-        "tts_dur_final": 1.40,
-        "tempo_ratio": 1.0,
+        "utt_speech_start": 7.20,
+        "utt_speech_end": 8.55,
+        "tempo_ratio": 1.08,
         "sub_text": "Xin chào, đồ ăn giao tới rồi,",
         "tts_text": "Xin chào, đồ ăn giao tới rồi,",
-        "mode": localization_mode
+        "mode": "voice_dub"
     }
 
     with open(os.path.join(schemas_dir, "01_asr_segment.template.json"), "w", encoding="utf-8") as f:
@@ -323,10 +324,10 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
     if not os.path.exists(bible_path):
         if genre == "short-drama":
             bible_data = {
-                "schema_version": "2.0",
+                "schema_version": "3.0",
                 "series_slug": series_slug or slug,
                 "genre": genre,
-                "localization_mode": localization_mode,
+                "localization_mode": "voice_dub",
                 "characters": [
                     {
                         "speaker_id": "M1",
@@ -380,10 +381,10 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
             }
         else:
             bible_data = {
-                "schema_version": "2.0",
+                "schema_version": "3.0",
                 "series_slug": series_slug or slug,
                 "genre": genre,
-                "localization_mode": localization_mode,
+                "localization_mode": "voice_dub",
                 "characters": [
                     {
                         "speaker_id": "NARRATOR",
@@ -409,7 +410,7 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
 def provision_series_hub(workspace_root: str, series_slug: str, genre: str, localization_mode: str, export_formats: list, unit_slug: str) -> str:
     """
     Creates or updates a multi-episode Series Hub at `workspace/<series_slug>/`
-    with shared `config/series_bible.json`, `source_inbox/`, `units/`, and `deliverables/`.
+    with shared `config/series_bible.json`, `source_inbox/`, `units/`, and `deliverables/subtitles/`.
     """
     hub_dir = os.path.abspath(os.path.join(workspace_root, series_slug))
     for sd in [
@@ -417,10 +418,8 @@ def provision_series_hub(workspace_root: str, series_slug: str, genre: str, loca
         "posters",
         "source_inbox",
         "units",
-        "deliverables/16x9",
-        "deliverables/9x16",
         "deliverables/subtitles",
-        "deliverables/episodes",
+        ".cache",
     ]:
         os.makedirs(os.path.join(hub_dir, sd), exist_ok=True)
 
@@ -443,13 +442,12 @@ def provision_series_hub(workspace_root: str, series_slug: str, genre: str, loca
     title_vi = existing_cfg.get("title_vi") or bible_data.get("title_vi") or ""
     title_zh = existing_cfg.get("title_zh") or bible_data.get("title_zh") or ""
     series_cfg = {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "series_slug": series_slug,
         "title_vi": title_vi,
         "title_zh": title_zh,
         "genre": genre,
-        "localization_mode": localization_mode,
-        "export_formats": export_formats,
+        "localization_mode": "voice_dub",
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     with open(series_cfg_path, "w", encoding="utf-8") as f:
@@ -463,16 +461,14 @@ def provision_series_hub(workspace_root: str, series_slug: str, genre: str, loca
 - **Series Slug:** `{series_slug}`
 - **Title (VI):** {title_vi or series_slug}
 - **Title (ZH):** {title_zh or '_unspecified_'}
-- **Series Root:** `{hub_dir}`
 - **Genre:** `{genre}`
-- **Default Localization Mode:** `{localization_mode}`
-- **Default Export Formats:** `{', '.join(export_formats)}`
+- **Localization Mode:** `voice_dub`
 - **Shared Series Bible:** `config/series_bible.json`
 
-## Working Units / Episodes Registry
-| Unit Slug | Topology | Episodes | Stage Status | 16:9 Deliverable | 9:16 Deliverable | SRT Deliverable |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `{unit_slug}` | `series_episodic` | _See unit manifest_ | `INITIALIZED` | `deliverables/16x9/final_{unit_slug}_vi.mp4` | `deliverables/9x16/final_{unit_slug}_vi_9x16.mp4` | `deliverables/subtitles/{unit_slug}_vi.srt` |
+## Working Units Registry
+| Unit Slug | Topology | Episodes | Stage Status | Batch MP4 | Batch SRT |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `{unit_slug}` | `series_episodic` | _See unit manifest_ | `INITIALIZED` | `units/{unit_slug}/media/final_{unit_slug}_vi.mp4` | `units/{unit_slug}/data/subtitles_full.srt` |
 """)
     return hub_dir
 
@@ -498,21 +494,28 @@ def main():
     parser.add_argument("--genre", default="auto", choices=["auto", "tech-review", "short-drama", "documentary", "tutorial"], help="Content genre.")
     parser.add_argument(
         "--mode",
-        default="auto",
+        default="voice_dub",
         choices=["auto", "voice_dub", "sub_only"],
-        help="Localization audio/subtitle mode: 'voice_dub' (VieNeu-TTS + auto-ducked BGM) or 'sub_only' (preserve original native audio + full Vietnamese subtitles)."
+        help="Localization mode: 'voice_dub' (VieNeu-TTS + auto-ducked BGM; v3.0.0 mandatory).",
     )
     parser.add_argument(
         "--export-formats",
         default="auto",
-        help="Comma-separated target video export formats: e.g. '16x9' or '16x9,9x16'."
+        help="Target video export format metadata (default: auto).",
     )
     parser.add_argument(
         "--sync-existing",
         action="store_true",
-        help="Upgrade/retrofit an existing workspace to the v2.0 storage & template contract without overwriting existing translations or renders."
+        help="Upgrade/retrofit an existing workspace to the v3.0.0 storage & template contract without overwriting existing translations or renders.",
     )
     args = parser.parse_args()
+
+    if args.mode == "sub_only":
+        print(
+            "[ERROR] --mode sub_only is retired in AICN v3.0.0; full-series Vietnamese voice_dub is mandatory.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # Resolve workspace path & slug
     if args.workspace:
@@ -536,11 +539,8 @@ def main():
         with open(existing_profile_path, "r", encoding="utf-8") as f:
             existing_profile = json.load(f)
 
-    genre = existing_profile.get("genre", "tech-review") if args.genre == "auto" else args.genre
-    if args.mode == "auto":
-        localization_mode = existing_profile.get("localization_mode") or ("sub_only" if genre == "short-drama" else "voice_dub")
-    else:
-        localization_mode = args.mode
+    genre = existing_profile.get("genre", "short-drama") if args.genre == "auto" else args.genre
+    localization_mode = "voice_dub"
 
     if args.export_formats == "auto":
         export_formats = ["16x9"]
@@ -551,29 +551,24 @@ def main():
     if args.topology == "auto":
         if args.series_slug:
             topology = "series_episodic"
-        elif args.episodes_dir or args.episodes or os.path.isdir(os.path.join(base, "raw_episodes")) or len(glob.glob(os.path.join(base, "source", "episodes", "*.mp4"))) >= 2:
+        elif args.episodes_dir or args.episodes or len(glob.glob(os.path.join(base, "source", "episodes", "*.mp4"))) >= 2:
             topology = "series_compilation"
         else:
             topology = existing_profile.get("topology", "single")
     else:
         topology = args.topology
 
-    # Create standardized v2.0 directory tree
+    # Create standardized v3.0.0 directory tree (zero unit-level deliverables/{16x9,9x16,episodes} or media/demucs clutter)
     subdirs = [
         ".cicd",
         "config/schemas",
-        "posters",
         "source/episodes",
         "data",
-        "media/demucs",
+        "media/stems",
         "media/tts_segments",
+        "media/audio",
         "frames/audit",
         "frames/qa",
-        "frames/qa_9x16",
-        "deliverables/16x9",
-        "deliverables/9x16",
-        "deliverables/subtitles",
-        "deliverables/episodes",
         "scripts",
     ]
     for sd in subdirs:
@@ -592,12 +587,14 @@ def main():
         )
 
     # Resolve source video and build episodes manifest
-    video_input = args.video or existing_profile.get("source_video", "")
+    raw_vid = args.video or existing_profile.get("source_video", "")
+    if raw_vid and not os.path.isabs(raw_vid):
+        raw_vid = os.path.join(base, raw_vid)
     master_source_path, episodes_manifest = ingest_and_build_episodes_manifest(
         base=base,
         slug=slug,
         topology=topology,
-        video_arg=video_input,
+        video_arg=raw_vid,
         episodes_dir_arg=args.episodes_dir,
         episodes_list_arg=args.episodes,
     )
@@ -619,15 +616,14 @@ def main():
     aspect_mode = "landscape_16x9" if width >= height else "vertical_9x16"
 
     profile = {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "slug": slug,
         "topology": topology,
         "series_slug": args.series_slug or slug,
         "genre": genre,
         "localization_mode": localization_mode,
-        "export_formats": export_formats,
         "total_episodes": episodes_manifest["total_episodes"],
-        "source_video": master_source_path,
+        "source_video": "source/master_source.mp4",
         "duration": duration,
         "width": width,
         "height": height,
@@ -643,31 +639,40 @@ def main():
     with open(profile_path, "w", encoding="utf-8") as f:
         json.dump(profile, f, ensure_ascii=False, indent=2)
 
-    # Write config/project_config.json
+    # Write config/project_config.json (relocation-safe relative POSIX paths)
+    def _rel_base(p: str) -> str:
+        if not p:
+            return ""
+        if ap:
+            return ap.normalize_rel_path(p, base)
+        try:
+            return os.path.relpath(os.path.abspath(p), os.path.abspath(base)).replace("\\", "/")
+        except ValueError:
+            return os.path.abspath(p).replace("\\", "/")
+
     brand_dir = os.path.abspath(os.path.join(args.workspace_root, "branding-dau-do"))
     tl_logo_path = os.path.join(brand_dir, "13_top_left_logo_large.png")
     tr_badge_path = os.path.join(brand_dir, "15_top_right_vietsub_floating.png")
+    series_hub_rel = _rel_base(series_hub_dir) if series_hub_dir else ""
     project_config = {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "slug": slug,
         "topology": topology,
         "series_slug": args.series_slug or slug,
-        "series_hub_dir": series_hub_dir,
+        "series_hub_rel": series_hub_rel,
         "genre": genre,
         "localization_mode": localization_mode,
-        "export_formats": export_formats,
-        "split_episodes_on_export": False,
         "watermark": {
             "enabled": os.path.exists(tl_logo_path) and os.path.exists(tr_badge_path),
-            "brand_dir": brand_dir,
+            "brand_dir": _rel_base(brand_dir),
             "channel_name": "Đậu Đỏ",
             "credit_prefix": "Vietsub by ",
             "layout": "dual_corner",
             "style": "floating",
-            "top_left_logo": tl_logo_path,
+            "top_left_logo": _rel_base(tl_logo_path),
             "top_left_x": 42,
             "top_left_y": 22,
-            "top_right_badge": tr_badge_path,
+            "top_right_badge": _rel_base(tr_badge_path),
             "top_right_margin_x": 42,
             "top_right_y": 58
         },
@@ -679,17 +684,12 @@ def main():
             "video_profile": "data/00_video_profile.json",
             "series_bible": "config/series_bible.json",
             "asr_segments": "data/01_asr_raw_segments.json",
-            "bbox_scan": "data/01_zh_bbox_scan.json",
             "waveform_audit": "data/01_waveform_voice_audit.json",
             "audit_manifest": "data/01_extracted_audit_manifest.json",
             "bilingual_script": "data/02_bilingual_script.json",
             "aligned_subtitles": "data/03_aligned_subtitles.json",
             "qa_manifest": "data/04_qa_frames_manifest.json",
             "canonical_srt": "data/subtitles_full.srt",
-            "posters_dir": "posters",
-            "deliverable_16x9": f"deliverables/16x9/final_{slug}_vi.mp4",
-            "deliverable_srt": f"deliverables/subtitles/{slug}_vi.srt",
-            "deliverable_episodes_dir": "deliverables/episodes"
         }
     }
     project_cfg_path = os.path.join(base, "config", "project_config.json")
@@ -729,17 +729,6 @@ def main():
                 with open(jpath, "w", encoding="utf-8") as f:
                     json.dump(items, f, ensure_ascii=False, indent=2)
 
-    # Sync deliverables vault links if final files already exist
-    m_16x9 = os.path.join(base, "media", f"final_{slug}_vi.mp4")
-    if os.path.exists(m_16x9):
-        link_or_copy(m_16x9, os.path.join(base, "deliverables", "16x9", f"final_{slug}_vi.mp4"))
-    m_9x16 = os.path.join(base, "media", f"final_{slug}_vi_9x16.mp4")
-    if os.path.exists(m_9x16):
-        link_or_copy(m_9x16, os.path.join(base, "deliverables", "9x16", f"final_{slug}_vi_9x16.mp4"))
-    m_srt = os.path.join(base, "data", "subtitles_full.srt")
-    if os.path.exists(m_srt):
-        link_or_copy(m_srt, os.path.join(base, "deliverables", "subtitles", f"{slug}_vi.srt"))
-
     # Remove any stray duplicate .json / .srt files from scripts/ (enforcing zero-entropy storage)
     scripts_dir = os.path.join(base, "scripts")
     if os.path.isdir(scripts_dir):
@@ -771,10 +760,8 @@ def main():
 - **Created / Synced At:** {now_str}
 - **Project Topology:** `{topology}` (`total_episodes = {episodes_manifest['total_episodes']}`)
 - **Genre Profile:** `{genre}` (`{aspect_mode}`)
-- **Localization Mode:** `{localization_mode}` (`voice_dub` = VieNeu-TTS + BGM ducking | `sub_only` = Preserve native original audio + full Vietnamese subtitles)
-- **Target Export Formats:** `{', '.join(export_formats)}`
-- **Master Source Video:** `source/master_source.mp4` (`{master_source_path}`)
-- **Workspace Path:** `{base}`
+- **Localization Mode:** `voice_dub` (VieNeu-TTS v3 Turbo `48000 Hz` + Spectral Auto-Ducked BGM)
+- **Master Source Video:** `source/master_source.mp4`
 - **Duration:** `{duration:.2f}s` (`{format_timecode(duration)}`)
 - **Resolution:** `{width}x{height}` @ `{r_fps:.2f} fps` (avg `{avg_fps:.2f} fps`, VFR=`{is_vfr}`)
 - **Audio Track:** `{profile['audio_codec']}`, `{profile['audio_sample_rate']} Hz`, `{profile['audio_channels']} channels`
@@ -788,24 +775,20 @@ def main():
 - **Immutable Source Inputs:** `source/master_source.mp4`, `source/episodes/epXX.mp4`, `source/concat_list.txt`
 - **Config & Series Bible:** `config/project_config.json`, `config/series_bible.json`, `config/schemas/*.template.json`
 - **Single Source of Truth Data:** `data/00_video_profile.json`, `data/00_episodes_manifest.json`, `data/01_asr_raw_segments.json`, `data/01_waveform_voice_audit.json`, `data/02_bilingual_script.json`, `data/03_aligned_subtitles.json`, `data/subtitles_full.srt`
-- **Final Release Deliverables Vault:**
-  - Landscape `16:9`: `deliverables/16x9/final_{slug}_vi.mp4`
-  - Vertical `9:16`: `deliverables/9x16/final_{slug}_vi_9x16.mp4`
-  - Vietnamese Subtitles: `deliverables/subtitles/{slug}_vi.srt`
-  - Per-Episode Split Exports: `deliverables/episodes/`
+- **Unit Verified Deliverable:** `media/final_{slug}_vi.mp4` (merged into Hub `deliverables/final_{args.series_slug or slug}_full_vi.mp4` at Stage 6)
 
 ## 3. Pipeline CI/CD Gate Checklist
 - [x] **Stage 0:** Workspace Topology, Episode Ingestion & Config Templates (`00_project_manifest.md`, `.cicd/stage_0_gate.json`)
-- [ ] **Stage 1:** ASR, 5fps BBox Scan, Waveform Onset & Visual Audit (`01_visual_audit_notes.md`, `.cicd/stage_1_gate.json`)
-- [ ] **Stage 2:** Bilingual Dual-Layer Script & Series Bible Compliance (`02_glossary_and_pronunciation.md`, `.cicd/stage_2_gate.json`)
-- [ ] **Stage 3:** 48kHz Audio Master (`sub_only` native stereo or `voice_dub` VieNeu-TTS) (`03_pacing_and_audio_report.md`, `.cicd/stage_3_gate.json`)
-- [ ] **Stage 4:** Dub + Watermark Render (`media/.staging_render.mp4`, `.cicd/stage_4_gate.json`)
-- [ ] **Stage 5:** Final Composite, CV QA Audit & Deliverables Publishing (`04_qa_review_report.md`, `.cicd/stage_5_gate.json`)
+- [ ] **Stage 1:** Multi-Pass Whisper ASR & Acoustic Waveform Audit (`01_visual_audit_notes.md`, `.cicd/stage_1_gate.json`)
+- [ ] **Stage 2:** Bilingual Dual-Layer Script & IPA Validation (`02_glossary_and_pronunciation.md`, `.cicd/stage_2_gate.json`)
+- [ ] **Stage 3:** 48kHz Indivisible-Utterance Dub & Single-STFT Audio Master (`03_pacing_and_audio_report.md`, `.cicd/stage_3_gate.json`)
+- [ ] **Stage 4:** Fast Hardware Render + Dual-Corner Branding (`media/.staging_render.mp4`, `.cicd/stage_4_gate.json`)
+- [ ] **Stage 5:** Visual QA & Release Promotion (`04_qa_review_report.md`, `.cicd/stage_5_gate.json`)
 """
         with open(manifest_path, "w", encoding="utf-8") as f:
             f.write(manifest_content)
 
-    # Genre- & Mode-Matched Markdown Templates
+    # Genre-Matched Markdown Templates
     if genre == "short-drama":
         glossary_template = f"""# 02 — Series Bible, Character Pronouns (`Xưng Hô`) & Glossary (`{slug}`)
 
@@ -855,23 +838,13 @@ def main():
 | `DeepSeek-R1` | `<en>Deep Seek R one</en>` | `diːp siːk ɑːɹ wʌn` |
 """
 
-    if localization_mode == "sub_only":
-        pacing_template = f"""# 03 — Native Audio Preservation & Subtitle Reading-Speed Report (`{slug}`)
+    pacing_template = f"""# 03 — Voice Pacing & Spectral Audio Mixing Report (`{slug}`)
 
-- **Localization Mode:** `sub_only` (100% Native Stereo Audio Preserved — Zero TTS Overdub)
-- **Master Audio Track:** `media/master_audio_48k.wav` (`48000 Hz`, `2 channels`, lossless PCM extracted from `source/master_source.mp4`)
-- **Total Subtitle Clauses:** _TBD_
-- **Subtitle Reading Speed (Syllables/sec):** `mean = TBD`, `max = TBD` (Target `<= 7.8 syl/s`)
-- **Onset & Gap Alignment:** `premature_lead_segments = 0`, `internal_blank_gap_segments = 0`
-"""
-    else:
-        pacing_template = f"""# 03 — Voice Pacing & BGM Mixing Report (`{slug}`)
-
-- **Localization Mode:** `voice_dub` (`VieNeu-TTS v3 Turbo` `48000 Hz` + Auto-Ducked BGM)
-- **Total Segments:** _TBD_
-- **Tempo Ratio Statistics:** `mean = TBD`, `median = TBD`, `max = TBD` (Hard cap `<= 1.24x`)
-- **Breathing Pause Statistics:** `mean = TBD`, `min = TBD`, `max = TBD`
-- **BGM Auto-Ducking:** `0.28` gain during active speech, `0.65` gain during pauses (`media/demucs/no_vocals.wav` resampled to `48000 Hz` stereo)
+- **Localization Mode:** `voice_dub` (`VieNeu-TTS v3 Turbo` `48000 Hz` + Single-STFT Spectral BGM/Vocal Carving)
+- **Total Utterances:** _TBD_
+- **Tempo Ratio Statistics:** `mean = TBD`, `median = TBD`, `max = TBD` (Cap `<= 1.28x`, `<= 1.32x` for `<= 2`-syl interjections)
+- **Target Loudness:** `-14.0 ± 1.0 LUFS`, True Peak `<= -0.8 dBFS`
+- **Dub Intelligibility:** `dub_snr_speech_db_median >= 10.0 dB`, `dub_snr_speech_db_p10 >= 4.0 dB`
 """
 
     notes_templates = {
@@ -881,24 +854,22 @@ def main():
 | Timestamp (s) | Episode | Frame File | Raw Whisper ASR Text | Visual On-Screen Text / Graphics | Corrected Term & Context |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 
-## 2. Acoustic Waveform & Filtered Voice Recovery (Phone Calls, Whispers, Radio/PA)
-- **Total Visual Hardsub Sub-Clauses:** _TBD_
-- **Sub-Clause Coverage Ratio:** _TBD_ (Target `>= 96%`)
-- **Premature Lead Segments (`start` before voice/hardsub):** `0`
-- **Internal Blank-Gap Segments (unsplit two-clause merges):** `0`
+## 2. Acoustic Waveform & Multi-Band Voice Recovery Summary
+- **Total ASR Clauses:** _TBD_
+- **Acoustic Speech Coverage Ratio:** _TBD_ (Target `>= 90%`)
+- **Bloated / Premature Lead / Overlapping Segments:** `0`
 """,
         "02_glossary_and_pronunciation.md": glossary_template,
         "03_pacing_and_audio_report.md": pacing_template,
-        "04_qa_review_report.md": f"""# 04 — Final QA, Deliverables Vault & Visual Frame Verification Report (`{slug}`)
+        "04_qa_review_report.md": f"""# 04 — Final QA & Visual Frame Verification Report (`{slug}`)
 
 ## 1. Stream & Format Verification (`ffprobe`)
-- **16:9 Master (`deliverables/16x9/final_{slug}_vi.mp4`):** _TBD_
-- **9:16 Vertical Master (`deliverables/9x16/final_{slug}_vi_9x16.mp4`):** _TBD_
-- **Canonical SRT (`deliverables/subtitles/{slug}_vi.srt`):** _TBD_
+- **Unit Verified MP4 (`media/final_{slug}_vi.mp4`):** _TBD_
+- **Canonical SRT (`data/subtitles_full.srt`):** _TBD_
 - **Subtitle Streams (`mov_text`):** `0` (verified `-sn`)
 
 ## 2. Stratified Visual Frame Inspection Checklist
-| Timestamp | Frame Path | Chinese Hardsub 100% Covered? | Lines <= 2 & Centered? | Onset & Visual Cue Sync Verified? |
+| Timestamp | Frame Path | Watermark & Framing Clean? | Audio/Visual Sync Verified? | Status |
 | :--- | :--- | :--- | :--- | :--- |
 """
     }
@@ -941,11 +912,11 @@ def main():
                 "config/schemas/02_bilingual_cue.template.json",
                 "config/schemas/03_aligned_cue.template.json",
             ]),
-            "detail": f"mode={localization_mode}, exports={export_formats}"
+            "detail": f"mode={localization_mode}"
         },
         {
-            "id": "workspace_tree_and_deliverables_vault_ready",
-            "description": "Standardized workspace tree, deliverables/{16x9,9x16,subtitles,episodes}, and 00..04 Markdown logs exist with 0 stray data files in scripts/",
+            "id": "workspace_tree_and_logs_ready",
+            "description": "Standardized v3.0.0 workspace tree and 00..04 Markdown logs exist with 0 stray data files in scripts/",
             "weight": 20,
             "passed": (
                 all(os.path.exists(os.path.join(base, f)) for f in [
@@ -954,10 +925,9 @@ def main():
                     "02_glossary_and_pronunciation.md",
                     "03_pacing_and_audio_report.md",
                     "04_qa_review_report.md",
-                    "deliverables/16x9",
-                    "deliverables/9x16",
-                    "deliverables/subtitles",
-                    "deliverables/episodes",
+                    "media/stems",
+                    "media/tts_segments",
+                    "media/audio",
                 ])
                 and len(stray_script_files) == 0
             ),
@@ -965,7 +935,7 @@ def main():
         },
         {
             "id": "video_profile_json_saved",
-            "description": "data/00_video_profile.json written with aspect ratio & stream metadata",
+            "description": "data/00_video_profile.json written with relative source path, aspect ratio & stream metadata",
             "weight": 15,
             "passed": os.path.exists(profile_path),
             "detail": f"aspect={aspect_mode}, {width}x{height}@{r_fps:.2f}fps"

@@ -1,215 +1,182 @@
 ---
 name: aicn
-description: Use when starting, resuming, or editing a Chinese short-drama / AI-drama Vietsub or Vietnamese dub re-up (any series, any unit of episodes), when entering a workspace with series hubs and units/, when a subtitle or dubbed line must change after render, when a re-render or a re-run of Whisper/TTS feels too slow or would start from scratch, or when estimating how long a finished video takes to produce.
+description: Use when starting, resuming, or editing a Chinese short-drama / AI-drama or English short-drama Vietnamese dub + Vietsub re-up (any series, any unit of episodes), when entering a workspace with series hubs and units/, when a subtitle or dubbed line must change after render, when a re-render or Whisper/TTS run is needed, or when estimating how long a finished video takes to produce.
 ---
 
-# AICN: drama re-up pipeline (full-series release, incremental)
+# AICN: Full-Series Vietnamese Dubbing & Localization Pipeline (`v3.0.0`)
 
 ## Overview
 
-One entry point for every series. It drives five stage skills (vendored in `vendor/`:
-orchestrator, ASR + visual audit, zh/en→vi script adapter, VieNeu voice + pacing mixer,
-QA review) and adds root discovery, a fixed folder and log contract, content-hash
-caching, hardware-overlapped full-series execution, and one-pass dub + dual-corner watermark rendering (v2.0.0 — no burned-in subtitle overlay or hardsub blurring).
+One unified entry point for every series. It drives five stage skills (canonical under `vendor/`: orchestrator, ASR + acoustic/visual audit, zh/en→vi script adapter, VieNeu voice + single-STFT mixer, QA review) and adds root discovery, a relocation-safe folder and log contract, SQLite-WAL pure content-SHA-256 caching, VRAM-aware concurrent GPU slot pooling (`gpu_slot`), warm multi-unit model batching, and hardware-accelerated one-pass dub + pre-composited dual-corner watermark rendering (`FF_RENDERER_VERSION = v3-dub-wm-3.0`, no burned-in subtitle overlay).
 
-> **Release rule (mandatory): 1 published video = 1 FULL series.**
-> Every publishable release is ALWAYS the complete series with **full Vietnamese dubbing +
-> dual-corner branding watermark + external `.srt` subtitles** at `deliverables/final_<series>_full_vi.mp4` (and
-> `deliverables/subtitles/final_<series>_full_vi.srt`). Working batches under `units/`
-> exist **strictly as internal work slices** (for caching, incremental edits, QA, and
-> GPU/CPU/Media-Engine pipelining) — **never** as separate uploads.
+> **Release & Mode Contract (mandatory):**
+> 1. **1 published video = 1 FULL series** at `deliverables/final_<series>_full_vi.mp4` and `deliverables/subtitles/final_<series>_full_vi.srt`.
+> 2. **`voice_dub` is mandatory** on every series (full Vietnamese dubbing + dual-corner watermark + external `.srt`). Never downgrade to subtitle-only video.
+> 3. Working batches under `units/` exist **strictly as internal work slices** (for caching, incremental edits, QA, and parallel batching) — **never** as standalone uploads.
 
-**Core principle: every expensive output is keyed by the hash of exactly the inputs
-that produce it.** An edit dirties only the cues, TTS sentences and working batch whose
-inputs changed. Everything else comes from cache. Nothing is recomputed because it is "safer".
+**Core principle: every expensive output is keyed strictly by the content SHA-256 of its inputs and parameters (`content_hash.db`, zero path dependence).** Moving or renaming a unit or series hub keeps 100% cache and CI/CD gate validity.
 
 | Variable | Value |
 |---|---|
-| `<skill>` | the folder holding this file |
-| Engine | `python <skill>/scripts/aicn.py <cmd>` (`--help` lists commands) |
+| `<skill>` | Folder holding this `SKILL.md` |
+| Engine | `$AICN_PY <skill>/scripts/aicn.py <cmd>` (`--help` lists commands) |
 | Hongguo Sourcing CLI | `node <skill>/scripts/hg_tool.cjs <cmd>` (thin dynamic wrapper over `tools/hongguo-drama`; always run `check-upstream` first) |
-| Douyin Sourcing CLI | `<dy_py> <skill>/scripts/dy_tool.py <cmd>` (`tools/.venv-dy/bin/python` or `Scripts/python.exe`) |
-| English DramaDunyam CLI | `python <skill>/scripts/dd_tool.py top\|list\|search\|detail\|download` (clean `lang=en`, non-adult `dramadunyam.com` API) |
-| Unified Radar & Index | `python <skill>/scripts/aicn_radar.py sync-all\|search\|top` (`data/drama_index.db`, Hongguo + Douyin + Bilibili + DramaDunyam) |
-| Stage scripts | `<skill>/vendor/<stage-skill>/scripts/*.py`, run with `$AICN_PY` (macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`, Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`) |
-| Gate tokens | `<unit>/.cicd/stage_N_gate.json`, signed, 100/100 required |
+| Douyin Sourcing CLI | `<dy_py> <skill>/scripts/dy_tool.py <cmd>` (Windows `tools\.venv-dy\Scripts\python.exe`, macOS `tools/.venv-dy/bin/python`) |
+| English DramaDunyam CLI | `$AICN_PY <skill>/scripts/dd_tool.py top\|list\|search\|detail\|download` (clean `lang=en`, non-adult `dramadunyam.com` API) |
+| Unified Radar & Index | `$AICN_PY <skill>/scripts/aicn_radar.py sync-all\|search\|top` (`data/drama_index.db`, Hongguo + Douyin + Bilibili + DramaDunyam) |
+| Stage scripts | `<skill>/vendor/<stage-skill>/scripts/*.py`, run with `$AICN_PY` (Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`, macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`) |
+| Gate tokens | `<unit>/.cicd/stage_N_gate.json` (`schema_version: "3.0"`, relocation-safe relative POSIX artifacts, 100/100 required) |
 | RSI Ledger | `<skill>/LESSONS.md` + `references/recursive_self_improvement.md` |
 
 ## 0. Once per machine: doctor
 
 ```bash
-python <skill>/scripts/aicn.py doctor --root <project-root>
+$AICN_PY <skill>/scripts/aicn.py doctor --root <project-root>
 ```
 
-It writes `config/machine.json` and prints the stack to use (`scripts/aicn_platform.py`).
-- **macOS Apple Silicon**: Whisper on MLX (Metal), Demucs MLX (`uvx`), ffmpeg one-pass render with `h264_videotoolbox` / `hevc_videotoolbox` (hardware decode + quality VBR), `rubberband`.
-- **Windows 10/11 + NVIDIA CUDA**: `faster-whisper` (`large-v3`, CUDA `int8_float16`), PyTorch `demucs` on CUDA, single-process VieNeu-TTS v3 Turbo CUDA `infer_batch()`, ffmpeg one-pass render with `h264_nvenc` / `hevc_nvenc` (`-rc vbr -cq`), `rubberband` (or `libx264` CPU fallback). Python never touches video frames on the default path.
+Writes `config/machine.json`, probes GPU VRAM, `overlay_cuda`/`scale_cuda`/`hwupload_cuda` filters, encoders, and tools (`scripts/aicn_platform.py`):
+- **Windows 10/11 + NVIDIA CUDA**: `faster-whisper` (`large-v3`, CUDA `int8_float16`), PyTorch `demucs` (`htdemucs` CUDA), single-process `VieNeu-TTS v3 Turbo` CUDA `infer_batch(16)`, FFmpeg hardware render (`h264_nvenc` / `hevc_nvenc` with `-hwaccel cuda` + `overlay_cuda`, or single static CPU `overlay` fallback), `rubberband` R3.
+- **macOS Apple Silicon**: `mlx-whisper` (`large-v3` on Metal), `demucs-mlx` (`uvx`), `VieNeu-TTS v3 Turbo` ONNX `fp32`, FFmpeg `h264_videotoolbox` / `hevc_videotoolbox` with single static `overlay` strip, `rubberband` R3.
+- **CPU Fallback**: `faster-whisper` `int8`, PyTorch `demucs`, ONNX `fp32`, `libx264` / `libx265`.
 
 ## 1. On entry: read the root
 
 ```bash
-python3 <skill>/scripts/aicn.py discover --root <project-root>
+$AICN_PY <skill>/scripts/aicn.py discover --root <project-root>
 ```
 
-It lists each Series Hub (`workspace/<series>/` with `units/` and
-`config/series_bible.json`), hub files, inbox, and each unit's gates as six letters:
+Lists each Series Hub (`workspace/<series>/` with `units/` and `config/series_bible.json`), hub files, inbox, and each unit's gates as six letters:
 `P` pass, `F` fail, `x` passed but its media was deleted, `-` missing.
 **The next stage for a unit is the first position that is not `P`.**
-Then read, in order: hub `PROGRESS.md`, the last 20 lines of the unit `CHANGELOG.md`,
-the unit `CHECKLIST.md`. Do not open media to find out where things stand.
+Then read, in order: hub `PROGRESS.md`, the last 20 lines of the unit `CHANGELOG.md`, and the unit `CHECKLIST.md`. Do not open media to find out where things stand.
 
 ## 1b. Sourcing, Discovery Analytics & Candidate Lists (Chinese-First, Zero YouTube)
 
 Full sourcing & analytics guide: `references/sourcing_and_analytics.md`.
 Original-platform engines: **`jackotom/hongguo-drama`** (thin wrapper `scripts/hg_tool.cjs`), **`Evil0ctal/Douyin_TikTok_Download_API`** (`scripts/dy_tool.py`), **DramaDunyam EN** (`scripts/dd_tool.py`), **`yt-dlp`** (Bilibili `--user-agent`), indexed together by **`scripts/aicn_radar.py`** -> `data/drama_index.db`.
 
-- **Mandatory Upstream Open-Source Check FIRST (zero hardcoding):** `scripts/hg_tool.cjs` is strictly a **thin dynamic wrapper** around `jackotom/hongguo-drama` — never hardcode upstream Hongguo private API routes, signing headers, or SDK internals in the skill or ad-hoc scripts. **Before ANY Hongguo search, ranking, episode inspection, or download**, the agent MUST run:
+- **Mandatory Upstream Open-Source Check FIRST (zero hardcoding):** `scripts/hg_tool.cjs` is strictly a **thin dynamic wrapper** around `jackotom/hongguo-drama` — never hardcode upstream Hongguo private API routes, signing headers, or SDK internals in the skill or ad-hoc scripts. **Before ANY Hongguo search, ranking, episode inspection, or download**, run:
   ```bash
   node <skill>/scripts/hg_tool.cjs check-upstream --json
   ```
-  Verify `up_to_date: true` (matching the latest GitHub release of `jackotom/hongguo-drama`) and `wrapper_contract_ok: true` (live `api_surface` + `sdk_cli` capabilities). If `up_to_date` is `false`, run `node <skill>/scripts/hg_tool.cjs check-upstream --sync` first and inspect the upstream release notes & `tools/hongguo-drama/src/native/` exports before querying or downloading. If upstream refactored an export (`wrapper_contract_ok: false`), update the thin wrapper to match upstream rather than hardcoding endpoints.
-- **Chinese-original & verified clean English-distribution sources (NO YouTube):** Never search or download Chinese dramas from YouTube (YouTube hosts recaps/re-ups). For Chinese dramas, always start in **Chinese keywords (`中文`)** on **Hongguo `红果`**, **Douyin `抖音`**, **Bilibili `B站`**, **Hema `河马`**, **Kuaishou `快手`**. For English AI/short dramas (DramaBox/ReelShort/NetShort/FreeReels), use **`dd_tool.py`** (`dramadunyam.com`, `--lang en`, excluding `yetiskin: true`) — set `--source-lang en` at `init-series` so Stage 1 Whisper & 9:16 portrait typography adapt cleanly (`720x1280` supported end-to-end).
-- **Search local analytics index first:** Run `aicn_radar.py sync-all` periodically, then query `aicn_radar.py search "<中文关键词>"` or `aicn_radar.py top --format ai --limit 15` (scored by recency-weighted engagement velocity from `first_visible_time`/`create_time` + `likes` + `favorites`).
-- **Freshness-first live queries:** Combine `hg_tool.cjs new --genre ai|real|all`, `hg_tool.cjs rank --category hot-ai-drama|hot-real-drama|hot-comic-drama`, `dy_tool.py detail` + `related_posts`, and `yt-dlp bilisearch`. Do not pitch stale/old dramas as "trending".
+  Verify `up_to_date: true` and `wrapper_contract_ok: true`. If `up_to_date` is `false`, run `node <skill>/scripts/hg_tool.cjs check-upstream --sync` first and inspect `tools/hongguo-drama/src/native/` exports.
+- **Original Chinese & verified clean English sources ONLY (NO YouTube):** Never search or download Chinese dramas from YouTube (YouTube hosts recaps/re-ups). Search in **Chinese keywords (`中文`)** on **Hongguo `红果`**, **Douyin `抖音`**, **Bilibili `B站`**, **Hema `河马`**, **Kuaishou `快手`**. For English AI/short dramas, use **`dd_tool.py`** (`dramadunyam.com`, `--lang en`, non-adult) and pass `--source-lang en` to `init-series`.
+- **Search local analytics index first:** Run `aicn_radar.py sync-all` periodically, then query `aicn_radar.py search "<中文关键词>"` or `aicn_radar.py top --format ai --limit 15`.
+- **Freshness-first live queries:** Combine `hg_tool.cjs new --genre ai|real|all`, `hg_tool.cjs rank --category hot-ai-drama|hot-real-drama|hot-comic-drama`, `dy_tool.py detail` + `related_posts`, and `yt-dlp bilisearch`. Do not pitch old series as "trending".
 - **Mandatory Candidate List Contract:** Every shortlist presented to the user MUST be written to an artifact and include for **every** candidate:
   1. **Vietnamese translated title** + original Chinese title (`ZH`) + valid Vietnamese `--series-slug`.
-  2. Platform (`hongguo`/`douyin`/`bilibili`), `series_id` / `aweme_id`, format/genre, episode count, publish date (`age`), likes/favorites/heat score.
+  2. Platform (`hongguo`/`douyin`/`bilibili`/`dramadunyam`), `series_id` / `aweme_id`, format/genre, episode count, publish date (`age`), likes/favorites/heat score.
   3. **Vietnamese synopsis** (2–4 sentences covering hook, comedy/drama beat, and main cast).
-  4. **Local `.jpg` cover thumbnail** fetched via `hg_tool.cjs fetch-covers` or `dy_tool.py detail --cover-out` and embedded directly in the artifact.
-- **No-Watermark / 1080p Downloads:**
-  - Hongguo: `node <skill>/scripts/hg_tool.cjs download <series_id> --episodes 1-10 --out <inbox_batch_dir> --quality 1080p`
-  - Douyin: `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py download <aweme_id_or_mix_id> --out <inbox_batch_dir>` (clean watermark-free MP4)
+  4. **Local `.jpg` cover thumbnail** fetched via `hg_tool.cjs fetch-covers`, `dy_tool.py detail --cover-out`, or `dd_tool.py download --cover-out` and embedded directly in the artifact.
 - **Upload Caption & Poster Packaging Standard:** Full guide in `references/poster_and_caption_guide.md`.
   - **Caption (2-line minimal format):** Line 1: `<Catchy Vietnamese Hook Title> <2 emojis> | Full N Tập`; Line 2: `#daudonho #aishortfilmdrama #aishortdrama #aifilm #phimai #phimngan #phimthuyetminh #phimtrungquoc #<topic1> #<topic2>` (all-lowercase, no awkward genre calque tags).
-  - **Poster / Thumbnail workflow:** Pull HD official source poster (`~tplv-resize:1440:0.image`) into `posters/official_poster_<slug>_zh.jpg`, provide `9:16` / `16:9` localization prompts (user generates externally via Nano Banana 2 / Flow or requests agent generation), then standardize & composite dual-corner branding via `aicn.py brand-poster --hub <hub> --input <raw_file> --brand-dir <brand_dir> --delete-source` and visually inspect `_branded.png` via `read_file`.
+  - **Poster / Thumbnail workflow:** Pull HD official source poster (`~tplv-resize:1440:0.image`) into `posters/official_poster_<slug>_zh.jpg`, localize `9:16` / `16:9` poster, then standardize & composite dual-corner branding via `aicn.py brand-poster --hub <hub> --input <raw_file> --brand-dir <brand_dir> --delete-source` and visually inspect `_branded.png` via `read_file`.
 
 ## 2. Folder contract
 
 Full tree: `references/folder_contract.md`. Short form:
 
-```
+```text
 workspace/<series>/                      Series Hub
-  CHANGELOG.md  PROGRESS.md  config/series_bible.json  config/rights.json
-  source_inbox/<batch>/epNN.mp4          raw downloads, never edited
+  CHANGELOG.md  PROGRESS.md  00_series_manifest.md
+  config/{rights.json,series_bible.json,series_config.json}
+  source_inbox/<batch>/epNN.mp4          raw downloads, immutable
   units/<batch>/                         internal working batches (~10 eps each; NOT standalone uploads)
-     CHECKLIST.md CHANGELOG.md  config/ data/ source/ media/ frames/ .cicd/
-     .cache/{timeline,tts_sent}/  media/.staging_render.mp4  media/final_<batch>_vi.mp4
+     CHECKLIST.md CHANGELOG.md 00..04.md
+     config/ data/ source/ media/{stems,tts_segments,audio}/ frames/{audit,qa}/ .cicd/
+     media/.staging_render.mp4  media/final_<batch>_vi.mp4
+  posters/
+     cover.jpg  official_poster_<slug>_zh.jpg  poster_<slug>_vi_<ratio>_{raw,clean,branded}.png
   deliverables/
      final_<series>_full_vi.mp4          THE publishable full-series master (via `merge-series`)
      subtitles/final_<series>_full_vi.srt
+<project_root>/.cache/                   Global pure content-addressed cache
+  content_hash.db  asr/  stems/  tts_sent/  rb_stretch/  wm_overlay/
 ```
 
-New series: `aicn.py init-series --series-slug <slug> --title-vi "<Tên Tiếng Việt>" --title-zh "<Tên Gốc ZH>" --total-episodes N --rights <basis>`
-- Update metadata anytime (including renaming slug across hub, config, bible, manifest & deliverables): `aicn.py update-series --hub workspace/<slug> [--series-slug <new-slug>] [--title-vi "<Tên Tiếng Việt>"] [--title-zh "<Tên Gốc ZH>"]`
-- **Naming rule (mandatory, enforced by CLI):** `--series-slug` MUST be the **Vietnamese translated title**, **no accents**, **lowercase**, **hyphen-separated** (`[a-z0-9]+(-[a-z0-9]+)*`), e.g. `《那年十八我造神器》` → `nam-18-tuoi-toi-che-tao-than-khi`. Never use pinyin, underscores, uppercase, or arbitrary names.
+New series: `$AICN_PY <skill>/scripts/aicn.py init-series --series-slug <slug> --title-vi "<Tên Tiếng Việt>" --title-zh "<Tên Gốc ZH>" --total-episodes N --rights <basis>`
+- Update metadata anytime (including renaming slug across hub, config, bible, manifest & deliverables): `aicn.py update-series --hub workspace/<slug> [--series-slug <new-slug>] [--title-vi "<Tên VI>"] [--title-zh "<Tên ZH>"]`
+- **Naming rule (mandatory, enforced by CLI):** `--series-slug` MUST be the **Vietnamese translated title**, **no accents**, **lowercase**, **hyphen-separated** (`^[a-z0-9]+(-[a-z0-9]+)*$`), e.g. `《那年十八我造神器》` → `nam-18-tuoi-toi-che-tao-than-khi`.
 - `--rights` is required: `own`, `licensed:<contract>`, `cps:<platform>`, `mcn:<name>`.
 - New internal working batch: `init_workspace.py --topology series_episodic ...`, then `aicn.py adopt --unit <batch>`.
-- Every folder, subfolder, Markdown checklist, and per-stage report template/format is specified in `references/folder_contract.md`.
 
 ## 3. Stages and gates
 
 Exact commands per stage: `references/stages.md`.
 
-| Stage | Does | Gate | Cached by |
+| Stage | Does | Gate | Cached by (Pure Content SHA-256) |
 |---|---|---|---|
-| 0 Init | series hub + internal working batches (`units/*`), fps/PTS-normalized `master_source.mp4` | stage_0 (decoupled from `series_bible.json`) | `source/master_source.mp4` |
-| 1 Prep (Stems + ASR + audit) | `run-series --phase prep` (machine-wide `gpu.lock`: `separate` + `large-v3` Pass 1 + Stitched `<=22s` Multi-Band Pass 2B `asr-3.1`, overlapped with CPU `waveform+audit`) | `verify_stage_1.py` | persistent `<root>/.cache/asr/<sha256>.json` + stems by source sha256 |
-| 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) + living `series_bible.json` | `validate_bilingual_script.py` | stream each unit immediately on Stage 1 PASS |
-| 3 Audio (full dub) | `aicn_audio.py all` (1 process): `PCM_16` stems → CUDA `infer_batch=16` VieNeu TTS (under `gpu.lock`) + parallel rubberband → `analyze` (9-band spectral + HP/LP) → cached-Z mix → fast 48 kHz 24-bit master → verify | audio gate + `verify_stage_3.py` | persistent `<root>/.cache/tts_sent/<sha>.wav` (`PCM_16`, survives hub prune) |
-| 4 Render (Dub + Watermark) | `render` (one ffmpeg pass: hardware `videotoolbox`/`nvenc` or `libx264` with `--brand-dir` dual-corner watermark, or instant video stream-copy when no watermark is set) | `aicn.py verify-render` / `verify-overlay` (codec/audio + A/V sync + frame count) | whole batch: sha256(source, audio, watermark, encoder, renderer version); unchanged → skipped |
-| 5 Batch QA | hardlink staging MP4, 4-worker QA frame extraction, **view every frame**, verify batch (`run-series --phase produce --units ...` streams S3→S5 with 3-engine locks) | `verify_stage_5.py` | hardlink (0 extra bytes) |
-| 6 Full-Series Release | **`aicn.py merge-series --hub <hub>`** once **ALL** working batches PASS Stage 5 (verifies uniform stream specs & A/V sync) → single full-series MP4 + SRT | all batches `P` at Stage 5 | stream copy (seconds) |
+| 0 Init | Series hub + internal working batches (`units/*`), fps/PTS-normalized `master_source.mp4` | `stage_0_gate.json` (`series_bible.json` decoupled) | `source/master_source.mp4` |
+| 1 Prep (Stems + ASR + Audit) | Warm `batch-separate` (`htdemucs`, `vram_mb=1024`) + warm `run_asr_and_scan.py --units` (`large-v3`, `vram_mb=2560`, anti-orphan Pass 1 + collar-masked Pass 2B) + parallel CPU `analyze_voice_waveform.py --snap-and-split` (`wf-4.0`) + `extract_audit_frames.py` | `verify_stage_1.py` (100 pts) | `<global_cache>/stems/<stems_key>/` + `asr/<stage1_asr_key>.json` |
+| 2 Script | `02_bilingual_script.json` (`zh_text`, `sub_text`, `tts_text`, `speaker`) + living `series_bible.json` | `validate_bilingual_script.py` (100 pts) | Stream each unit immediately on Stage 1 PASS |
+| 3 Audio (Full Dub) | Warm `batch-all --units` (or `aicn_audio.py all --unit`): single CUDA VieNeu `infer_batch(16)` (`vram_mb=1024`) -> indivisible utterance grouping (`gap<=0.12s`, `<=3` clauses, `span<=4.5s`, **never sliced back into clause pieces**) -> parallel rubberband -> **fail-fast on overflow before `mix`** -> single-STFT + C-speed `follow_hold` mix (`<12s`/unit) -> fast 48 kHz 24-bit master -> verify | Audio gate (`03_mix_report.json`) + `verify_stage_3.py` (100 pts) | `<global_cache>/tts_sent/<tts_sent_key>.wav` + `rb_stretch/<rb_stretch_key>.wav` |
+| 4 Render (Dub + Watermark) | `aicn.py render` (lock-free parallel: cached tight top-band RGBA PNG + `-hwaccel cuda`/`overlay_cuda` or single static `overlay`, instant `-c:v copy` if no watermark) | `aicn.py verify-render` (codec/audio, `-sn`, A/V sync `±0.30s`, exact frame count) | `render_key(src_sha, audio_sha, wm_key, enc, v3-dub-wm-3.0)` |
+| 5 Batch QA | `composite_and_verify.py` (hardlink `.staging_render.mp4 -> .staging_final.mp4`, 4-worker QA frame extraction), **view every frame via `read_file`**, verify batch | `verify_stage_5.py` (100 pts) → `media/final_<batch>_vi.mp4` | Hardlink (0 extra bytes) |
+| 6 Full-Series Release | `aicn.py merge-series --hub <hub>` once **ALL** working batches PASS Stage 5 → single full-series MP4 + SRT | All batches `P` at Stage 5 + stream/sync check | Stream copy (seconds) |
 
-**Streaming & Lean Worker Cap (mandatory for ~45m target):**
-- **Never wait for all batches at Stage 2:** stream units independently (`Stage 1 → 2 → 3 → 4 → 5`) via `aicn.py run-series --hub <hub> --phase produce --units <unit>` as soon as each unit passes Stage 2.
-- **Keep at most 2–3 workers active** (1–2 Stage 2 translators + 1 `run-series` runner; auto-kill/pause idle workers). Never spawn >1 GPU (Metal/CUDA) job or >1 VieNeu TTS job concurrently; `run-series` enforces cross-process `gpu.lock` / `cpu.lock` / `media.lock` via `aicn_platform.file_lock`.
+**VRAM-Aware Concurrency & Warm Batching (No Serial GPU Lock):**
+- `aicn_platform.gpu_slot(task, vram_mb)` allocates 512 MB OS-locked VRAM slots (`RTX 2060 6 GB` = 10 slots: `whisper(5) + demucs(2) + vieneu(2) = 9 <= 10` run concurrently without OOM!).
+- `run-series --phase prep|produce [--units ...]` batches units into ONE warm Demucs/Whisper/VieNeu CUDA session and runs NVENC/VideoToolbox Stage 4 renders + QA extraction lock-free in parallel (`AICN_MAX_RENDER_JOBS=2`).
+- Stream units independently (`Stage 1 → 2 → 3 → 4 → 5`) via `--units` as soon as each unit passes Stage 2 — never wait for an all-batch barrier.
 
-The project requires **full Vietnamese dubbing (`voice_dub`) + full Vietnamese subtitles** on
-every published series. Never downgrade to `sub_only` as a shortcut.
-The old `assemble_master_audio.py` path is retired: it replaced a missing Demucs stem with
-silence and dropped the original voice entirely. Do not use it.
-(`aicn.py tts-sync` is legacy for the old per-chunk flow; Stage 3 uses `aicn_audio.py`.)
+## 4. Edit loop (≈ 1 min per edit)
 
-## 4. Edit loop (≈ 1–2 min per edit)
+1. Edit the smallest thing: one item in `data/02_bilingual_script.json`.
+2. Re-run `validate_bilingual_script.py --workspace $U`.
+3. If `tts_text` changed: `$AICN_PY <skill>/scripts/aicn_audio.py dub --unit $U`, then `mix`, `master`, `verify` (only changed utterances are re-synthesized/re-stretched; everything else hits `tts_sent`/`rb_stretch` cache). For mix-only changes (`config/audio_mix.json`): `mix`, `master`, `verify`. If only `sub_text` changed: re-export SRT (`master`/`verify`) and re-run `merge-series` (no video re-render needed).
+4. `$AICN_PY <skill>/scripts/aicn.py plan --unit $U` (pass matching `--codec`/`--quality`/`--brand-dir` flags) shows `render=current` or `stale: <parts>`. Then `$AICN_PY <skill>/scripts/aicn.py render --unit $U`.
+5. `$AICN_PY <skill>/scripts/aicn.py verify-render --unit $U`, run `composite_and_verify.py` (defaults to `.staging_render.mp4`), inspect every QA frame in `read_file`, log PASS in `04_qa_review_report.md`, and run `verify_stage_5.py`.
+6. `$AICN_PY <skill>/scripts/aicn.py log --unit $U --kind fix --message "<what> (<why>) -> rerun: <stages>"`.
 
-1. Edit the smallest thing: one item in `02_bilingual_script.json`.
-2. Re-run `validate_bilingual_script.py`.
-3. `voice_dub`, if `tts_text` changed: `aicn_audio.py dub`, `mix`, `master`, `verify` (only the edited sentence is re-synthesized). For a mix-only change (`config/audio_mix.json`): `mix`, `master`, `verify`.
-4. `aicn.py plan --unit U` (pass the same `--codec`/`--quality`/`--brand-dir` flags as `render`) says `render=current` or `stale: <parts>`; anything other than the part you edited means an unintended change. Then `aicn.py render --unit U`: one ffmpeg pass over the unit (watermarked encode or instant stream-copy when no watermark is set). It is skipped when nothing it reads changed.
-5. `aicn.py verify-render --unit U`, Stage 5 import with `--qa-timestamps` at cue midpoints, view the QA frames for watermark/visual sanity, `verify_stage_5.py`.
-6. `aicn.py log --unit U --kind fix --message "<what> (<why>) -> rerun: <stages>"`.
+## 5. Audio: dub over the film, never instead of it (`v3.0.0`)
 
-Undo is free: the old text restores the old key, and the cached TTS segment is restored.
+Full design, parameters, and tuning: `references/audio_mix.md`.
 
-## 5. Dub + Watermark + Translate Only (v2.0.0)
+- **Indivisible Utterances (Zero Mid-Word Chopping):** Adjacent same-speaker comma-chained clauses are merged ONLY when truly continuous (`gap <= 0.12s`, `<= 3` clauses, `span <= 4.5s`). Each utterance is synthesized once, trimmed (`5ms` guard + `10ms` cosine fade), stretched ONCE intact via `rubberband -3 -F -q` (`base_tempo = 1.08`, up to `1.28`, or `1.32` for `<= 2`-syl interjections) into elastic slack (`next_start - 0.05s`, max overhang `+1.20s`), and placed ONCE intact onto `dub_voice_48k.wav` (`media/tts_segments/utt_NNNN.wav`).
+- **Fail-Fast Before Mix:** Any genuine overflow aborts `cmd_dub` immediately (exit code `2`) with exact syllable-trim advice — zero wasted `mix`/`master` runs.
+- **Single-STFT + Clean Vocal Carving:** Demucs stems (`vocals.wav`, `accomp.wav`) are mandatory. One `torch.stft` (`scipy.fft` fallback) STFT per stem, C-speed chunked `follow_hold()`, and one combined `torch.istft` (`11.56s` / 10-min unit) duck `V` (`base_vocal_db = -10.0`, `speech_vocal_dip_db = -16.0` on `300 Hz–5 kHz` while active, clamped directly at `floor_vocal_db = -24.0` — never stacked) and `B` (`snr_bgm_db = 6.0`, `floor_bgm_db = -9.0`).
+- **Master & Listen:** `-14.0 ± 1.0 LUFS`, true peak `<= -0.8 dBFS`, 48 kHz 24-bit (`AAC 192k` in MP4). Spot-listen to at least one dubbed passage and one undubbed passage before release.
 
-`aicn v2.0.0` produces clean dubbed + watermarked video with an external `.srt` track — **no burned-in subtitle overlay, no Style-B pill plates, and no GaussianBlur hardsub masking**.
-- When `--brand-dir` (or `project_config.json["watermark"]`) is set, `render` composites the dual-corner PNGs (`13_top_left_logo_large.png` + `15_top_right_vietsub_floating.png`, scaled proportionally on portrait widths `< 1200`) via hardware `videotoolbox` (macOS), `nvenc` (NVIDIA GPU), or `libx264` (CPU fallback) with `-fps_mode passthrough -sn`.
-- When no watermark is configured, `render` stream-copies video (`-c:v copy -sn`) and muxes `master_audio_48k.wav` in seconds.
+## 6. Correctness rules (never traded for speed)
 
-## 6. Audio: dub over the film, never instead of it
+- Timeline truth is Whisper (`asr-4.0`) + acoustic waveform (`analyze_voice_waveform.py --snap-and-split`, `wf-4.0`), enforcing strict monotonic `0.0 <= start[i] < end[i] <= start[i+1] - 0.02` and `dur >= 0.15s`.
+- `verify-render` checks `.staging_render.mp4`, `h264`/`hevc` + `aac 48000 Hz stereo` + `0` subtitle streams (`-sn`), and `av_sync_and_frame_integrity` (`±0.30s` duration tol + exact source frame count via `-fps_mode passthrough`).
+- Changed renderer code → bump `FF_RENDERER_VERSION` in `aicn_platform.py`.
+- Viewing every extracted QA frame (`frames/qa/*.jpg`) via `read_file` for dual-corner watermark placement and visual sanity is mandatory.
 
-Full design, parameters and tuning: `references/audio_mix.md`.
+## 7. Production Time & Recursive Self-Improvement (RSI)
 
-- The original voice, music and effects stay in the master. Demucs stems are mandatory: `mix` stops if they are missing.
-- TTS reads whole sentences (comma-chained clauses of one speaker are merged), because short fragments come out with wrong tones.
-- Speed: rubberband R3 with formants preserved, `base_tempo` 1.10, up to 1.25 to fit. Never `atempo`: it doubled the word error rate.
-- Mix: 12 bands, about 10 ms frames. The original is turned down only in bands where the dub is active, only enough for the dub to be 10 dB above the voice and 6 dB above the music, never below its floor (voice -18 dB, music -9 dB).
-- Master: -14 LUFS, -1 dBTP, 48 kHz, 24-bit. Delivered as AAC 192k.
-- Listen to at least one dubbed passage and one passage without dub before release. Numbers do not catch a voice that sounds wrong.
-
-## 7. Correctness rules (never traded for speed)
-
-- Timeline truth is Whisper + acoustic waveform (`analyze_voice_waveform.py --snap-and-split`), then re-validate.
-- `verify-render` / `verify-overlay` checks staging MP4 presence, `h264`/`hevc` + `aac 48000Hz stereo` + `0` subtitle streams (`-sn`), and `av_sync_and_frame_integrity` (duration & frame count match source).
-- The render keeps every source frame with its own timestamp (`-fps_mode passthrough`), so the output has the source frame count and audio cannot drift. Check the frame count after a render.
-- Changed renderer code → bump `FF_RENDERER_VERSION` in `aicn.py`.
-- Viewing each extracted QA frame (`frames/qa/*.jpg`) for watermark placement and visual sanity is mandatory.
-
-## 8. How long a video takes
-
-Measured numbers and the formula: `references/production_time.md`.
-Rule of thumb for one 10-episode unit (≈ 10 min, 1080p30, Apple Silicon) is in its first table.
-
-## 9. Recursive Self-Improvement (RSI)
-
-Full protocol: `references/recursive_self_improvement.md`. Live ledger: `LESSONS.md`.
-Whenever an upstream API breaks, a QA gate fails, the user corrects an output/workflow, or a full series finishes:
-1. **Detect & Measure:** Log exact error/metric (`Measured` vs `Assumed` vs `Unknown`) as `L-NNN` in `LESSONS.md`.
-2. **Codify into Guardrails:** Turn every lesson into code (`scripts/`), a regression test (`tests/`), or a hard contract/Red Flag in `SKILL.md` — never prose-only promises.
-3. **Verify & Bump:** Run the full `unittest` suite + live smoke test, update `CHANGELOG.md`, commit, and tag `skills/aicn`.
+- Measured `v3.0.0` speeds and full-series timing: `references/production_time.md`.
+- RSI protocol: `references/recursive_self_improvement.md`. Live ledger: `LESSONS.md`.
+  1. **Detect & Measure** (`Measured` vs `Assumed` vs `Unknown`) → log `L-NNN` in `LESSONS.md`.
+  2. **Codify into Guardrails** (code + `unittest` + hard gate/contract — never prose-only).
+  3. **Verify & Bump** (`unittest` + smoke test + `CHANGELOG.md`).
 
 ## Common mistakes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `plan` says the source changed | `master_source.mp4` was rebuilt | re-run Stage 1 for this unit, then downstream |
-| Final has only the dub voice, no film sound | old `assemble_master_audio.py` with no Demucs stem | use `aicn_audio.py all`; its gate checks `original_present` |
-| Dub sounds slurred or robotic on some lines | `atempo` speed-up, or a 2–4 syllable clause read alone | `aicn_audio.py dub` (sentences + rubberband) |
-| `OVERFLOW` in `dub` | sentence too long even at 1.25× | shorten `tts_text` of those ids in Stage 2 |
-| Hiss between dubbed words | TTS noise floor raised by the level match | keep the expander (`expander_*` in `audio_mix.json`) |
-| `frames/qa/` has stale frames | leftovers from an older render | only `data/04_qa_frames_manifest.json` counts |
-| `discover` shows `x` | gate signed, media deleted | restore media (verify sha256 against `00_episodes_manifest.json`), re-run that stage |
-| A gate blocks after editing a JSON | gates hash their artifacts | re-run that stage's validator; never edit `.cicd/` |
+| `plan` says the source changed | `master_source.mp4` was rebuilt | Re-run Stage 1 for this unit, then downstream |
+| `cmd_dub` exits 2 with `OVERFLOW` | Utterance exceeds elastic window even at `1.28x`/`1.32x` | Shorten `tts_text` of offending IDs in `02_bilingual_script.json`, re-run `validate_bilingual_script.py`, re-run `dub` |
+| `dub_intelligible` FAIL in `cmd_verify` | Active-frame `dub_snr_speech_db_p10 < 4.0 dB` or `median < 10.0 dB` | Check `03_mix_stats.json`; ensure `base_vocal_db <= -10.0`, `speech_vocal_dip_db <= -16.0`, `snr_vocal_db >= 14.0` |
+| `frames/qa/` has stale frames | Leftovers from an older render | Only `data/04_qa_frames_manifest.json` counts |
+| `discover` shows `x` | Gate signed, media deleted | Restore media (verify sha256 against `00_episodes_manifest.json`), re-run that stage |
+| A gate blocks after editing a JSON | Gates hash their artifacts | Re-run that stage's validator; never edit `.cicd/` manually |
 
 ## Red flags (stop)
 
 - "Re-run the whole pipeline to be safe" → run `plan`; render only what it lists.
 - "Whisper again, the text changed" → text edits never touch Stage 1.
-- "Tick the CHECKLIST box now, run the gate later" → tick after PASS.
-- "CV check passed, skip viewing frames" → view them.
+- "Tick the CHECKLIST box now, run the gate later" → tick only after `PASS`.
+- "Automated checks passed, skip viewing frames" → inspect every frame via `read_file`.
 - "Rights later" → `init-series` will not run without `--rights`.
-- "No stems, just mix the dub alone" → that is the bug that removed the film sound. Run `separate`.
-- "Speed it up with atempo" → rubberband only.
-- "Render frames in Python, it is more flexible" → ffmpeg one pass; Python draws PNGs only.
-- "faster-whisper is what the script used" → run `doctor`; on Apple Silicon use MLX.
-- "Upload one unit/batch as a standalone episode" → never. `units/` are internal working batches; every published video must be the full series assembled by `aicn.py merge-series`.
-- "Skip dubbing (`sub_only`) to hit a time target" → never. Every full-series release requires complete Vietnamese dubbing + subtitles.
-- "Use `ohg` / `openhongguo` to download" → retired and deleted; always use `hg_tool.cjs` (Hongguo) or `dy_tool.py` (Douyin).
-- "Skip `check-upstream` or hardcode Hongguo private API routes / SDK internals" → forbidden. `hg_tool.cjs` is strictly a thin wrapper over `jackotom/hongguo-drama`; always run `node <skill>/scripts/hg_tool.cjs check-upstream [--sync]` to verify the latest upstream release and live `src/native/` API surface before sourcing or downloading.
-- "Grab Chinese dramas from YouTube or search in Vietnamese/English first" → forbidden. YouTube is recap/re-up. Search in Chinese and acquire only from Hongguo, Douyin, Bilibili, Hema, or Kuaishou.
-- "Present a candidate list with only Chinese titles or without thumbnails" → never. Always include Vietnamese title, Vietnamese synopsis, `--series-slug`, recency/trend signal, and embedded local `.jpg` covers.
-- "I'll remember not to make that mistake next time" → never prose-only; log `L-NNN` in `LESSONS.md` and codify into code, tests, or a hard gate.
+- "No stems, just mix the dub alone" → Demucs stems are mandatory; run `aicn_audio.py separate`.
+- "Speed it up with FFmpeg audio tempo filters" → `rubberband` R3 (`-3 -F -q`) only.
+- "Wait for all 13 units to finish Stage 2 before starting Stage 3" → stream ready units immediately via `--units`.
+- "Upload one unit/batch as a standalone episode or ship subtitle-only video" → never. Every published release is 1 full series with full Vietnamese dubbing (`merge-series`).
+- "Skip `check-upstream` or hardcode Hongguo private API routes / SDK internals" → forbidden; always run `hg_tool.cjs check-upstream [--sync]` first.
+- "Grab Chinese dramas from YouTube or search in Vietnamese/English first" → forbidden; use original CN platforms (Hongguo, Douyin, Bilibili, Hema, Kuaishou) or `dd_tool.py` for English sources (`--source-lang en`).
+- "Present a candidate list without Vietnamese title, synopsis, slug, or thumbnails" → never.
+- "I'll remember not to make that mistake next time" → never prose-only; log `L-NNN` in `LESSONS.md` and codify into code, tests, or gates.
 
-References: `references/sourcing_and_analytics.md`, `references/recursive_self_improvement.md`, `references/stages.md`, `references/audio_mix.md`, `references/folder_contract.md`,
-`references/incremental_build.md`, `references/production_time.md`, `LESSONS.md`.
+References: `references/stages.md`, `references/audio_mix.md`, `references/folder_contract.md`, `references/incremental_build.md`, `references/production_time.md`, `references/sourcing_and_analytics.md`, `references/poster_and_caption_guide.md`, `references/recursive_self_improvement.md`, `LESSONS.md`.

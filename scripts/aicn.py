@@ -1,36 +1,34 @@
 #!/usr/bin/env python3
 """
-aicn.py - incremental build engine for the AICN drama re-up / dub + watermark pipeline (v2.0.0).
+aicn.py - incremental build engine for the AICN v3.0.0 drama re-up / dub + watermark pipeline.
 
-Wraps the existing Antigravity stage skills (video-localization-orchestrator,
+Wraps the Antigravity stage skills (video-localization-orchestrator,
 video-asr-visual-audit, zh-vi-script-adapter, vieneu-voice-pacing-mixer,
-video-localization-qa-review) and adds:
+video-localization-qa-review) and provides:
 
+  doctor          probe local hardware (CUDA/Metal/CPU, NVENC/VideoToolbox, tools) -> config/machine.json
   discover        read a root folder: series hubs, units, gate status, progress
   init-series     scaffold a Series Hub (CHANGELOG, PROGRESS, bible, inbox, units)
+  update-series   update series_slug, title_vi, title_zh in a Series Hub
   adopt           add the incremental layer to a unit made by init_workspace.py
-  plan            dry-run: whether the dub+watermark render is current or stale
-  tts-sync        content-addressed TTS cache around synthesize_and_audit_pacing.py
-  render          mux source video + 48kHz master audio + optional dual-corner
-                  watermark (--brand-dir) -> media/.staging_render.mp4
-  verify-overlay  Stage 4 gate (alias: verify-render): A/V sync, codec/audio
-                  compliance, and frame integrity on media/.staging_render.mp4
+  plan            dry-run: whether Stage 1 or Stage 4 render is current or stale
+  render          fast one-pass hardware render (cached tight-strip RGBA watermark + audio) -> media/.staging_render.mp4
+  verify-render   Stage 4 gate (alias: verify-overlay): A/V sync, codec/audio compliance, frame integrity
+  run-series      warm multi-unit batch prep/produce pipeline with parallel CPU & lock-free NVENC
   merge-series    concatenate all verified units into 1 full-series MP4 + SRT
   brand-poster    rename, resize, optionally de-star & dual-corner brand a poster
+  clean           safely prune heavy regenerable intermediates after final MP4 exists
   progress        rebuild the hub PROGRESS.md table
   log             append a line to CHANGELOG.md and refresh PROGRESS.md
-
-Nothing here re-runs Whisper / Demucs. Stage 1 outputs are frozen unless the
-source hash changes (see `plan`).
 """
 import argparse
 import glob
-import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -42,8 +40,8 @@ import aicn_platform as ap  # noqa: E402
 SKILL_DIR = os.path.normpath(os.path.join(HERE, ".."))
 VENDOR = os.path.join(SKILL_DIR, "vendor")
 
-FF_RENDERER_VERSION = "v2-dub-wm-2.0"
-TTS_ENGINE_TAG = "vieneu-v3-turbo-48k"
+FF_RENDERER_VERSION = ap.FF_RENDERER_VERSION
+TTS_ENGINE_TAG = ap.TTS_ENGINE_TAG
 ENCODE_PRESETS = ("h264", "hevc", "h264_high")
 
 
@@ -75,8 +73,37 @@ def resolve_watermark(ws, brand_dir=None, width=1920):
         sys.exit(f"[aicn] --brand-dir missing 13_top_left_logo_large.png or 15_top_right_vietsub_floating.png in {bd}")
     cfg = jload(os.path.join(ws, "config", "project_config.json"), {}) or {}
     wm = cfg.get("watermark") or {}
-    tl, tr = wm.get("top_left_logo", ""), wm.get("top_right_badge", "")
-    if wm.get("enabled") and tl and tr and os.path.exists(tl) and os.path.exists(tr):
+    if not wm.get("enabled"):
+        return None
+
+    def _find_brand_asset(stored_p, fname):
+        if stored_p:
+            cand = stored_p if os.path.isabs(stored_p) else os.path.normpath(os.path.join(ws, stored_p))
+            if os.path.exists(cand):
+                return cand
+        hub = resolve_unit_hub(ws, cfg)
+        fallback_dirs = []
+        if wm.get("brand_dir"):
+            bd_stored = wm["brand_dir"]
+            bd_cand = bd_stored if os.path.isabs(bd_stored) else os.path.normpath(os.path.join(ws, bd_stored))
+            fallback_dirs.append(bd_cand)
+            if hub:
+                fallback_dirs.append(os.path.join(os.path.dirname(hub), os.path.basename(bd_stored)))
+        if hub:
+            fallback_dirs.append(os.path.join(os.path.dirname(hub), "branding-dau-do"))
+        proj = ap.find_project_root(ws)
+        if proj is not None:
+            fallback_dirs.append(str(proj / "workspace" / "branding-dau-do"))
+        for d in fallback_dirs:
+            if d:
+                c = os.path.join(d, fname)
+                if os.path.exists(c):
+                    return c
+        return ""
+
+    tl = _find_brand_asset(wm.get("top_left_logo", ""), "13_top_left_logo_large.png")
+    tr = _find_brand_asset(wm.get("top_right_badge", ""), "15_top_right_vietsub_floating.png")
+    if tl and tr and os.path.exists(tl) and os.path.exists(tr):
         return _spec(
             tl,
             tr,
@@ -101,39 +128,10 @@ def jload(p, default=None):
 
 
 def jdump(p, obj):
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, p)
+    ap.atomic_write_json(p, obj)
 
 
-def h_obj(obj):
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-
-
-class FastHash:
-    """sha256 with a (size, mtime_ns) stat cache so big media is hashed once."""
-
-    def __init__(self, ws):
-        self.path = os.path.join(ws, ".cache", "stat_hash.json")
-        self.db = jload(self.path, {})
-
-    def __call__(self, p):
-        st = os.stat(p)
-        k = os.path.abspath(p)
-        rec = self.db.get(k)
-        if rec and rec["size"] == st.st_size and rec["mtime_ns"] == st.st_mtime_ns:
-            return rec["sha256"]
-        h = hashlib.sha256()
-        with open(p, "rb") as f:
-            for b in iter(lambda: f.read(1 << 20), b""):
-                h.update(b)
-        self.db[k] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": h.hexdigest()}
-        return self.db[k]["sha256"]
-
-    def save(self):
-        jdump(self.path, self.db)
+h_obj = ap.hash_obj
 
 
 def cicd():
@@ -144,7 +142,8 @@ def cicd():
              os.path.join(os.getcwd(), ".agents/skills/video-localization-orchestrator/scripts")]
     for c in cands:
         if c and os.path.exists(os.path.join(c, "cicd_gate.py")):
-            sys.path.insert(0, c)
+            if c not in sys.path:
+                sys.path.insert(0, c)
             import cicd_gate  # noqa
             return cicd_gate
     sys.exit("[aicn] cicd_gate.py not found; set AICN_CICD_DIR")
@@ -159,10 +158,15 @@ def is_hub(d):
 
 
 def resolve_unit_hub(ws, cfg=None):
-    """Return active Series Hub directory for a unit, falling back to parent-of-units if hub was renamed."""
+    """Return active Series Hub directory for a unit (relocation-safe relative -> legacy abs -> parent-of-units)."""
     cfg = cfg if cfg is not None else (jload(os.path.join(ws, "config", "project_config.json"), {}) or {})
+    hub_rel = cfg.get("series_hub_rel") or ""
+    if hub_rel:
+        cand_rel = os.path.abspath(os.path.join(ws, hub_rel))
+        if os.path.isdir(cand_rel) and is_hub(cand_rel):
+            return cand_rel
     hub = cfg.get("series_hub_dir") or ""
-    if hub and os.path.isdir(hub):
+    if hub and os.path.isdir(hub) and is_hub(hub):
         return hub
     cand = os.path.dirname(os.path.dirname(os.path.abspath(ws)))
     if os.path.basename(os.path.dirname(os.path.abspath(ws))) == "units" and is_hub(cand):
@@ -215,7 +219,10 @@ def cmd_discover(a):
             if len(gs) >= 6 and gs[5] == "P":
                 n_pass += 1
             adopted = os.path.exists(os.path.join(u, ".cache", "build_state.json")) or os.path.exists(os.path.join(u, "CHECKLIST.md"))
-            final = glob.glob(os.path.join(u, "media", "final_*_vi.mp4")) + glob.glob(os.path.join(u, "deliverables", "16x9", "*.mp4"))
+            final = [
+                p for p in glob.glob(os.path.join(u, "media", "final_*_vi.mp4"))
+                if not os.path.basename(p).startswith(".")
+            ] or glob.glob(os.path.join(u, "deliverables", "16x9", "*.mp4"))
             print(f"  {os.path.basename(u):28s} {gs:10s}  {'yes' if adopted else 'no ':3s}      {'yes' if final else 'no'}")
         full_mp4 = os.path.join(hub, "deliverables", f"final_{os.path.basename(hub)}_full_vi.mp4")
         if os.path.exists(full_mp4):
@@ -262,7 +269,6 @@ def _sync_series_manifest(hub, series_slug, title_vi="", title_zh="", scfg=None)
     scfg = scfg if scfg is not None else (jload(os.path.join(hub, "config", "series_config.json"), {}) or {})
     genre = scfg.get("genre", "short-drama")
     mode = scfg.get("localization_mode", "voice_dub")
-    formats = ", ".join(scfg.get("export_formats") or ["16x9"])
     units = [u for u in sorted(glob.glob(os.path.join(hub, "units", "*"))) if is_unit(u)]
     rows = []
     for u in units:
@@ -273,10 +279,10 @@ def _sync_series_manifest(hub, series_slug, title_vi="", title_zh="", scfg=None)
         status = "READY (Stage 5 PASS)" if (len(gs) >= 6 and gs[5] == "P") else f"GATES:{gs}"
         rows.append(
             f"| `{uslug}` | `series_episodic` | `{n_eps or '?'}` | `{status}` | "
-            f"`deliverables/16x9/final_{uslug}_vi.mp4` | `deliverables/9x16/final_{uslug}_vi_9x16.mp4` | `deliverables/subtitles/{uslug}_vi.srt` |"
+            f"`units/{uslug}/media/final_{uslug}_vi.mp4` | `units/{uslug}/data/subtitles_full.srt` |"
         )
     if not rows:
-        rows.append("| _pending_ | `series_episodic` | `-` | `PENDING` | `-` | `-` | `-` |")
+        rows.append("| _pending_ | `series_episodic` | `-` | `PENDING` | `-` | `-` |")
     manifest_p = os.path.join(hub, "00_series_manifest.md")
     lines = [
         f"# Series Hub Manifest: `{series_slug}`",
@@ -284,15 +290,13 @@ def _sync_series_manifest(hub, series_slug, title_vi="", title_zh="", scfg=None)
         f"- **Series Slug:** `{series_slug}`",
         f"- **Title (VI):** {title_vi or series_slug}",
         f"- **Title (ZH):** {title_zh or '_unspecified_'}",
-        f"- **Series Root:** `{hub}`",
         f"- **Genre:** `{genre}`",
-        f"- **Default Localization Mode:** `{mode}`",
-        f"- **Default Export Formats:** `{formats}`",
+        f"- **Localization Mode:** `{mode}`",
         "- **Shared Series Bible:** `config/series_bible.json`",
         "",
-        "## Working Units / Episodes Registry",
-        "| Unit Slug | Topology | Episodes | Stage Status | 16:9 Deliverable | 9:16 Deliverable | SRT Deliverable |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        "## Working Units Registry",
+        "| Unit Slug | Topology | Episodes | Stage Status | Batch MP4 | Batch SRT |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
         *rows,
         "",
     ]
@@ -323,8 +327,7 @@ def cmd_init_series(a):
     title_vi = getattr(a, "title_vi", "") or a.title or ""
     title_zh = getattr(a, "title_zh", "") or ""
     hub = os.path.abspath(os.path.join(a.workspace_root, a.series_slug))
-    for d in ("config", "source_inbox", "units", "deliverables/16x9", "deliverables/9x16",
-              "deliverables/subtitles", "deliverables/episodes", "posters", ".cache/tts"):
+    for d in ("config", "source_inbox", "units", "deliverables/subtitles", "posters", ".cache"):
         os.makedirs(os.path.join(hub, d), exist_ok=True)
     kw = dict(series=a.series_slug, title=title_vi or a.series_slug, date=now(), total=a.total_episodes,
               unit_size=a.unit_size, rights=a.rights)
@@ -334,13 +337,13 @@ def cmd_init_series(a):
         {"series": a.series_slug, "basis": a.rights, "proof": "", "platforms_allowed": [], "content_id_risk": "unknown"},
         ensure_ascii=False, indent=2))
     write_if_absent(os.path.join(hub, "config", "series_bible.json"), json.dumps(
-        {"series_slug": a.series_slug, "source_language": getattr(a, "source_lang", "zh"),
+        {"schema_version": "3.0", "series_slug": a.series_slug, "source_language": getattr(a, "source_lang", "zh"),
          "title_zh": title_zh, "title_vi": title_vi, "characters": [],
          "pronoun_matrix": [], "glossary": [], "voices": {}},
         ensure_ascii=False, indent=2))
     scfg_p = os.path.join(hub, "config", "series_config.json")
-    scfg = {"schema_version": "2.0", "series_slug": a.series_slug, "title_vi": title_vi, "title_zh": title_zh,
-            "genre": "short-drama", "localization_mode": "voice_dub", "export_formats": ["16x9"], "updated_at": now()}
+    scfg = {"schema_version": "3.0", "series_slug": a.series_slug, "title_vi": title_vi, "title_zh": title_zh,
+            "genre": "short-drama", "localization_mode": "voice_dub", "updated_at": now()}
     write_if_absent(scfg_p, json.dumps(scfg, ensure_ascii=False, indent=2))
     if not os.path.exists(os.path.join(hub, "00_series_manifest.md")):
         _sync_series_manifest(hub, a.series_slug, title_vi=title_vi, title_zh=title_zh, scfg=scfg)
@@ -411,13 +414,13 @@ def cmd_update_series(a):
     bible["title_zh"] = new_zh
     jdump(bible_p, bible)
 
-    scfg.setdefault("schema_version", "2.0")
+    scfg["schema_version"] = "3.0"
     scfg["series_slug"] = new_slug
     scfg["title_vi"] = new_vi
     scfg["title_zh"] = new_zh
     scfg.setdefault("genre", "short-drama")
-    scfg.setdefault("localization_mode", "voice_dub")
-    scfg.setdefault("export_formats", ["16x9"])
+    scfg["localization_mode"] = "voice_dub"
+    scfg.pop("export_formats", None)
     scfg["updated_at"] = now()
     jdump(scfg_p, scfg)
 
@@ -441,7 +444,8 @@ def cmd_update_series(a):
                 pc_p = os.path.join(u, "config", "project_config.json")
                 pc = jload(pc_p, {}) or {}
                 pc["series_slug"] = new_slug
-                pc["series_hub_dir"] = hub
+                pc["series_hub_rel"] = ap.normalize_rel_path(hub, u)
+                pc.pop("series_hub_dir", None)
                 jdump(pc_p, pc)
                 vp_p = os.path.join(u, "data", "00_video_profile.json")
                 if os.path.exists(vp_p):
@@ -483,15 +487,14 @@ def cmd_adopt(a):
     if not is_unit(ws):
         sys.exit(f"[adopt] {ws} has no config/project_config.json - run init_workspace.py first")
     cfg = jload(os.path.join(ws, "config", "project_config.json"))
-    for d in (".cache/tts",):
-        os.makedirs(os.path.join(ws, d), exist_ok=True)
+    os.makedirs(os.path.join(ws, ".cache"), exist_ok=True)
     kw = dict(unit=cfg.get("slug", os.path.basename(ws)), series=cfg.get("series_slug", ""), date=now(),
               mode=cfg.get("localization_mode", "voice_dub"))
     write_if_absent(os.path.join(ws, "CHECKLIST.md"), render_tpl("CHECKLIST.md", **kw))
     write_if_absent(os.path.join(ws, "CHANGELOG.md"), render_tpl("UNIT_CHANGELOG.md", **kw))
     state_p = os.path.join(ws, ".cache", "build_state.json")
     if not os.path.exists(state_p):
-        jdump(state_p, {"created": now(), "tts": {}, "stage1_key": None})
+        jdump(state_p, {"created": now(), "stage1_key": None})
         print(f"  create  {state_p}")
     print("[adopt] done.")
 
@@ -510,41 +513,68 @@ def load_unit(ws):
     return prof, eps, cues, cfg
 
 
-def stage1_key(ws, fh):
+def _resolve_unit_asr_meta(ws, cfg=None):
+    cfg = cfg if cfg is not None else (jload(os.path.join(ws, "config", "project_config.json"), {}) or {})
+    asr_cache = jload(os.path.join(ws, ".cache", "stage1_asr_cache.json"), {}) or {}
+    model = asr_cache.get("model") or os.environ.get("AICN_WHISPER_MODEL", "large-v3")
+    src_lang = asr_cache.get("source_lang") or cfg.get("source_language")
+    if not src_lang:
+        bible = jload(os.path.join(ws, "config", "series_bible.json"), {}) or {}
+        src_lang = bible.get("source_language") or "zh"
+    return str(model), str(src_lang)
+
+
+def stage1_key(ws, model=None, source_lang=None):
     src = os.path.join(ws, "source", "master_source.mp4")
-    asr_engine = ap.detect_asr_backend()["engine"]
-    asr_tag = "mlx-whisper" if asr_engine == "mlx" else asr_engine
-    return h_obj({"src": fh(src) if os.path.exists(src) else None, "asr": asr_tag})
+    voc = os.path.join(ws, "media", "stems", "vocals.wav")
+    det_model, det_lang = _resolve_unit_asr_meta(ws)
+    return ap.stage1_asr_key(
+        ap.content_sha256(src),
+        ap.content_sha256(voc),
+        model or det_model,
+        source_lang or det_lang,
+    )
 
 
-def ff_render_key(ws, fh, enc=None, wm=None):
+def ff_render_key(ws, enc=None, wm=None, width=1920, height=1080):
     enc = enc or resolve_encode({})
     src = os.path.join(ws, "source", "master_source.mp4")
     audio = os.path.join(ws, "media", "master_audio_48k.wav")
+    src_sha = ap.content_sha256(src) if os.path.exists(src) else "NO_SOURCE"
+    audio_sha = ap.content_sha256(audio) if os.path.exists(audio) else None
     wm_key = None
     if wm:
-        wm_key = {"tl": fh(wm["tl"])[:16], "tr": fh(wm["tr"])[:16],
-                  "scale": wm.get("scale", 1.0),
-                  "pos": [wm["tl_x"], wm["tl_y"], wm["tr_mx"], wm["tr_y"]]}
+        tl_sha = ap.content_sha256(wm["tl"])
+        tr_sha = ap.content_sha256(wm["tr"])
+        wm_key = ap.wm_overlay_key(
+            width,
+            height,
+            tl_sha,
+            tr_sha,
+            wm.get("scale", 1.0),
+            [wm["tl_x"], wm["tl_y"], wm["tr_mx"], wm["tr_y"]],
+        )
+    enc_effective = enc if wm else {"vcodec": "copy"}
+    key = ap.render_key(src_sha, audio_sha, wm_key, enc_effective)
     parts = {
         "wm": wm_key,
-        "src": fh(src) if os.path.exists(src) else "NO_SOURCE",
-        "audio": fh(audio) if os.path.exists(audio) else None,
-        "enc": enc if wm else {"vcodec": "copy"},
+        "src": src_sha,
+        "audio": audio_sha,
+        "enc": enc_effective,
         "v": FF_RENDERER_VERSION,
     }
-    return parts, h_obj(parts)
+    return parts, key
 
 
 def cmd_plan(a, quiet=False):
     ws = os.path.abspath(a.unit)
-    fh = FastHash(ws)
     prof, eps, cues, cfg = load_unit(ws)
-    state = jload(os.path.join(ws, ".cache", "build_state.json"), {"tts": {}})
+    state = jload(os.path.join(ws, ".cache", "build_state.json"), {}) or {}
     enc = resolve_encode(cfg, getattr(a, "codec", None), getattr(a, "quality", None))
     W = int(prof.get("width", 1920))
+    H = int(prof.get("height", 1080))
     wm = resolve_watermark(ws, getattr(a, "brand_dir", None), width=W)
-    parts, key = ff_render_key(ws, fh, enc, wm)
+    parts, key = ff_render_key(ws, enc, wm, width=W, height=H)
     prev = state.get("render", {})
     staging = os.path.exists(os.path.join(ws, "media", ".staging_render.mp4"))
     if prev.get("key") == key and staging:
@@ -552,7 +582,7 @@ def cmd_plan(a, quiet=False):
     else:
         changed = [k for k, v in parts.items() if prev.get("parts", {}).get(k) != h_obj(v)] if prev else ["new"]
         why, dirty = "stale: " + ",".join(changed or ["staging missing"]), ["unit"]
-    s1 = stage1_key(ws, fh); fh.save()
+    s1 = stage1_key(ws)
     if not quiet:
         print(f"[plan] unit={os.path.basename(ws)} engine=ffmpeg render={why} wm={'on' if wm else 'off'}")
         print("  !! source changed since Stage 1 -> Stage 1 must be re-run for this unit"
@@ -561,50 +591,7 @@ def cmd_plan(a, quiet=False):
     return dirty
 
 
-# ----------------------------------------------------------------- TTS cache
-def tts_key(item, default_voice):
-    return h_obj({"t": item.get("tts_text", ""), "v": item.get("voice") or default_voice, "e": TTS_ENGINE_TAG})
-
-
-def cmd_tts_sync(a):
-    ws = os.path.abspath(a.unit)
-    script = jload(os.path.join(ws, "data", "02_bilingual_script.json"), [])
-    wav_dir = os.path.join(ws, "media", "tts_segments")
-    cache = os.path.join(ws, ".cache", "tts")
-    os.makedirs(wav_dir, exist_ok=True)
-    os.makedirs(cache, exist_ok=True)
-    idx_p = os.path.join(ws, ".cache", "tts_index.json")
-    index = jload(idx_p, {})
-    kept = restored = stale = stored = 0
-    for i, item in enumerate(script):
-        k = tts_key(item, a.voice)
-        seg = os.path.join(wav_dir, f"seg_{i:04d}.wav")
-        cpath = os.path.join(cache, k + ".wav")
-        if a.store:
-            if os.path.exists(seg) and not os.path.exists(cpath):
-                shutil.copy2(seg, cpath); stored += 1
-            if os.path.exists(seg):
-                index[str(i)] = k
-            continue
-        if os.path.exists(seg) and index.get(str(i)) == k:
-            kept += 1
-        elif os.path.exists(cpath):
-            shutil.copy2(cpath, seg); index[str(i)] = k; restored += 1
-        elif os.path.exists(seg):
-            os.remove(seg); index.pop(str(i), None); stale += 1
-    for extra in glob.glob(os.path.join(wav_dir, "seg_*.wav")):
-        n = int(os.path.basename(extra)[4:8])
-        if n >= len(script):
-            os.remove(extra); index.pop(str(n), None); stale += 1
-    jdump(idx_p, index)
-    if a.store:
-        print(f"[tts-sync --store] cached {stored} new wavs")
-    else:
-        missing = sum(1 for i in range(len(script)) if not os.path.exists(os.path.join(wav_dir, f"seg_{i:04d}.wav")))
-        print(f"[tts-sync] kept={kept} restored_from_cache={restored} removed_stale={stale} to_synthesize={missing}")
-
-
-# ----------------------------------------------------------------- media helpers & renderer
+# ----------------------------------------------------------------- media helpers & fast Stage 4 renderer
 def ffprobe_duration(p):
     return float(subprocess.run([ap.find_tool("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p],
                                 capture_output=True, text=True).stdout.strip() or 0)
@@ -643,71 +630,166 @@ def resolve_fps(ws, prof):
     return 30
 
 
+def build_cached_watermark_strip(wm, width, height):
+    """Pre-composite dual-corner branding ONCE into a tight top-band RGBA PNG cached globally by content hash."""
+    from PIL import Image
+
+    tl_sha = ap.content_sha256(wm["tl"])
+    tr_sha = ap.content_sha256(wm["tr"])
+    pos = [int(wm["tl_x"]), int(wm["tl_y"]), int(wm["tr_mx"]), int(wm["tr_y"])]
+    sc = float(wm.get("scale", 1.0))
+    wm_key = ap.wm_overlay_key(width, height, tl_sha, tr_sha, sc, pos)
+    overlay_png = ap.global_cache_path("wm_overlay", wm_key, ".png")
+    if os.path.exists(overlay_png):
+        return overlay_png, wm_key
+
+    with Image.open(wm["tl"]) as _tl, Image.open(wm["tr"]) as _tr:
+        tl_im = _tl.convert("RGBA")
+        tr_im = _tr.convert("RGBA")
+
+    if sc < 0.999:
+        tl_w = max(2, int(round(tl_im.width * sc / 2.0)) * 2)
+        tl_h = max(2, int(round(tl_im.height * sc / 2.0)) * 2)
+        tr_w = max(2, int(round(tr_im.width * sc / 2.0)) * 2)
+        tr_h = max(2, int(round(tr_im.height * sc / 2.0)) * 2)
+        tl_im = tl_im.resize((tl_w, tl_h), Image.LANCZOS)
+        tr_im = tr_im.resize((tr_w, tr_h), Image.LANCZOS)
+
+    tl_x, tl_y, tr_mx, tr_y = pos
+    raw_band_h = max(tl_y + tl_im.height, tr_y + tr_im.height) + 8
+    band_h = min(int(height), raw_band_h + (raw_band_h % 2))
+    band_h = max(2, band_h - (band_h % 2))
+
+    canvas = Image.new("RGBA", (int(width), band_h), (0, 0, 0, 0))
+    dx_tl, dy_tl = max(0, tl_x), max(0, tl_y)
+    if dx_tl < int(width) and dy_tl < band_h:
+        tl_crop = tl_im.crop((0, 0, min(tl_im.width, int(width) - dx_tl), min(tl_im.height, band_h - dy_tl)))
+        if tl_crop.width > 0 and tl_crop.height > 0:
+            canvas.alpha_composite(tl_crop, (dx_tl, dy_tl))
+    dx_tr = max(0, int(width) - tr_im.width - tr_mx)
+    dy_tr = max(0, tr_y)
+    if dx_tr < int(width) and dy_tr < band_h:
+        tr_crop = tr_im.crop((0, 0, min(tr_im.width, int(width) - dx_tr), min(tr_im.height, band_h - dy_tr)))
+        if tr_crop.width > 0 and tr_crop.height > 0:
+            canvas.alpha_composite(tr_crop, (dx_tr, dy_tr))
+
+    tmp = f"{overlay_png}.{os.getpid()}.{threading.get_ident()}.png"
+    try:
+        canvas.save(tmp, "PNG")
+        for attempt in range(8):
+            try:
+                os.replace(tmp, overlay_png)
+                break
+            except PermissionError:
+                if os.path.exists(overlay_png):
+                    break
+                if attempt == 7:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return overlay_png, wm_key
+
+
 def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
-    """Mux source video + 48kHz master audio + optional dual-corner watermarks (or stream-copy video when no watermark)."""
+    """Mux source video + 48kHz master audio + optional cached tight-strip watermark (lock-free hardware encode)."""
     enc = enc or resolve_encode({})
     fps = resolve_fps(ws, prof)
     src_mp4 = os.path.join(ws, "source", "master_source.mp4")
     has_audio = os.path.exists(audio)
+    ff_bin = ap.find_tool("ffmpeg")
+    part_out = out + ".part.mp4"
 
-    cmd = [ap.find_tool("ffmpeg"), "-v", "error", "-y"]
     if wm:
-        cmd += ap.build_hwaccel_input_args(enc)
-        cmd += ["-i", src_mp4]
-        audio_idx = None
-        next_idx = 1
-        if has_audio:
-            cmd += ["-i", audio]
-            audio_idx = next_idx
-            next_idx += 1
-        cmd += ["-framerate", str(fps), "-loop", "1", "-i", wm["tl"],
-                "-framerate", str(fps), "-loop", "1", "-i", wm["tr"]]
-        tl_i, tr_i = next_idx, next_idx + 1
-        sc = float(wm.get("scale", 1.0))
-        if sc < 0.999:
-            fg = (
-                f"[{tl_i}:v]scale=trunc(iw*{sc:.3f}/2)*2:-1[tlw];"
-                f"[{tr_i}:v]scale=trunc(iw*{sc:.3f}/2)*2:-1[trw];"
-                f"[0:v][tlw]overlay={wm['tl_x']}:{wm['tl_y']}:shortest=1:format=auto[v1];"
-                f"[v1][trw]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:shortest=1:format=auto,format={enc['pix_fmt']}[v]"
-            )
+        W = int(prof.get("width") or 0)
+        H = int(prof.get("height") or 0)
+        if W <= 0 or H <= 0:
+            vs = next((s for s in ffprobe_streams(src_mp4) if s.get("codec_type") == "video"), {})
+            W = int(vs.get("width") or 1920)
+            H = int(vs.get("height") or 1080)
+        overlay_png, _ = build_cached_watermark_strip(wm, W, H)
+        filters = ap.probe_ffmpeg_filters(ff_bin)
+        use_cuda_overlay = (
+            enc.get("backend") == "nvenc"
+            and filters.get("overlay_cuda")
+            and filters.get("scale_cuda")
+            and filters.get("hwupload_cuda")
+            and os.environ.get("AICN_NO_CUDA_OVERLAY") != "1"
+        )
+
+        def _build_wm_cmd(cuda_mode):
+            c = [ff_bin, "-v", "error", "-y"]
+            if not cuda_mode:
+                c += ap.build_hwaccel_input_args(enc)
+            c += ["-i", src_mp4]
+            audio_idx = None
+            next_idx = 1
+            if has_audio:
+                c += ["-i", audio]
+                audio_idx = next_idx
+                next_idx += 1
+            wm_idx = next_idx
+            c += ["-i", overlay_png]
+            if cuda_mode:
+                # Omit -hwaccel_output_format cuda: NVDEC pads coded frames (e.g. 240->256, 1080->1088)
+                fg = (
+                    f"[0:v]format=yuv420p,hwupload_cuda[base];"
+                    f"[{wm_idx}:v]format=yuva420p,hwupload_cuda[wm];"
+                    f"[base][wm]overlay_cuda=0:0:eof_action=repeat[v]"
+                )
+            else:
+                fg = f"[0:v][{wm_idx}:v]overlay=0:0:eof_action=repeat:format=auto,format={enc['pix_fmt']}[v]"
+            c += ["-filter_complex", fg, "-map", "[v]"]
+            c += ["-map", f"{audio_idx}:a", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if audio_idx is not None else ["-an"]
+            c += ap.build_vcodec_args(enc)
+            c += ["-g", str(int(round(fps * 2))), "-fps_mode", "passthrough", "-sn", "-movflags", "+faststart", part_out]
+            return c
+
+        if use_cuda_overlay:
+            try:
+                subprocess.run(_build_wm_cmd(True), check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError:
+                if os.path.exists(part_out):
+                    try:
+                        os.remove(part_out)
+                    except OSError:
+                        pass
+                subprocess.run(_build_wm_cmd(False), check=True)
         else:
-            fg = (
-                f"[0:v][{tl_i}:v]overlay={wm['tl_x']}:{wm['tl_y']}:shortest=1:format=auto[v1];"
-                f"[v1][{tr_i}:v]overlay=W-w-{wm['tr_mx']}:{wm['tr_y']}:shortest=1:format=auto,format={enc['pix_fmt']}[v]"
-            )
-        cmd += ["-filter_complex", fg, "-map", "[v]"]
-        cmd += ["-map", f"{audio_idx}:a", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if audio_idx is not None else ["-an"]
-        cmd += ap.build_vcodec_args(enc)
-        cmd += ["-g", str(int(round(fps * 2))), "-fps_mode", "passthrough", "-sn", "-movflags", "+faststart", out + ".part.mp4"]
+            subprocess.run(_build_wm_cmd(False), check=True)
     else:
-        cmd += ["-i", src_mp4]
+        cmd = [ff_bin, "-v", "error", "-y", "-i", src_mp4]
         if has_audio:
             cmd += ["-i", audio, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
         else:
             cmd += ["-map", "0:v:0", "-an"]
-        cmd += ["-c:v", "copy", "-sn", "-shortest", "-movflags", "+faststart", out + ".part.mp4"]
+        cmd += ["-c:v", "copy", "-sn", "-shortest", "-movflags", "+faststart", part_out]
+        subprocess.run(cmd, check=True)
 
-    subprocess.run(cmd, check=True)
-    os.replace(out + ".part.mp4", out)
+    os.replace(part_out, out)
 
 
 def cmd_render(a):
     ws = os.path.abspath(a.unit)
     if not a.no_gate:
         cicd().require_gate(ws, 3)
-    fh = FastHash(ws)
     prof, eps, cues, cfg = load_unit(ws)
     enc = resolve_encode(cfg, getattr(a, "codec", None), getattr(a, "quality", None))
     W = int(prof.get("width", 1920))
+    H = int(prof.get("height", 1080))
     wm = resolve_watermark(ws, getattr(a, "brand_dir", None), width=W)
     audio = os.path.join(ws, "media", "master_audio_48k.wav")
-    parts, key = ff_render_key(ws, fh, enc, wm)
+    parts, key = ff_render_key(ws, enc, wm, width=W, height=H)
     out = os.path.join(ws, "media", ".staging_render.mp4")
-    state = jload(os.path.join(ws, ".cache", "build_state.json"), {"tts": {}})
+    state = jload(os.path.join(ws, ".cache", "build_state.json"), {}) or {}
     prev = state.get("render", {})
     if prev.get("key") == key and os.path.exists(out):
-        print("[render] unchanged -> staging is current"); fh.save(); return
+        print("[render] unchanged -> staging is current")
+        return
     t0 = time.time()
     if not wm:
         enc_desc = "stream-copy"
@@ -728,7 +810,6 @@ def cmd_render(a):
     state["last_render"] = {"at": now(), "rendered": 1, "reused": 0, "output": out,
                             "seconds": round(time.time() - t0, 1), "size_mb": round(sz_mb, 1)}
     jdump(os.path.join(ws, ".cache", "build_state.json"), state)
-    fh.save()
 
 
 # ----------------------------------------------------------------- Stage 4 gate (Dub + Watermark Render)
@@ -752,23 +833,29 @@ def cmd_verify_overlay(a):
         sv = next((s for s in stg_streams if s.get("codec_type") == "video"), {})
         sa = next((s for s in stg_streams if s.get("codec_type") == "audio"), {})
         ssub = [s for s in stg_streams if s.get("codec_type") == "subtitle"]
+        src_p = os.path.join(ws, "source", "master_source.mp4")
+        src_streams = ffprobe_streams(src_p) if os.path.exists(src_p) else []
+        src_v = next((s for s in src_streams if s.get("codec_type") == "video"), {})
+        src_a = next((s for s in src_streams if s.get("codec_type") == "audio"), {})
+
         v_codec = sv.get("codec_name", "")
         a_codec = sa.get("codec_name", "")
         a_sr = int(sa.get("sample_rate") or 0)
         a_ch = int(sa.get("channels") or 0)
+        target_w = int(prof.get("width") or src_v.get("width") or 0)
+        target_h = int(prof.get("height") or src_v.get("height") or 0)
+        out_w = int(sv.get("width") or 0)
+        out_h = int(sv.get("height") or 0)
+        dims_ok = (target_w <= 0 or target_h <= 0) or (out_w == target_w and out_h == target_h)
         has_master_audio = os.path.exists(os.path.join(ws, "media", "master_audio_48k.wav"))
         audio_ok = (a_codec == "aac" and a_sr == 48000 and a_ch == 2) if (sa or has_master_audio) else True
-        codec_ok = (v_codec in ("h264", "hevc")) and audio_ok and len(ssub) == 0
-        codec_detail = f"v={v_codec}, a={a_codec}({a_sr}Hz,{a_ch}ch), sub_streams={len(ssub)}"
+        codec_ok = (v_codec in ("h264", "hevc")) and audio_ok and len(ssub) == 0 and dims_ok
+        codec_detail = f"v={v_codec}({out_w}x{out_h}/{target_w}x{target_h}), a={a_codec}({a_sr}Hz,{a_ch}ch), sub_streams={len(ssub)}"
 
         v_dur = float(sv.get("duration") or 0.0)
         a_dur = float(sa.get("duration") or v_dur)
         v_st = float(sv.get("start_time") or 0.0)
         a_st = float(sa.get("start_time") or 0.0)
-        src_p_dur = os.path.join(ws, "source", "master_source.mp4")
-        src_streams = ffprobe_streams(src_p_dur) if os.path.exists(src_p_dur) else []
-        src_v = next((s for s in src_streams if s.get("codec_type") == "video"), {})
-        src_a = next((s for s in src_streams if s.get("codec_type") == "audio"), {})
         target_dur = float(src_v.get("duration") or 0.0) or float(prof.get("duration", v_dur))
         dur_ok = abs(v_dur - target_dur) <= 0.30
         av_dur_ok = abs(v_dur - a_dur) <= 0.30
@@ -776,9 +863,7 @@ def cmd_verify_overlay(a):
         av_st_ok = abs(v_st - a_st) <= 0.12 or (bool(src_v) and abs((v_st - a_st) - src_offset) <= 0.12)
         frames_ok = True
         frame_note = ""
-        src_p = os.path.join(ws, "source", "master_source.mp4")
-        if not prof.get("is_vfr") and os.path.exists(src_p) and sv.get("nb_frames"):
-            src_v = next((s for s in ffprobe_streams(src_p) if s.get("codec_type") == "video"), {})
+        if not prof.get("is_vfr") and src_v and sv.get("nb_frames"):
             src_f = int(src_v.get("nb_frames") or 0)
             out_f = int(sv.get("nb_frames") or 0)
             if src_f > 0 and out_f > 0:
@@ -804,10 +889,13 @@ def cmd_verify_overlay(a):
 def cmd_clean(a):
     """Safely prune heavy regenerable intermediates AFTER final_<unit>_vi.mp4 exists.
     Default keeps all Stage 0-5 gate-hashed artifacts (PPPPPP stays green) while removing stems,
-    premaster/dub WAVs, per-segment TTS WAVs, rubberband clause cache, and waveform .npy caches;
+    premaster/dub WAVs, per-utterance TTS WAVs, and waveform .npy caches;
     --deep also removes .staging_render.mp4, master_audio_48k.wav, and unit source copies."""
     ws = os.path.abspath(a.unit)
-    finals = glob.glob(os.path.join(ws, "media", "final_*_vi.mp4")) + glob.glob(os.path.join(ws, "deliverables", "16x9", "*.mp4"))
+    finals = [
+        p for p in glob.glob(os.path.join(ws, "media", "final_*_vi.mp4"))
+        if not os.path.basename(p).startswith(".")
+    ] or glob.glob(os.path.join(ws, "deliverables", "16x9", "*.mp4"))
     if not finals and not a.force:
         sys.exit(f"[clean] refusing to prune {ws}: no final MP4 found (pass --force to override)")
     targets = [
@@ -879,20 +967,27 @@ def cmd_merge_series(a):
         sys.exit(f"[merge-series] no working batches under {hub}/units/")
     mp4s, srts, durs, total_eps = [], [], [], 0
     for u in units:
+        bn = os.path.basename(u)
         gs = gate_status(u)
         if not a.allow_incomplete and (len(gs) < 6 or gs[5] != "P"):
-            sys.exit(f"[merge-series] {os.path.basename(u)} Stage 5 gate is not PASS ({gs}) — every batch must PASS before full-series release")
-        cand_mp4 = (glob.glob(os.path.join(hub, "deliverables", "16x9", f"*{os.path.basename(u)}*.mp4"))
-                    + glob.glob(os.path.join(hub, "deliverables", "9x16", f"*{os.path.basename(u)}*.mp4"))
-                    + glob.glob(os.path.join(u, "media", "final_*_vi.mp4")))
+            sys.exit(f"[merge-series] {bn} Stage 5 gate is not PASS ({gs}) — every batch must PASS before full-series release")
+        cand_mp4 = sorted(
+            p for p in glob.glob(os.path.join(u, "media", "final_*_vi.mp4"))
+            if not os.path.basename(p).startswith(".")
+        ) or (
+            glob.glob(os.path.join(hub, "deliverables", "16x9", f"*{bn}*.mp4"))
+            + glob.glob(os.path.join(hub, "deliverables", "9x16", f"*{bn}*.mp4"))
+        )
         if not cand_mp4:
-            sys.exit(f"[merge-series] missing batch MP4 for {os.path.basename(u)}")
+            sys.exit(f"[merge-series] missing batch MP4 for {bn}")
         mp4s.append(cand_mp4[0])
         durs.append(ffprobe_duration(cand_mp4[0]))
         ep_man = jload(os.path.join(u, "data", "00_episodes_manifest.json"), [])
         total_eps += len(ep_man) if isinstance(ep_man, list) else len(ep_man.get("episodes", []))
-        cand_srt = (glob.glob(os.path.join(hub, "deliverables", "subtitles", f"*{os.path.basename(u)}*.srt"))
-                    + [os.path.join(u, "data", "subtitles_full.srt")])
+        cand_srt = (
+            [os.path.join(u, "data", "subtitles_full.srt")]
+            + glob.glob(os.path.join(hub, "deliverables", "subtitles", f"*{bn}*.srt"))
+        )
         srts.append(next((p for p in cand_srt if os.path.exists(p)), None))
     batch_specs, time_bases, codec_tags = set(), set(), set()
     v_codec = None
@@ -956,14 +1051,15 @@ def cmd_merge_series(a):
                     out_f.write(f"{cue_idx}\n{_fmt_srt(st + offset)} --> {_fmt_srt(et + offset)}\n{txt}\n\n")
                     cue_idx += 1
             offset += dur
-    # Prune redundant per-unit slice copies inside hub/deliverables/ so deliverables/ holds ONLY the single full-series master
+    # Prune any legacy per-unit slice copies inside hub/deliverables/ so deliverables/ holds ONLY the single full-series master
     for sub_d in (os.path.join(hub, "deliverables", "16x9"), os.path.join(hub, "deliverables", "9x16")):
-        for up in glob.glob(os.path.join(sub_d, "final_*_vi*.mp4")):
-            if os.path.abspath(up) != os.path.abspath(out_mp4):
-                try:
-                    os.remove(up)
-                except OSError:
-                    pass
+        if os.path.isdir(sub_d):
+            for up in glob.glob(os.path.join(sub_d, "final_*_vi*.mp4")):
+                if os.path.abspath(up) != os.path.abspath(out_mp4):
+                    try:
+                        os.remove(up)
+                    except OSError:
+                        pass
     for up_srt in glob.glob(os.path.join(hub, "deliverables", "subtitles", "*_vi.srt")):
         if os.path.abspath(up_srt) != os.path.abspath(out_srt):
             try:
@@ -999,10 +1095,9 @@ def _qa_timestamps_for(u):
 
 
 def cmd_run_series(a):
-    """Hardware-overlapped full-series batch runner (GPU + CPU + Video Encoder).
-    - prep:    GPU/MLX (separate + ASR) overlapped with CPU (waveform + audit-frames) for Stage 0 PASS batches.
-    - produce: 3-engine overlapped pipeline (GPU separate -> CPU dub/mix/master/verify -> VideoEncoder render/verify-render/QA-extract)
-               for batches with Stage 2 PASS. Supports --units u1,u2 for streaming per-unit execution without waiting for all batches."""
+    """Warm multi-unit full-series batch runner (VRAM-slot GPU + parallel CPU + lock-free NVENC/MediaEngine).
+    - prep:    batch-separate (warm Demucs) -> run_asr_and_scan --units (warm Whisper) -> parallel CPU waveform & audit-frames.
+    - produce: batch-all (warm VieNeu CUDA + parallel CPU mix/master/verify) -> lock-free parallel render/verify-render/qa-extract."""
     from concurrent.futures import ThreadPoolExecutor
     hub = os.path.abspath(a.hub)
     if not is_hub(hub):
@@ -1024,43 +1119,46 @@ def cmd_run_series(a):
     asr_tag = "Metal" if ap.detect_asr_backend(py, gpu_info)["device"] == "mps" else ("CUDA" if gpu_info.get("cuda") else "CPU")
     vid_tag = {"videotoolbox": "MediaEngine", "nvenc": "NVENC", "cpu": "CPU"}[ap.detect_video_backend()]
 
-    lock_dir = ap.machine_lock_dir()
-
-    def _engine_lock(kind):
-        if kind == "gpu":
-            return ap.gpu_lock()
-        return ap.file_lock(os.path.join(lock_dir, f"{kind}.lock"), reentrant=True, label=f"{kind.upper()}-LOCK")
-
-    def _run(tag, cmd):
+    def _run(tag, cmd, check=True):
         t0 = time.time()
         print(f"[run-series] START {tag}", flush=True)
+        rc = 0
         if not a.dry_run:
-            subprocess.run(cmd, check=True, env=ap.child_env_with_held_locks())
-        print(f"[run-series] DONE  {tag} ({time.time() - t0:.1f}s)", flush=True)
+            res = subprocess.run(cmd, check=check, env=ap.child_env_with_held_locks())
+            rc = res.returncode
+        print(f"[run-series] DONE  {tag} ({time.time() - t0:.1f}s, rc={rc})", flush=True)
+        return rc
 
     t_all = time.time()
     if a.phase == "prep":
         todo = [u for u in units if len(gate_status(u)) >= 2 and gate_status(u)[0] == "P" and gate_status(u)[1] != "P"]
         print(f"[run-series] phase=prep hub={os.path.basename(hub)} batches={len(todo)}/{len(units)} dry_run={a.dry_run}", flush=True)
+        if todo:
+            unit_arg = ",".join(todo)
+            _run(f"batch-separate({len(todo)})[{demucs_tag}]", [py, audio_py, "batch-separate", "--units", unit_arg])
+            _run(f"batch-asr({len(todo)})[{asr_tag}]", [py, os.path.join(s1_dir, "run_asr_and_scan.py"), "--units", unit_arg, "--skip-waveform"])
 
-        def _prep_one(u):
-            bn = os.path.basename(u)
-            src = os.path.join(u, "source", "master_source.mp4")
-            with _engine_lock("gpu"):
-                _run(f"{bn}:separate[{demucs_tag}]", [py, audio_py, "separate", "--unit", u])
-                _run(f"{bn}:asr[{asr_tag}]", [py, os.path.join(s1_dir, "run_asr_and_scan.py"), "--video", src, "--workspace", u, "--skip-waveform"])
-            with _engine_lock("cpu"):
+            def _prep_cpu(u):
+                bn = os.path.basename(u)
+                src = os.path.join(u, "source", "master_source.mp4")
                 _run(f"{bn}:waveform[CPU]", [py, os.path.join(s1_dir, "analyze_voice_waveform.py"), "--workspace", u, "--snap-and-split"])
                 _run(f"{bn}:audit-frames[CPU]", [py, os.path.join(s1_dir, "extract_audit_frames.py"), "--video", src, "--workspace", u])
-            return bn
+                return bn
 
-        with ThreadPoolExecutor(max_workers=min(2, max(1, len(todo)))) as ex:
-            list(ex.map(_prep_one, todo))
+            with ThreadPoolExecutor(max_workers=min(4, max(1, len(todo)))) as ex:
+                list(ex.map(_prep_cpu, todo))
         print(f"[run-series] prep finished in {(time.time() - t_all) / 60:.1f} min. Next: visually inspect frames/audit/ and run verify_stage_1.py.", flush=True)
         return
 
-    # phase == "produce": overlapped pipeline across batches with Stage 2 PASS (aicn_audio.py acquires GPU lock only for Demucs/CUDA-TTS)
-    todo = [u for u in units if len(gate_status(u)) >= 6 and gate_status(u)[2] == "P" and gate_status(u)[5] != "P"]
+    # phase == "produce": warm batch audio + lock-free parallel hardware render & QA extraction
+    todo = [
+        u for u in units
+        if len(gate_status(u)) >= 6
+        and gate_status(u)[0] == "P"
+        and gate_status(u)[1] == "P"
+        and gate_status(u)[2] == "P"
+        and gate_status(u)[5] != "P"
+    ]
     print(f"[run-series] phase=produce hub={os.path.basename(hub)} batches={len(todo)}/{len(units)} dry_run={a.dry_run}", flush=True)
     render_flags = []
     if a.codec:
@@ -1070,28 +1168,50 @@ def cmd_run_series(a):
     if a.brand_dir:
         render_flags += ["--brand-dir", os.path.abspath(a.brand_dir)]
 
-    def _produce_one(u):
+    audio_todo = [u for u in todo if gate_status(u)[3] != "P"]
+    audio_rc = 0
+    if audio_todo:
+        audio_rc = _run(
+            f"batch-all({len(audio_todo)})",
+            [py, audio_py, "batch-all", "--units", ",".join(audio_todo)],
+            check=False,
+        )
+
+    if a.dry_run:
+        render_todo = list(todo)
+    else:
+        render_todo = [
+            u for u in todo
+            if gate_status(u)[3] == "P"
+            and (gate_status(u)[4] != "P" or not os.path.exists(os.path.join(u, "data", "04_qa_frames_manifest.json")))
+        ]
+
+    def _produce_render(u):
         bn = os.path.basename(u)
         gs = gate_status(u)
-        if gs[3] != "P":
-            # Single Python process runs separate -> dub (CUDA infer_batch under gpu_lock) -> mix -> master -> verify
-            _run(f"{bn}:audio-all", [py, audio_py, "all", "--unit", u])
+        if a.dry_run or gs[4] != "P":
+            _run(f"{bn}:render[{vid_tag}]", [py, aicn_py, "render", "--unit", u, *render_flags])
+            _run(f"{bn}:verify-render", [py, aicn_py, "verify-render", "--unit", u])
         qa_man = os.path.join(u, "data", "04_qa_frames_manifest.json")
-        if gs[4] != "P" or not os.path.exists(qa_man):
-            with _engine_lock("media"):
-                _run(f"{bn}:render[{vid_tag}]", [py, aicn_py, "render", "--unit", u, *render_flags])
-                _run(f"{bn}:verify-render", [py, aicn_py, "verify-render", "--unit", u])
-                src = os.path.join(u, "source", "master_source.mp4")
-                stg = os.path.join(u, "media", ".staging_render.mp4")
-                ts = _qa_timestamps_for(u)
-                _run(f"{bn}:qa-extract", [py, os.path.join(s5_dir, "composite_and_verify.py"),
-                                          "--video", src, "--workspace", u, "--slug", bn,
-                                          "--import-existing-mp4", stg, "--qa-timestamps", ts])
+        if a.dry_run or not os.path.exists(qa_man):
+            src = os.path.join(u, "source", "master_source.mp4")
+            stg = os.path.join(u, "media", ".staging_render.mp4")
+            ts = _qa_timestamps_for(u)
+            _run(f"{bn}:qa-extract", [py, os.path.join(s5_dir, "composite_and_verify.py"),
+                                      "--video", src, "--workspace", u, "--slug", bn,
+                                      "--import-existing-mp4", stg, "--qa-timestamps", ts])
         return bn
 
-    with ThreadPoolExecutor(max_workers=min(3, max(1, len(todo)))) as ex:
-        done = list(ex.map(_produce_one, todo))
-    print(f"[run-series] produce finished {len(done)} batches in {(time.time() - t_all) / 60:.1f} min.", flush=True)
+    max_render = max(1, int(os.environ.get("AICN_MAX_RENDER_JOBS", "2") or "2"))
+    done = []
+    if render_todo:
+        with ThreadPoolExecutor(max_workers=min(max_render, len(render_todo))) as ex:
+            done = list(ex.map(_produce_render, render_todo))
+
+    failed_audio = [] if a.dry_run else [os.path.basename(u) for u in audio_todo if gate_status(u)[3] != "P"]
+    print(f"[run-series] produce finished {len(done)} render batch(es) in {(time.time() - t_all) / 60:.1f} min.", flush=True)
+    if audio_rc != 0 or failed_audio:
+        sys.exit(f"[run-series] Stage 3 audio failed/overflowed for unit(s): {', '.join(failed_audio) or 'see batch-all output'}")
     print(f"[run-series] Next: view frames/qa/ per batch -> verify_stage_5.py -> `aicn.py merge-series --hub {hub}` for the full-series release.", flush=True)
 
 
@@ -1195,13 +1315,18 @@ def cmd_doctor(a):
     else:
         enc_choices = [e for e in ("libx264", "libx265") if encoders.get(e)]
     rb_hint = "MISSING (run install.ps1)" if ap.is_windows() else "MISSING (brew install rubberband)"
+    vram_slots = ap.gpu_vram_budget_mb(gpu) // ap.SLOT_UNIT_MB
     m["choose"] = {
         "asr": asr_info["label"],
-        "render": f"ffmpeg one-pass ({video_backend}: dub + watermark / stream-copy)",
+        "render": f"ffmpeg one-pass ({video_backend}: cached tight-strip wm / stream-copy)",
         "encoder": " + ".join(enc_choices) if enc_choices else "libx264",
         "stems": demucs_info["label"],
         "stretch": "rubberband R3" if m["tools"]["rubberband"] else rb_hint,
-        "gpu": f"{gpu.get('backend')} ({gpu.get('name')}, {gpu.get('vram_gb')} GB)" if gpu.get("vram_gb") else f"{gpu.get('backend')} ({gpu.get('name')})",
+        "gpu": (
+            f"{gpu.get('backend')} ({gpu.get('name')}, {gpu.get('vram_gb')} GB, {vram_slots}x{ap.SLOT_UNIT_MB}MB slots)"
+            if gpu.get("vram_gb")
+            else f"{gpu.get('backend')} ({gpu.get('name')}, {vram_slots}x{ap.SLOT_UNIT_MB}MB slots)"
+        ),
     }
     out = os.path.join(os.path.abspath(a.root), "config", "machine.json")
     jdump(out, m)
@@ -1374,8 +1499,8 @@ def cmd_brand_poster(a):
 
 # ----------------------------------------------------------------- main
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sp = ap.add_subparsers(dest="cmd", required=True)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = parser.add_subparsers(dest="cmd", required=True)
     p = sp.add_parser("doctor"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_doctor)
     p = sp.add_parser("discover"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_discover)
     p = sp.add_parser("init-series"); p.add_argument("--series-slug", required=True); p.add_argument("--title", default="")
@@ -1399,17 +1524,15 @@ def main():
     p.add_argument("--quality", type=int, default=None)
     p.add_argument("--brand-dir", default=None)
     p.set_defaults(f=cmd_plan)
-    p = sp.add_parser("tts-sync"); p.add_argument("--unit", required=True); p.add_argument("--voice", default="Trúc Ly")
-    p.add_argument("--store", action="store_true"); p.set_defaults(f=cmd_tts_sync)
     p = sp.add_parser("render"); p.add_argument("--unit", required=True)
     p.add_argument("--no-gate", action="store_true", help="tests only")
     p.add_argument("--codec", choices=list(ENCODE_PRESETS), default=None, help="encoder preset: h264 | hevc | h264_high")
     p.add_argument("--quality", type=int, default=None, help="Encoder quality (-q:v VideoToolbox / -cq NVENC / -crf x264)")
     p.add_argument("--brand-dir", default=None, help="folder with 13_top_left_logo_large.png & 15_top_right_vietsub_floating.png")
     p.set_defaults(f=cmd_render)
-    p = sp.add_parser("verify-overlay"); p.add_argument("--unit", required=True); p.add_argument("--no-gate", action="store_true")
-    p.set_defaults(f=cmd_verify_overlay)
     p = sp.add_parser("verify-render"); p.add_argument("--unit", required=True); p.add_argument("--no-gate", action="store_true")
+    p.set_defaults(f=cmd_verify_overlay)
+    p = sp.add_parser("verify-overlay", help=argparse.SUPPRESS); p.add_argument("--unit", required=True); p.add_argument("--no-gate", action="store_true")
     p.set_defaults(f=cmd_verify_overlay)
     p = sp.add_parser("clean"); p.add_argument("--unit", required=True); p.add_argument("--dry-run", action="store_true")
     p.add_argument("--deep", action="store_true", help="also remove .staging_render.mp4 and master_audio_48k.wav")
@@ -1437,7 +1560,7 @@ def main():
     p.add_argument("--delete-source", action="store_true", help="remove original messy-named input file after archiving as _raw")
     p.set_defaults(f=cmd_brand_poster)
     p = sp.add_parser("progress"); p.add_argument("--hub", required=True); p.set_defaults(f=cmd_progress)
-    a = ap.parse_args()
+    a = parser.parse_args()
     a.f(a)
 
 

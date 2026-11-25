@@ -177,3 +177,24 @@ Structured log of verified production failures, user corrections, and API change
   1. Added `references/poster_and_caption_guide.md` with the complete HD official poster pull, `9:16` / `16:9` prompt templates, and updated 2-line upload caption standard (`<Hook> <2 emojis> | Full N Tập` + `#daudonho ...`).
   2. Added `aicn.py brand-poster` to standardize any user-generated raw poster into `_raw`, `_clean.png`, and dual-corner `_branded.png` (with optional `--remove-star` and `--delete-source`), backed by unit tests in `tests/test_aicn.py`.
   3. Updated `SKILL.md` and `references/folder_contract.md`.
+
+## L-022 (2026-11-25) — `v2.7.0` 13-Unit Forensic Audit: Serial `gpu.lock`, `split_points()` Audio Chops, Pass 2B Overlap/Duplicates, Slow STFT & Dual-Loop NVENC
+- **Symptom:** Full-series production of `nam-than-giam-can-giam-mot-can-thuong-mot-tram-trieu` (13 units, 134 eps, RTX 2060 6 GB) exposed six systemic defects across Stages 1–5:
+  1. Serial `gpu.lock` caused 33 lock waits totaling **343.6 min** (max single wait **78 min**) alongside 26+ cold model startups.
+  2. Dubbed audio suffered mid-word glitches/chops and premature stops even though raw VieNeu WAVs in `.cache/tts_sent` had `0/407` internal silence glitches.
+  3. `cmd_mix` averaged **113.8s/unit** while `dub_snr_speech_db_p10` dropped to **-11.9 to -28.7 dB** across all 28 runs (Chinese vocal bleed), and `cmd_dub` exited `0` on `OVERFLOW` causing **15 wasted 114s `cmd_mix` runs** (~28 min).
+  4. Across 5 forensic units, **50.5% (`101/200`)** of Pass 2B recoveries were 1–2 char boundary fragments/duplicates, Pass 1 left 157 `<=1`-CJK-char DTW orphans, and `analyze_voice_waveform.py` produced **52 negative timestamp overlaps** plus an inverted `-0.34s` segment (`unit_02` id 98).
+  5. Stage 4 NVENC choked at **154.7s/unit** (e.g., `8.75s` on a 30s 1080p30 benchmark).
+  6. `FastHash` (`stat_hash.json`) and `global_stat_hash.json` were path-keyed/racy, `stage1_key` drifted between `aicn.py` and `run_asr_and_scan.py`, `cicd_gate.py` signed absolute paths, and vendor `SKILL.md` docs still carried `v1.x` `sub_only`/Style-B/bbox instructions.
+- **Verified Root Causes:**
+  1. `split_points()` + `clean()` (`30ms` pad trap) sliced active vowels **159 times** (`26–103%` RMS), created **125 `<150ms` (mostly `10–15ms`) glitch pieces**, and injected **622 mid-sentence pauses (`>=0.18s`)**.
+  2. `cmd_mix` executed 8 total STFT/iSTFT passes + an 80,000-step Python `follow_hold()` loop; `raw_active` drop-outs let `V` bounce back to `-6.5 dB` between syllables.
+  3. Pass 1 (`speech_pad_ms=200`) split words across DTW gaps; Pass 2B shrunk `covered` by `-0.05s` and padded `±0.25s` into neighbors; `analyze_voice_waveform.py:842` (`max(start + 0.35, next_start - 0.02)`) forced overlaps.
+  4. `render_ffmpeg` ran `-framerate 30 -loop 1` on 2 separate PNGs through 2 CPU `overlay` filters with no CUDA upload/overlay.
+- **Guardrail Implemented (`v3.0.0`, `SPEC_V3.md`):**
+  1. Replaced serial `gpu.lock` and `media.lock` with crash-safe 512 MB-unit `ap.gpu_slot()` (`RTX 2060` 10 slots: `whisper(5)+demucs(2)+vieneu(2)=9` run concurrently), lock-free parallel NVENC (`AICN_MAX_RENDER_JOBS=2`), and warm multi-unit batch CLIs (`run_asr_and_scan.py --units`, `aicn_audio.py batch-separate|batch-dub|batch-all --units`).
+  2. Replaced `stat_hash.json`/`global_stat_hash.json` with SQLite-WAL `content_hash.db` (`ap.content_sha256`, unified key builders, relative POSIX paths in `00_video_profile.json`/`00_episodes_manifest.json`/`stage_N_gate.json`).
+  3. Abolished `split_points()` and the `30ms` pad: continuous clauses (`gap<=0.12s`, `<=3` clauses, `span<=4.5s`) synthesize, trim (`5ms` guard + `10ms` fade), stretch, and place as **one indivisible utterance** (`media/tts_segments/utt_NNNN.wav`), failing fast (`exit 2`) in `cmd_dub` on overflow before `cmd_mix`.
+  4. Rebuilt `cmd_mix` with PyTorch Welch `spectral_profile_fast()`, anti-denormal `sosfilt`, in-RAM BS.1770-4 `lufs()`, C-speed chunked `follow_hold()`, single `torch.stft` (`scipy.fft` fallback) per stem + single combined linear `torch.istft` (`11.56s` / 10-min unit, `9.8×` faster), and non-stacked `-24 dB` clamped vocal carving (`base_vocal_db=-10`, `speech_vocal_dip_db=-16`, `snr_vocal_db=14`, gating `dub_snr_speech_db_median>=10 dB` & `p10>=4 dB` on `-15 dB` active voiced-syllable frames `snr_on`; live VieNeu CUDA E2E verified `22.03 dB` median / `12.72 dB` p10).
+  5. Hardened Stage 1/2 (`asr-4.0`/`wf-4.0`): `speech_pad_ms=80` + DTW orphan merge, `+0.08s` Pass 2B collar + boundary dedup, strict `0 <= start[i] < end[i] <= start[i+1] - 0.02` (`dur>=0.15s`), calibrated 753-WAV Stage 2 duration predictor.
+  6. Pre-composited dual-corner watermark strip into global `wm_overlay` cache + NVENC `overlay_cuda` (`2.87s / 30s` = `10.5×` RT) with single-static CPU fallback (`3.90s / 30s`), deleted 5 retired `v1.x` scripts, and unified all 30 docs to `v3.0.0`.

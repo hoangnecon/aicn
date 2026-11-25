@@ -1,20 +1,19 @@
-# Visual Keyframe Audit & ASR Disambiguation Handbook
+# Visual Keyframe Audit & ASR Disambiguation Handbook (`v3.0.0`)
 
-Whisper ASR models process only the audio waveform. In fast-paced Chinese videos (especially Bilibili tech essays, Douyin short dramas, and finance documentaries), audio-only transcription suffers from severe **homophone corruption** and **English acronym mangling**. Visual keyframe auditing resolves 100% of these ambiguities before a single line of Vietnamese is written.
+Whisper ASR models process only the audio waveform. In fast-paced Chinese and English videos (short dramas, Bilibili tech essays, documentaries), audio-only transcription suffers from **homophone corruption**, **proper-noun misspelling**, and **English acronym mangling**. Visual keyframe auditing (`extract_audit_frames.py` → `frames/audit/frame_*s.jpg`) resolves these ambiguities before Stage 2 translation begins.
 
 ---
 
-## 1. The 5 Visual Layers to Inspect in Every Extracted Frame
+## 1. Visual Layers to Inspect in Every Extracted Audit Frame
 
-When calling `read_file` on `frames/audit/frame_XXXXs.jpg`, systematically inspect all 5 visual zones:
+When calling `read_file` on every frame in `data/01_extracted_audit_manifest.json` (`frames/audit/frame_XXXXs.jpg`), systematically inspect these visual cues:
 
-| Visual Zone | What to Look For | Impact on Localization |
+| Visual Layer | What to Look For | Impact on Localization |
 | :--- | :--- | :--- |
-| **Zone 1: Bottom Burned-In Hardsub (`y=[880..1080]`)** | Exact Chinese characters (`汉字`) and English tokens printed at the bottom. | Overrides phonetic Whisper hallucinations (`Ancelope` -> `Anthropic`, `DPSK21` -> `DeepSeek-R1`). |
-| **Zone 2: Center Canvas / Slides / UI Pointers** | Highlighted text, red pencil circles, cursor clicks, code blocks, tweets, news clippings (e.g., `<|user|>`, `<|assistant|>`, `<|end|>`, `Fire-Flyer 3FS`). | Locks **Visual Anchor Timing**: ensures the Vietnamese translation names the exact UI element at the exact second the pointer touches it. |
-| **Zone 3: Floating Impact Text (`花字` / Callouts)** | Large colored pop-up banners in the center or upper corners (`批量创建账号`, `监督微调`). | Confirms the structural section heading and technical register of the current scene. |
-| **Zone 4: Lower-Thirds & Speaker Nameplates** | Chyrons introducing interviewees, CEOs, or characters (`黄仁勋`, `Dario Amodei`). | Prevents transliterating proper names into nonsense syllables. |
-| **Zone 5: Hardsub Geometry & Background Luminance** | Is the hardsub 1 line or 2 lines tall? Does it sit over a dark studio background or a bright white paper slide? | Validates that `01_zh_bbox_scan.json` captured the true text width (`x0..x1`) rather than false-triggering on a white slide background. |
+| **1. On-Screen Dialogue / Hardsubs (if present)** | Exact Chinese characters (`汉字`) or English tokens burned into the source frame. | Overrides phonetic Whisper homophones (`Ancelope` -> `Anthropic`, `DPSK21` -> `DeepSeek-R1`, character surname homophones). |
+| **2. Center Action / Slides / UI Pointers** | Highlighted text, diagrams, props, phone screens, contracts, system HUDs (e.g., `<\|user\|>`, `<\|end\|>`, `Fire-Flyer 3FS`, drama system pop-ups). | Locks **Visual Anchor Timing**: ensures the Vietnamese dub names the exact on-screen entity at the right moment and matches Pass 2B recovered lines to visible speakers. |
+| **3. Floating Impact Text (`花字` / Callouts)** | Large stylized pop-up banners or drama titles (`批量创建账号`, `系统任务`, `监督微调`). | Confirms scene context, proper names, and comedic/dramatic register. |
+| **4. Lower-Thirds & Character Nameplates** | Chyrons introducing characters, titles, CEOs, or locations (`黄仁勋`, `Dario Amodei`, character roles). | Locks spelling and gender/hierarchy in `config/series_bible.json` before Stage 2 translation. |
 
 ---
 
@@ -37,7 +36,7 @@ When calling `read_file` on `frames/audit/frame_XXXXs.jpg`, systematically inspe
 | `对齐` -> `xếp hàng ngang` | `安全对齐 (Alignment)` | `căn chỉnh an toàn (alignment)` |
 | `套壳` -> `bọc vỏ ốc` | `套壳模型 (Wrapper)` | `bọc vỏ API (wrapper)` |
 
-### B. Business, Finance & Internet Culture Traps
+### B. Drama, Business, Finance & Internet Culture Traps
 | Whisper / Literal Error | True On-Screen Text | Correct Vietnamese Adaptation |
 | :--- | :--- | :--- |
 | `割韭菜` -> `cắt hẹ` | `割韭菜` | `lùa gà` / `vặt lông người dùng` |
@@ -51,11 +50,11 @@ When calling `read_file` on `frames/audit/frame_XXXXs.jpg`, systematically inspe
 
 ## 3. How to Populate `01_visual_audit_notes.md` (Mandatory Gate Format)
 
-`verify_stage_1.py` parses `01_visual_audit_notes.md` and verifies that **every single frame** listed in `data/01_extracted_audit_manifest.json` has a documented row. Use this exact Markdown table format:
+`verify_stage_1.py` parses `01_visual_audit_notes.md` and verifies that **every single frame** listed in `data/01_extracted_audit_manifest.json` (`>= 10` frames, prioritizing Pass 2B recovered timestamps + stratified checkpoints) has a documented row. Use this exact Markdown table format:
 
 ```markdown
-| Timestamp (s) | Frame File | Raw Whisper ASR Text | Visual On-Screen Text / Graphics | Corrected Term & Context |
+| Timestamp (s) | Frame File | Raw Whisper ASR Text | Visual On-Screen Context / Text | Corrected Term & Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | `18.0s` | `frame_0018s.jpg` | `Ancelope 中转站` | Slide: `批量创建账号 / 第三方中转 / Anthropic` | Fix `Ancelope` -> `Anthropic`; translate `第三方中转` as `trạm trung chuyển bên thứ ba` |
-| `113.0s` | `frame_0113s.jpg` | `user标签 end标签` | Red pencil pointing at `<|end|>` after `<|user|>` and `<|assistant|>` | Keep 3 separate short clauses locked to `108.1s`, `110.0s`, `111.8s` so each tag matches the pencil |
+| `113.0s` | `frame_0113s.jpg` | `user标签 end标签` | Red pencil pointing at `<\|end\|>` after `<\|user\|>` and `<\|assistant\|>` | Keep 3 separate short clauses locked to `108.1s`, `110.0s`, `111.8s` so each tag matches the pointer |
 ```

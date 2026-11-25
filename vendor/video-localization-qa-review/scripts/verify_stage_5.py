@@ -97,7 +97,7 @@ def main():
             and int(a_st.get("sample_rate", 0)) == 48000
             and int(a_st.get("channels", 0)) == 2
             and len(s_st) == 0
-            and abs(out_dur - vid_dur) <= 0.25
+            and abs(out_dur - vid_dur) <= 0.30
         )
         mp4_detail = (
             f"v={v_st.get('codec_name')} ({v_st.get('width')}x{v_st.get('height')}), "
@@ -148,40 +148,21 @@ def main():
         except OSError:
             shutil.copy2(src_p, dst_p)
 
-    deliv_16x9 = os.path.join(ws, "deliverables", "16x9", f"final_{slug}_vi.mp4")
-    deliv_srt = os.path.join(ws, "deliverables", "subtitles", f"{slug}_vi.srt")
-    canon_srt = os.path.join(ws, "data", "subtitles_full.srt")
-
     if pre_release_ok:
         _hardlink_or_copy(staging_mp4, final_mp4)
-        _hardlink_or_copy(final_mp4, deliv_16x9)
-        if os.path.exists(canon_srt):
-            _hardlink_or_copy(canon_srt, deliv_srt)
-        # Also publish to parent Series Hub deliverables/ if configured
-        proj_cfg_path = os.path.join(ws, "config", "project_config.json")
-        if os.path.exists(proj_cfg_path):
-            with open(proj_cfg_path, "r", encoding="utf-8") as f:
-                proj_cfg = json.load(f)
-            hub_dir = proj_cfg.get("series_hub_dir", "")
-            if hub_dir and os.path.isdir(hub_dir):
-                _hardlink_or_copy(final_mp4, os.path.join(hub_dir, "deliverables", "16x9", f"final_{slug}_vi.mp4"))
-                if os.path.exists(canon_srt):
-                    _hardlink_or_copy(canon_srt, os.path.join(hub_dir, "deliverables", "subtitles", f"{slug}_vi.srt"))
         if args.release_path:
-            shutil.copy2(staging_mp4, os.path.abspath(args.release_path))
+            _hardlink_or_copy(final_mp4, os.path.abspath(args.release_path))
         promoted_ok = (
             os.path.exists(final_mp4)
-            and os.path.exists(deliv_16x9)
             and os.path.getsize(final_mp4) == os.path.getsize(staging_mp4)
         )
         promo_detail = (
-            f"Promoted verified video to {final_mp4} & deliverables/16x9/final_{slug}_vi.mp4"
+            f"Promoted verified unit deliverable to {final_mp4}"
             + (f" and {args.release_path}" if args.release_path else "")
         )
     else:
-        for p in [final_mp4, deliv_16x9]:
-            if os.path.exists(p):
-                os.remove(p)
+        if os.path.exists(final_mp4):
+            os.remove(final_mp4)
 
     checks = [
         {

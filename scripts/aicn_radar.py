@@ -26,12 +26,13 @@ if _SCRIPTS_DIR not in sys.path:
 import aicn_platform as ap  # noqa: E402
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = SKILL_DIR.parents[1]
+PROJECT_ROOT = ap.find_project_root(SKILL_DIR) or SKILL_DIR.parents[1]
 HG_TOOL = SKILL_DIR / "scripts" / "hg_tool.cjs"
 DY_TOOL = SKILL_DIR / "scripts" / "dy_tool.py"
 DD_TOOL = SKILL_DIR / "scripts" / "dd_tool.py"
 DY_PY = Path(ap.find_dy_python(PROJECT_ROOT))
 NODE_BIN = ap.find_tool("node")
+YTDLP_BIN = ap.find_tool("yt-dlp")
 HONGGUO_REPO = PROJECT_ROOT / "tools" / "hongguo-drama"
 DOUYIN_REPO = PROJECT_ROOT / "tools" / "Douyin_TikTok_Download_API"
 DEFAULT_DB = PROJECT_ROOT / "data" / "drama_index.db"
@@ -45,10 +46,11 @@ BILI_UA = (
 def connect_db(db_path: Path) -> sqlite3.Connection:
     """Open SQLite DB and ensure schema + FTS5 virtual table exist."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=15.0)
     conn.row_factory = sqlite3.Row
     conn.executescript(
         """
+        PRAGMA busy_timeout=15000;
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS series (
             uid TEXT PRIMARY KEY,
@@ -367,7 +369,7 @@ def sync_bilibili(conn: sqlite3.Connection, queries: list[str], count_per_query:
     total = 0
     for q in queries:
         proc = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--dump-single-json", f"bilisearch{count_per_query}:{q}", "--user-agent", BILI_UA],
+            [YTDLP_BIN, "--flat-playlist", "--dump-single-json", f"bilisearch{count_per_query}:{q}", "--user-agent", BILI_UA],
             capture_output=True,
             text=True,
             check=False,
@@ -378,7 +380,7 @@ def sync_bilibili(conn: sqlite3.Connection, queries: list[str], count_per_query:
         if not urls:
             continue
         meta_proc = subprocess.run(
-            ["yt-dlp", "--skip-download", "--dump-json", *urls, "--user-agent", BILI_UA],
+            [YTDLP_BIN, "--skip-download", "--dump-json", *urls, "--user-agent", BILI_UA],
             capture_output=True,
             text=True,
             check=False,

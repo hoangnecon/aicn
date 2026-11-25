@@ -1,78 +1,67 @@
 ---
 name: vieneu-voice-pacing-mixer
-description: Use when synthesizing Vietnamese narration with VieNeu-TTS, enforcing natural speech pacing without robotic speedups, locking visual cue start timestamps, and mixing 48kHz voice with auto-ducked background music.
+description: Use when synthesizing Vietnamese narration with VieNeu-TTS, enforcing indivisible utterance pacing with rubberband R3, locking visual cue start timestamps, and mixing 48kHz voice with single-STFT vocal-carved original audio.
 ---
 
-# VieNeu-TTS 48kHz Voice Synthesis, Elastic Pacing & BGM Mixer
+# VieNeu-TTS 48 kHz Indivisible Dubbing, Elastic Pacing & Single-STFT Mixer (`v3.0.0`)
 
 ## Overview
 
-Stage 3 of the video localization pipeline. Supports two configurable audio architectures (`localization_mode` in `data/00_video_profile.json` or `--mode voice_dub | sub_only`):
-- **`voice_dub` Mode:** Synthesizes all `tts_text` entries at `48000 Hz` using `VieNeu-TTS v3 Turbo` (ONNX `fp32`), enforces a strict natural tempo ceiling (`<= 1.24x`), hard-locks every segment's `slot_start` to prevent cumulative visual drift, preserves natural breathing pauses (`~0.22s`), and mixes the voice track with `no_vocals.wav` using smooth cosine auto-ducking.
-- **`sub_only` Mode (Native Audio Passthrough):** Skips TTS synthesis, extracts the original stereo audio track losslessly at `48000 Hz` (`media/master_audio_48k.wav`) to preserve 100% of the native voice acting, telephone call acoustics, emotional screams, and cinema sound design, and maps `02_bilingual_script.json` directly to `data/03_aligned_subtitles.json` and `data/subtitles_full.srt` with `tempo = 1.0x`.
-Enforces a **4-check, 100-point CI/CD gate (`verify_stage_3.py` -> `.cicd/stage_3_gate.json`)** before Stage 4 overlay rendering can run.
+Stage 3 of the video localization pipeline (`voice_dub`-only, `AUDIO_VERSION = "aicn-audio-3.0"`), driven by `<aicn>/scripts/aicn_audio.py` and gated by `verify_stage_3.py`. Synthesizes continuous same-speaker Vietnamese utterances at `48000 Hz` (`PCM_16`) using `VieNeu-TTS v3 Turbo` (single-process CUDA `infer_batch(16)` under `ap.gpu_slot("vieneu", vram_mb=1024)` or ONNX `fp32` on macOS/CPU), stretches each intact utterance once via parallel `rubberband -3 -F -q` (`base_tempo = 1.08`, `max_tempo = 1.28`, `1.32` for `<= 2`-syl interjections) into elastic slack, fails fast before mixing on any overflow, and mixes with `media/stems/{vocals,accomp}.wav` through a single-STFT, C-speed DSP pipeline (`< 12s`/10-min unit) that carves Chinese speech bands cleanly without muting sound effects or music.
 
 **REQUIRED BACKGROUND:** Complete Stage 2 (`zh-vi-script-adapter`) and verify `.cicd/stage_2_gate.json` == `PASS` first.
 
 ---
 
-## Internal Sub-Skills Catalog (8 Core Capabilities)
+## Core Capabilities (`v3.0.0`)
 
-### Sub-Skill 4.1: `VieNeu-TTS v3 Turbo` Engine & Multi-Persona Dispatch
-- Always run with `$AICN_PY` (macOS `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python`, Windows `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe`; never bare system `python`).
-- Instantiate `Vieneu()` with default cached `fp32` ONNX weights (`RTF ≈ 0.32` on Apple Silicon / desktop CPU). Never pass `precision="int8"` unless already cached locally.
-- Supports single-narrator (`--voice "Hải Đăng"`) and multi-speaker drama scripts (where each item in `02_bilingual_script.json` can specify `"voice": "Hải Đăng" | "Ngọc" | "Bình" | "Tuyên"`). See [audio_dsp_and_pacing_manual.md](./references/audio_dsp_and_pacing_manual.md) for voice persona selection.
+### 1. Single-Process CUDA `infer_batch` & Global `tts_sent` Cache
+- Always run via `$AICN_PY` (`C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe` on Windows, `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python` on macOS).
+- On NVIDIA CUDA, loads **1 in-process PyTorch `Vieneu` instance** inside `ap.gpu_slot("vieneu", vram_mb=1024)` with `infer_batch(batch_size=16)` grouped by `(voice, temperature, top_k)` (ONNX `fp32` on macOS/CPU).
+- In warm batch mode (`aicn_audio.py batch-dub` / `batch-all --units ...`), loads VieNeu **ONCE** across all cache-miss utterances of all units in the batch.
+- Caches raw 48 kHz `PCM_16` WAVs globally at `<global_cache>/tts_sent/<tts_sent_key>.wav` (`TTS_ENGINE_TAG = "vieneu-v3-turbo-48k"`, pure content hash — zero path dependence).
 
-### Sub-Skill 4.2: Plosive-Safe Silence Trimming (`trim_silence`)
-Trims leading/trailing dead air from each synthesized `seg_XXXX.wav` at amplitude threshold `0.008` while preserving a mandatory `30ms` (`1440` samples at `48kHz`) attack/release margin and applying a `15ms` linear boundary fade so initial plosives (`p, t, c, k, s`) and final stops (`-p, -t, -c`) are never clipped.
+### 2. Indivisible Utterances (Zero Mid-Word Slicing)
+Never merge pause-separated clauses and chop a synthesized WAV back into pieces!
+- `group_lines()` merges adjacent clauses ONLY when ALL hold: same `speaker` & `voice`, previous clause is comma-chained (not `[.!?…]\s*$`), `gap <= 0.12s` (`group_max_gap_s = 0.12`), `< 3` clauses (`max_group_clauses = 3`), and total span `<= 4.5s` (`max_group_span_s = 4.5`).
+- `clean()` trims `|w| > 0.006` with a **`5ms` guard**, runs the `-50 dBFS / -15 dB` noise-floor expander, and applies **`10ms` cosine edge fades** (zero excess silence pad).
+- Each utterance is stretched ONCE intact via `rubberband -3 -F -q` (cached globally at `<global_cache>/rb_stretch/<rb_stretch_key>.wav`), placed ONCE intact onto `media/audio/dub_voice_48k.wav`, and saved intact at `media/tts_segments/utt_{gi:04d}.wav`.
+- `data/03_aligned_subtitles.json` preserves all `N` rows for `data/subtitles_full.srt` with strictly monotonic `slot_start`/`slot_end` and links each row to `utterance_id`, `utterance_wav`, `utt_speech_start`, `utt_speech_end`, and `tempo_ratio`.
 
-### Sub-Skill 4.3: Hard-Locked `slot_start` & Zero-Drift Timeline Mathematics
-**STRICT PROHIBITION:** Never delay or push `seg[i+1].start` forward when `seg[i]` runs long. Pushing subsequent segments creates cumulative drift across a 12-minute video and breaks visual synchronization.
-- Every segment `i` is **hard-locked** to its original `start` timestamp (`|slot_start - script_start| <= 25ms`).
-- Bounded elastic ceiling: `ceiling = min(seg[i].end + 0.12, seg[i+1].start - 0.14)`.
+### 3. Elastic Pause Borrowing & Fail-Fast Overflow Guard
+- Utterance `gi` starts at `start_u = max(segs[g[0]]["start"], prev_end + 0.03)` and borrows silent slack up to `avail = min(next_start - 0.05, segs[g[-1]]["end"] + 1.20) - start_u` (`lead_gap_s = 0.05`, `max_overhang_s = 1.20`).
+- **Fail-Fast Before Mix:** If ANY utterance has `tempo > cap + 0.005` (`1.28` standard, `1.32` for `<= 2`-syl), `overflow_s > 0.05`, or `end_u > next_start - 0.03`, `cmd_dub` writes `data/03_dub_sentences.json` with offending IDs + trim guidance and exits with code **`2`** immediately before `mix` / `master` (unless `--allow-overflow` is passed for diagnostics).
 
-### Sub-Skill 4.4: Closed-Loop Text Tightening for Over-Budget Segments (`> 1.24x`)
-`synthesize_and_audit_pacing.py` computes `raw_ratio = trimmed_wav_dur / avail_dur` for every segment.
-- **If any segment has `raw_ratio > 1.24x`:** The script exits with code `2` and lists the exact segment IDs.
-- **Mandatory Recovery Loop:** Never increase `atempo` above `1.25x`. Instead, shorten `sub_text` and `tts_text` for those specific segment IDs in `data/02_bilingual_script.json` by 15–25%, re-run `validate_bilingual_script.py` (to re-sign Stage 2 gate), delete only the affected `seg_XXXX.wav` files, and re-run `synthesize_and_audit_pacing.py --only-missing` until `100%` of segments pass `<= 1.24x`.
+### 4. Single-STFT, C-Speed DSP Mixer & Clean Vocal Carving (`cmd_mix`, `11.56s` / 10-min unit)
+- Uses PyTorch Welch `spectral_profile_fast()`, anti-denormal `sosfilt` RBJ biquad EQ + 3:1 dub chain, in-RAM BS.1770-4 `lufs()` (`~0.6s`), C-speed chunked `follow_hold()` (`< 0.1s`), **ONE `torch.stft` (`scipy.fft` fallback) STFT per stem** (`T`, `V`, `B`), and **ONE combined linear `torch.istft`** `istft(ZV*GV + ZB*GB)` (`9.8×` faster than `v2.7.0`'s `113.8s`, measuring `dub_snr_speech_db_median = 17.4 dB`, `p10 = 16.48 dB` on 10-min benchmark).
+- Carves original Chinese vocals cleanly (`base_vocal_db = -10.0`, `speech_vocal_dip_db = -16.0` on `300 Hz–5 kHz` when broadband `talk > 0.05`, `vocal_high_dip_db = -4.5` on `> 5 kHz`, clamped directly at **`floor_vocal_db = -24.0`** total floor without stacking; `snr_vocal_db = 14.0`, `snr_bgm_db = 6.0`, `floor_bgm_db = -9.0`, `attack_s = 0.015`, `hold_s = 0.30`, `release_s = 0.38`).
+- Vocal carving engages early down to `-30 dB` (`p95 * 1e-3`), while `dub_snr_speech_db_median` and `p10` are measured strictly on `-15 dB` active voiced-syllable frames (`snr_on = pt_speech > max(p95_sp * 10**(-15/10), 1e-10)` — live VieNeu CUDA E2E verified at `median = 22.03 dB`, `p10 = 12.72 dB`, `orig_vocal_atten = -17.35 dB`).
 
-### Sub-Skill 4.5: Natural Micro-Pauses & Prosodic Breathing Room
-Reserves at least `0.14s–0.28s` of inter-clause breathing silence (`mean_breathing_pause >= 0.14s`, typically `~0.22s`) so the narrator sounds calm and human rather than a breathless machine gun.
+### 5. Native 48 kHz Fast Master & Gate Checks (`cmd_master`, `cmd_verify`, `verify_stage_3.py`)
+- `cmd_master` (`master_mode="fast"`): 2:1 glue compressor + native 48 kHz `ebur128` linear gain + `alimiter` → `media/master_audio_48k.wav` (48 kHz, 24-bit stereo).
+- `cmd_verify` validates 7 checks in `data/03_mix_report.json` (`loudness` `-14.0 ± 1.0 LUFS` & peak `<= -0.8 dBFS`, `stems_match_source`, `dub_intelligible` active `median >= 10.0 dB` & `p10 >= 4.0 dB`, `original_never_muted`, `original_present >= -6.0 dB`, `dub_fits_and_intact` zero overflow/overlap/runt `< 0.12s`, `dub_sync` `speech_start - script_start` in `[-0.10, +0.50]s`), writes `03_pacing_and_audio_report.md`, and runs `verify_stage_3.py` (`100/100`: `audio_gate_report_passed` 20 pts, `utterance_wavs_intact_and_non_runt` 20 pts, `utterance_sync_and_zero_overlaps` 30 pts, `master_audio_48k_stereo_and_srt_valid` 30 pts).
 
-### Sub-Skill 4.6: Multi-Rate Stem Resampling (`44.1kHz` -> `48kHz` Stereo)
-`htdemucs` outputs `no_vocals.wav` at `44100 Hz`. `assemble_master_audio.py` resamples `no_vocals.wav` on the fly via `ffmpeg -f f32le -ar 48000 -ac 2` so the stereo BGM bed aligns sample-for-sample with the `48000 Hz` voice track.
-
-### Sub-Skill 4.7: Cosine Envelope Auto-Ducking & Headroom Normalization
-Convolves the binary speech activity mask with a `400ms` (`19,200` samples) Hanning window to smoothly duck the BGM bed to `0.28` during active narration and swell it to `0.65` during pauses/transitions, normalizing peak amplitude to `<= 0.92` (`-0.7 dBFS`).
-
-### Sub-Skill 4.8: Stage 3 Cryptographic CI/CD Gate Validator (`verify_stage_3.py`)
-Enforces 4 weighted deterministic checks (`100/100` required to sign `.cicd/stage_3_gate.json`):
-1. `tts_segments_complete_48k` (`20 pts`): All `N` WAV files (`seg_0000.wav .. seg_{N-1:04d}.wav`) exist in `media/tts_segments/` and are non-silent.
-2. `hard_locked_slot_start_zero_drift` (`25 pts`): Every segment in `data/03_aligned_subtitles.json` has `|slot_start - script_start| <= 25ms` and `0` overlaps (`slot_end <= next_slot_start`).
-3. `natural_tempo_and_breathing_pauses` (`25 pts`): `max_tempo <= 1.26x`, `mean_tempo <= 1.18x`, and `mean_breathing_pause >= 0.14s`.
-4. `master_audio_48k_stereo_and_srt_valid` (`30 pts`): `media/master_audio_48k.wav` is `48000 Hz` stereo matching source duration (`±0.20s`), and `data/subtitles_full.srt` contains all `N` subtitle blocks.
+See [audio_dsp_and_pacing_manual.md](./references/audio_dsp_and_pacing_manual.md) and `<aicn>/references/audio_mix.md`.
 
 ---
 
 ## Execution Commands
 
-### Step 3A: Synthesize 48kHz Voice Segments & Audit Pacing
+### Single Unit (All Steps)
 ```bash
-$AICN_PY .agents/skills/vieneu-voice-pacing-mixer/scripts/synthesize_and_audit_pacing.py \
-  --workspace "workspace/bilibili-anthropic-distill" \
-  --voice "Hải Đăng" \
-  --only-missing
+$AICN_PY <aicn>/scripts/aicn_audio.py all --unit "workspace/<series>/units/<unit>" [--force]
+# Or individual steps: separate | dub | analyze | mix | master | verify
 ```
 
-### Step 3B: Assemble 48kHz Stereo Master Audio & Sign Stage 3 Gate
+### Warm Multi-Unit Batch (Recommended for Series)
 ```bash
-$AICN_PY .agents/skills/vieneu-voice-pacing-mixer/scripts/assemble_master_audio.py \
-  --workspace "workspace/bilibili-anthropic-distill"
+$AICN_PY <aicn>/scripts/aicn_audio.py batch-all --units "workspace/<series>/units/unit_01,workspace/<series>/units/unit_02"
+# Or via orchestrator: aicn.py run-series --hub workspace/<series> --phase produce --units unit_01,unit_02
 ```
 
-### Step 3C: Standalone Stage 3 CI/CD Gate Check
+### Standalone Gate Check
 ```bash
-$AICN_PY .agents/skills/vieneu-voice-pacing-mixer/scripts/verify_stage_3.py \
-  --workspace "workspace/bilibili-anthropic-distill"
+$AICN_PY <aicn>/vendor/vieneu-voice-pacing-mixer/scripts/verify_stage_3.py \
+  --workspace "workspace/<series>/units/<unit>"
 ```
-Do NOT proceed to Stage 4 render until `.cicd/stage_3_gate.json` reports `Status: PASS | Score: 100.0/100`.
+Do NOT proceed to Stage 4 render until `.cicd/stage_3_gate.json` prints `Status: PASS | Score: 100.0/100`.

@@ -1,10 +1,10 @@
-# Poster Localization, Thumbnail Packaging & Upload Caption Guide (`v2.7.0`)
+# Poster Localization, Thumbnail Packaging & Upload Caption Guide (`v3.0.0`)
 
 This guide standardizes post-production release packaging for every AICN series: pulling the HD official source poster, localizing Vietnamese `9:16` / `16:9` posters (user-generated externally via Nano Banana 2 / Google Flow / Gemini or agent-assisted), auto-renaming & compositing dual-corner channel branding via `aicn.py brand-poster`, and writing ready-to-paste upload captions.
 
 ---
 
-## 1. Canonical `posters/` File Contract (Tier 2 — Series Folder)
+## 1. Canonical `posters/` File Contract (Tier 2 — Series Hub)
 
 Every Series Hub (`workspace/<series-slug>/posters/` and its Google Drive mirror) uses this exact naming contract:
 
@@ -12,7 +12,7 @@ Every Series Hub (`workspace/<series-slug>/posters/` and its Google Drive mirror
 |---|---|
 | `cover.jpg` | Compact catalog thumbnail fetched at discovery (`~640px`). |
 | `official_poster_<slug>_zh.jpg` | **HD unshrunk official source poster** (`1440px+` wide) used as the image-edit reference. |
-| `poster_<slug>_vi_<ratio>_raw.<ext>` | Unmodified Vietnamese poster generated externally (or via `image-generator`) before resize/branding (`<ratio>` = `9x16`, `16x9`, or `3x4`). |
+| `poster_<slug>_vi_<ratio>_raw.<ext>` | Unmodified Vietnamese poster generated externally before resize/branding (`<ratio>` = `9x16`, `16x9`, or `3x4`). |
 | `poster_<slug>_vi_<ratio>_clean.png` | Normalized full-res PNG (`1080x1920` for `9x16`, `1920x1080` for `16x9`, `1080x1440` for `3x4`) with zero text distortion and optional corner star `✦` removed. |
 | `poster_<slug>_vi_<ratio>_branded.png` | Final publish-ready poster with dual-corner channel branding (`13_top_left_logo_large.png` + `15_top_right_vietsub_floating.png`). |
 
@@ -64,10 +64,10 @@ Exact Vietnamese spelling and diacritics, zero Chinese characters, zero watermar
 
 ## 4. Step 3 — Standardize, Clean & Brand via `aicn.py brand-poster`
 
-Once the user drops the generated poster (e.g., `Editing_Vietnamese_anime_poster_xxxx.jpg`) into `posters/`, run:
+Once the generated poster is placed into `posters/`, run:
 
 ```bash
-python <skill>/scripts/aicn.py brand-poster \
+$AICN_PY <skill>/scripts/aicn.py brand-poster \
   --hub workspace/<series-slug> \
   --input workspace/<series-slug>/posters/<raw_file> \
   --brand-dir <branding_dir> \
@@ -77,7 +77,7 @@ python <skill>/scripts/aicn.py brand-poster \
 Options:
 - `--aspect auto|9x16|16x9|3x4` (default `auto`: detects portrait `9x16` → `1080×1920`, widescreen `16x9` → `1920×1080`, or `3x4` → `1080×1440` using aspect-preserving center-crop + Lanczos resize).
 - `--remove-star` (optional: removes the Flow/Imagen bottom-right corner star `✦` via smooth boundary inpainting before resizing; omit when the raw image has no star).
-- `--delete-source` (removes the messy-named input file after archiving it as `poster_<slug>_vi_<ratio>_raw.<ext>`).
+- `--delete-source` (removes the original input file after archiving it as `poster_<slug>_vi_<ratio>_raw.<ext>`).
 - **Mandatory visual verification:** Always inspect `poster_<slug>_vi_<ratio>_branded.png` via `read_file` to verify Vietnamese diacritics, zero Chinese leakage, and clean dual-corner logo placement without overlapping the title.
 
 ---

@@ -111,7 +111,7 @@ Exact commands per stage: `references/stages.md`.
 | Stage | Does | Gate | Cached by |
 |---|---|---|---|
 | 0 Init | series hub + internal working batches (`units/*`), fps/PTS-normalized `master_source.mp4` | stage_0 (decoupled from `series_bible.json`) | `source/master_source.mp4` |
-| 1 Prep (Stems + ASR + audit) | `run-series --phase prep` (GPU `separate+ASR` overlapped with CPU `waveform+audit`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
+| 1 Prep (Stems + ASR + audit) | `run-series --phase prep` (GPU `separate` + `large-v3` Pass 1 anti-stall + Gap-First Multi-Band Pass 2B Full/High/Mid/Low + Reverse Refine overlapped with CPU `waveform+audit`) | `verify_stage_1.py` | stems & Stage 1 frozen by source sha256 |
 | 2 Script | `02_bilingual_script.json` (translation, `sub_text`, `tts_text`) + living `series_bible.json` | `validate_bilingual_script.py` | stream each unit immediately on Stage 1 PASS |
 | 3 Audio (full dub) | `aicn_audio.py all`: stems (cached) → CPU VieNeu TTS (2×4 threads) + parallel rubberband → `analyze` (9-band spectral + HP/LP conditioning) → cached-Z mix (anti-pumping hold + gentle vocal carve) → fast 48 kHz master → verify | audio gate + `verify_stage_3.py` | stems: source sha; dub: hub-shared `<hub>/.cache/tts_sent/<sha>.wav` |
 | 4 Render (Dub + Watermark) | `render` (one ffmpeg pass: hardware `videotoolbox`/`nvenc` or `libx264` with `--brand-dir` dual-corner watermark, or instant video stream-copy when no watermark is set) | `aicn.py verify-render` / `verify-overlay` (codec/audio + A/V sync + frame count) | whole batch: sha256(source, audio, watermark, encoder, renderer version); unchanged → skipped |

@@ -335,12 +335,18 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
 
 
 
-ASR_PIPELINE_VERSION = "asr-2.2"
+ASR_PIPELINE_VERSION = "asr-3.0"
 HALLUCINATION_SUBSTRINGS = (
     "索兰娅", "谢谢观看", "感谢观看", "感谢收看", "请不吝点赞", "点赞订阅",
     "字幕由", "优优独播剧场", "Amara.org", "Thank you for watching", "Thanks for watching",
-    "Please subscribe", "Subtitles by",
+    "Please subscribe", "Subtitles by", "以下是普通话的句子", "使用简体中文",
 )
+
+
+def _initial_prompt_for(source_lang: str) -> str | None:
+    if source_lang == "zh":
+        return "以下是普通话的句子，使用简体中文。"
+    return None
 
 
 def _is_hallucination(text: str) -> bool:
@@ -369,12 +375,14 @@ class _MlxWhisper:
         self.repo = self.REPO.get(size, size)
 
     def transcribe(self, audio, language="zh", word_timestamps=False, beam_size=None, vad_filter=None,
-                   vad_parameters=None, condition_on_previous_text=True, temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)):
+                   vad_parameters=None, condition_on_previous_text=False, temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+                   initial_prompt=None):
         import mlx_whisper
+        prompt = initial_prompt if initial_prompt is not None else ("以下是普通话的句子，使用简体中文。" if language == "zh" else None)
         r = mlx_whisper.transcribe(np.asarray(audio, np.float32), path_or_hf_repo=self.repo, language=language,
                                    word_timestamps=word_timestamps, condition_on_previous_text=condition_on_previous_text,
                                    temperature=temperature, verbose=None,
-                                   initial_prompt="以下是普通话的句子，使用简体中文。" if language == "zh" else None)
+                                   initial_prompt=prompt)
         # No VAD in mlx-whisper: drop what Whisper itself marks as silence or a repetition loop
         keep = [d for d in r["segments"]
                 if not (d.get("no_speech_prob", 0) > 0.6 and d.get("avg_logprob", 0) < -1.0)
@@ -465,22 +473,30 @@ def run_multipass_whisper_asr(
         pass1_audio = raw_audio
 
     model = load_whisper(model_size)
-    vad_params = dict(threshold=0.25, min_speech_duration_ms=80, min_silence_duration_ms=220, speech_pad_ms=180)
-    segments_gen, _ = model.transcribe(
-        pass1_audio,
+    prompt = _initial_prompt_for(source_lang)
+    vad_params = dict(threshold=0.20, min_speech_duration_ms=80, min_silence_duration_ms=200, speech_pad_ms=200)
+    transcribe_kwargs = dict(
         language=whisper_lang,
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=vad_params,
+        condition_on_previous_text=False,
     )
+    if prompt:
+        transcribe_kwargs["initial_prompt"] = prompt
+    segments_gen, _ = model.transcribe(pass1_audio, **transcribe_kwargs)
 
     results = []
     last_log = time.time()
     for idx, seg in enumerate(segments_gen):
         txt = seg.text.strip()
-        if not txt:
+        if not txt or _is_hallucination(txt):
             continue
         avg_prob = round(float(getattr(seg, "avg_logprob", -0.2)), 3)
+        no_sp = float(getattr(seg, "no_speech_prob", 0.0))
+        comp_r = float(getattr(seg, "compression_ratio", 1.0))
+        if (no_sp > 0.75 and avg_prob < -1.0) or comp_r > 2.4:
+            continue
         words = list(getattr(seg, "words", None) or [])
         if words:
             chunks = [[words[0]]]
@@ -491,7 +507,7 @@ def run_multipass_whisper_asr(
                     chunks[-1].append(w)
             for ch in chunks:
                 ch_txt = "".join(w.word for w in ch).strip()
-                if not ch_txt:
+                if not ch_txt or _is_hallucination(ch_txt):
                     continue
                 st_w = round(max(float(seg.start), float(ch[0].start)), 3)
                 et_w = round(min(float(seg.end), max(st_w + 0.15, float(ch[-1].end))), 3)
@@ -616,107 +632,444 @@ def run_multipass_whisper_asr(
                 f"{visual_ocr_cnt} visual-only sub-clause gaps for mandatory keyframe OCR.",
                 flush=True,
             )
-    # Pass 2B: Acoustic Quiet-Whisper, Telephone/Radio & Uncovered Vocal Burst Recovery (in-RAM bandpass, independent of hardsub)
-    from analyze_voice_waveform import compute_voice_mask_and_bursts, _bandpass_in_ram
-    raw_tel = _bandpass_in_ram(raw_audio, 300.0, 3400.0, sr=16000)
-    # Fast local RMS normalization for telephony envelope without spawning an extra ffmpeg decode
-    win_n = 1600
-    tel_env = np.sqrt(np.convolve(raw_tel ** 2, np.ones(win_n, dtype=np.float32) / win_n, mode="same") + 1e-8)
-    tel_src = np.clip(raw_tel / np.maximum(tel_env * 3.0, 0.04), -0.95, 0.95).astype(np.float32)
-    voc_bp = _bandpass_in_ram(voc_audio, 150.0, 6000.0, sr=16000)
-    _, merged_bursts = compute_voice_mask_and_bursts(
-        voc_audio, tel_src, raw_tel_arr=raw_tel, raw_arr=raw_audio, sr=16000
+    # Pass 2B: Gap-First Multi-Band Frequency ASR (Full / High / Mid / Low) + Reverse Cross-Check & Refine
+    p2b_report_path = os.path.join(os.path.dirname(os.path.abspath(out_json)), "01_pass2b_recovery_report.json")
+    results, _ = run_multiband_pass2b_recovery(
+        model=model,
+        results=results,
+        voc_audio=voc_audio,
+        raw_audio=raw_audio,
+        whisper_lang=whisper_lang,
+        source_lang=source_lang,
+        sr=16000,
+        report_path=p2b_report_path,
     )
-    sr = 16000
-    uncovered_bursts = []
-    for b in merged_bursts:
-        bst, bet = float(b["start"]), float(b["end"])
-        bdur = bet - bst
-        kind = b.get("kind", "normal")
-        is_candidate = (
-            (kind == "phone_call" and bdur >= 0.40)
-            or (kind == "whisper" and bdur >= 0.45)
-            or (bdur >= 0.35 and float(b.get("peak_voc_rms", 0.0)) >= 0.08)
-        )
-        if not is_candidate:
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"[DONE] Saved {len(results)} total fine-grained ASR segments to {out_json} in {time.time()-t0:.2f}s", flush=True)
+
+
+def _text_char_overlap(a: str, b: str) -> float:
+    """Character-level Dice similarity (robust for Chinese clauses without spaces and short English phrases)."""
+    sa = [c for c in a.lower() if ("\u4e00" <= c <= "\u9fff") or c.isalnum()]
+    sb = [c for c in b.lower() if ("\u4e00" <= c <= "\u9fff") or c.isalnum()]
+    if not sa or not sb:
+        return 0.0
+    set_a, set_b = set(sa), set(sb)
+    return 2.0 * len(set_a & set_b) / (len(set_a) + len(set_b))
+
+
+def _probe_band_clip(
+    model,
+    wave: np.ndarray,
+    pad_s: float,
+    pad_e: float,
+    gst: float,
+    get: float,
+    band_name: str,
+    whisper_lang: str | None,
+    source_lang: str,
+    peak_voc_rms: float,
+    sr: int = 16000,
+) -> list:
+    """Run vad_filter=False Whisper on one frequency-band slice and return scored candidate segments."""
+    s_idx = max(0, int(round(pad_s * sr)))
+    e_idx = min(len(wave), int(round(pad_e * sr)))
+    clip = wave[s_idx:e_idx]
+    if len(clip) < int(0.30 * sr):
+        return []
+    mx = float(np.max(np.abs(clip)))
+    if mx <= 0.002:
+        return []
+    clip = (clip / mx * 0.85).astype(np.float32)
+
+    prompt = _initial_prompt_for(source_lang)
+    kwargs = dict(
+        language=whisper_lang,
+        beam_size=3 if band_name in ("full_vocal", "raw_clean") else 2,
+        word_timestamps=False,
+        vad_filter=False,
+        condition_on_previous_text=False,
+        temperature=0.0,
+    )
+    if prompt:
+        kwargs["initial_prompt"] = prompt
+    try:
+        sub_gen, _ = model.transcribe(clip, **kwargs)
+    except TypeError:
+        kwargs.pop("initial_prompt", None)
+        sub_gen, _ = model.transcribe(clip, **kwargs)
+
+    cands = []
+    for sg in list(sub_gen):
+        rec_text = sg.text.strip()
+        if not rec_text or _is_hallucination(rec_text):
             continue
-        ov = sum(max(0.0, min(bet, s["end"]) - max(bst, s["start"])) for s in results)
-        if (ov / max(0.2, bdur)) < 0.35:
-            uncovered_bursts.append(b)
-    if uncovered_bursts:
+        rec_prob = round(float(getattr(sg, "avg_logprob", -0.6)), 3)
+        no_sp = float(getattr(sg, "no_speech_prob", 0.0))
+        comp_r = float(getattr(sg, "compression_ratio", 1.0))
+        n_cjk = len([c for c in rec_text if "\u4e00" <= c <= "\u9fff"])
+        if source_lang == "zh":
+            # Allow crisp 1-char exclamations (e.g. "嗯", "啊", "走", "停") only when high-confidence & loud vocal
+            has_words = (n_cjk >= 2) or (n_cjk == 1 and rec_prob > -0.45 and no_sp < 0.25 and peak_voc_rms >= 0.035)
+        else:
+            has_words = len(rec_text.strip()) >= 3
+        if not (rec_prob > -0.95 and no_sp < 0.65 and comp_r <= 2.2 and has_words):
+            continue
+
+        seg_st = round(max(gst, pad_s + float(getattr(sg, "start", 0.0))), 3)
+        seg_et = round(min(get, pad_s + float(getattr(sg, "end", get - pad_s))), 3)
+        if seg_et - seg_st < 0.18:
+            continue
+        base_score = round(rec_prob - 0.80 * no_sp - max(0.0, comp_r - 1.8) * 0.40, 4)
+        cands.append({
+            "start": seg_st,
+            "end": seg_et,
+            "text": rec_text,
+            "avg_logprob": rec_prob,
+            "no_speech_prob": round(no_sp, 3),
+            "compression_ratio": round(comp_r, 3),
+            "band": band_name,
+            "base_score": base_score,
+        })
+    return cands
+
+
+def _refine_span_to_band_energy(seg_st: float, seg_et: float, band_raw: np.ndarray, sr: int = 16000):
+    """Trim dead leading/trailing silence inside a recovered segment using 25ms RMS hops on the winning band."""
+    if band_raw is None or len(band_raw) == 0 or (seg_et - seg_st) <= 0.45:
+        return round(seg_st, 3), round(seg_et, 3)
+    hop = max(1, int(round(0.025 * sr)))
+    i0 = max(0, int(round(seg_st * sr)))
+    i1 = min(len(band_raw), int(round(seg_et * sr)))
+    seg_x = band_raw[i0:i1]
+    n_h = len(seg_x) // hop
+    if n_h < 6:
+        return round(seg_st, 3), round(seg_et, 3)
+    blks = seg_x[: n_h * hop].reshape(n_h, hop)
+    rms = np.sqrt(np.mean(blks ** 2, axis=1) + 1e-12)
+    pk = float(np.max(rms))
+    if pk <= 0.002:
+        return round(seg_st, 3), round(seg_et, 3)
+    act = np.where(rms >= max(0.0025, pk * 0.16))[0]
+    if act.size == 0:
+        return round(seg_st, 3), round(seg_et, 3)
+    new_st = max(seg_st, seg_st + max(0, int(act[0]) - 2) * 0.025)
+    new_et = min(seg_et, seg_st + min(n_h, int(act[-1]) + 3) * 0.025)
+    if (new_et - new_st) < 0.25:
+        return round(seg_st, 3), round(seg_et, 3)
+    return round(new_st, 3), round(new_et, 3)
+
+
+def fuse_and_refine_multiband_candidates(
+    candidates: list,
+    streams: dict,
+    gap_meta: dict,
+    model=None,
+    whisper_lang: str | None = None,
+    source_lang: str = "zh",
+    sr: int = 16000,
+) -> list:
+    """
+    Reverse Cross-Check & Cross-Band Candidate Fusion:
+      1. Clusters temporally overlapping ASR candidates across full_vocal / high / mid / low bands.
+      2. Multi-band consensus (>=2 independent frequency bands agreeing) gets a strong confidence bonus (+0.18).
+      3. Single-band-only detections undergo reverse verification:
+         - Acoustic modulation/energy check on the winning band inside [start, end], AND
+         - When vocals stem was attenuated (<0.022 RMS — e.g. Demucs stripped child/cartoon/phone voice into accomp),
+           runs a reverse cross-check probe on `raw_clean` (100-7500 Hz unfiltered raw) to confirm or refine the text.
+         - Unconfirmed single-band detections require tighter confidence (`avg_logprob > -0.78`, `no_speech_prob < 0.50`).
+      4. Refines winning candidate's [start, end] to active band energy onset/offset.
+    """
+    if not candidates:
+        return []
+
+    ordered = sorted(candidates, key=lambda c: (c["start"], c["end"]))
+    clusters = []
+    for c in ordered:
+        placed = False
+        for cl in clusters:
+            cl_st = min(x["start"] for x in cl)
+            cl_et = max(x["end"] for x in cl)
+            ov = max(0.0, min(cl_et, c["end"]) - max(cl_st, c["start"]))
+            min_d = max(0.15, min(cl_et - cl_st, c["end"] - c["start"]))
+            union_d = max(0.15, max(cl_et, c["end"]) - min(cl_st, c["start"]))
+            if (ov / min_d) >= 0.45 or (ov / union_d) >= 0.30:
+                cl.append(c)
+                placed = True
+                break
+        if not placed:
+            clusters.append([c])
+
+    band_to_cue = {
+        "full_vocal": gap_meta.get("kind", "normal"),
+        "high": "high_voice",
+        "mid": "phone_call" if gap_meta.get("kind") == "phone_call" else "mid_voice",
+        "low": "low_voice",
+        "raw_clean": "raw_verified",
+    }
+
+    fused = []
+    voc_raw = streams.get("voc_raw")
+    raw_clean_wave = streams.get("raw_clean")
+    total_dur = (len(raw_clean_wave) / sr) if raw_clean_wave is not None else float(gap_meta.get("end", 0.0))
+
+    for cl in clusters:
+        bands_present = sorted({x["band"] for x in cl})
+        cl_st = min(x["start"] for x in cl)
+        cl_et = max(x["end"] for x in cl)
+
+        # Reverse cross-check against raw_clean when only 1 band fired and vocals stem is weak (Demucs attenuation)
+        if len(bands_present) == 1 and model is not None and raw_clean_wave is not None:
+            s0 = max(0, int(round(cl_st * sr)))
+            s1 = min(len(voc_raw), int(round(cl_et * sr))) if voc_raw is not None else 0
+            local_voc_rms = float(np.sqrt(np.mean(voc_raw[s0:s1] ** 2) + 1e-12)) if s1 > s0 else 0.0
+            if local_voc_rms < 0.022 and bands_present[0] != "raw_clean":
+                r_pad_s = max(0.0, cl_st - 0.20)
+                r_pad_e = min(total_dur, cl_et + 0.20)
+                rev_cands = _probe_band_clip(
+                    model=model,
+                    wave=raw_clean_wave,
+                    pad_s=r_pad_s,
+                    pad_e=r_pad_e,
+                    gst=cl_st,
+                    get=cl_et,
+                    band_name="raw_clean",
+                    whisper_lang=whisper_lang,
+                    source_lang=source_lang,
+                    peak_voc_rms=float(gap_meta.get("peak_voc_rms", 0.0)),
+                    sr=sr,
+                )
+                for rc in rev_cands:
+                    ov = max(0.0, min(cl_et, rc["end"]) - max(cl_st, rc["start"]))
+                    if ov >= 0.15:
+                        cl.append(rc)
+                bands_present = sorted({x["band"] for x in cl})
+
+        # Score each candidate with cross-band consensus + text agreement
+        best_item = None
+        best_score = -999.0
+        for cand in cl:
+            other_bands = [x for x in cl if x["band"] != cand["band"]]
+            agreed_bands = {cand["band"]}
+            max_txt_sim = 0.0
+            for ob in other_bands:
+                sim = _text_char_overlap(cand["text"], ob["text"])
+                max_txt_sim = max(max_txt_sim, sim)
+                if sim >= 0.25 or (min(cand["end"], ob["end"]) - max(cand["start"], ob["start"])) >= 0.25:
+                    agreed_bands.add(ob["band"])
+            consensus_bonus = (0.18 if len(agreed_bands) >= 2 else 0.0) + (0.10 * max_txt_sim)
+            # Slight preference for full_vocal/raw_clean on exact tie (broader natural bandwidth)
+            bw_bonus = 0.03 if cand["band"] in ("full_vocal", "raw_clean") else 0.0
+            total_score = cand["base_score"] + consensus_bonus + bw_bonus
+            if total_score > best_score:
+                best_score = total_score
+                best_item = (cand, sorted(agreed_bands), round(total_score, 4))
+
+        if best_item is None:
+            continue
+        win, agreed_bands, win_score = best_item
+
+        # Reject unconfirmed single-band low-confidence detections (anti-hallucination guard)
+        if len(agreed_bands) == 1:
+            if not (win["avg_logprob"] > -0.78 and win["no_speech_prob"] < 0.50):
+                continue
+            # Acoustic energy confirmation on winning band raw waveform
+            b_raw = streams.get(f"{win['band']}_raw")
+            if b_raw is not None and len(b_raw) > 0:
+                s0 = max(0, int(round(win["start"] * sr)))
+                s1 = min(len(b_raw), int(round(win["end"] * sr)))
+                if s1 > s0:
+                    seg_rms = float(np.sqrt(np.mean(b_raw[s0:s1] ** 2) + 1e-12))
+                    if seg_rms < 0.003:
+                        continue
+
+        ref_st, ref_et = _refine_span_to_band_energy(
+            win["start"], win["end"], streams.get(f"{win['band']}_raw"), sr=sr
+        )
+        fused.append({
+            "id": -1,
+            "start": ref_st,
+            "end": ref_et,
+            "text": win["text"],
+            "avg_logprob": win["avg_logprob"],
+            "cue_type": band_to_cue.get(win["band"], "normal"),
+            "winning_band": win["band"],
+            "bands_agreed": agreed_bands,
+            "fusion_score": win_score,
+            "source": f"pass2b_multiband_{win['band']}",
+        })
+
+    return fused
+
+
+def run_multiband_pass2b_recovery(
+    model,
+    results: list,
+    voc_audio: np.ndarray,
+    raw_audio: np.ndarray,
+    whisper_lang: str | None,
+    source_lang: str,
+    sr: int = 16000,
+    report_path: str | None = None,
+):
+    """
+    Gap-First Multi-Band Frequency ASR Recovery (v2.5.0):
+      1. Decomposes audio into Full-Vocal (120-7500 Hz), High (900-7500 Hz), Mid (300-3400 Hz),
+         Low (85-1400 Hz), and Raw-Clean (100-7500 Hz) streams in RAM.
+      2. Scans ONLY uncovered timeline gaps (<= 10s energy-valley-split windows, zero RMS dead zone).
+      3. Probes Full-Vocal first; whenever uncovered or borderline confidence, sweeps active High/Mid/Low
+         frequency bands, runs Reverse Cross-Check & Fusion, refines timestamps, and logs verified non-speech gaps.
+    """
+    from analyze_voice_waveform import build_multiband_audio_streams, detect_uncovered_multiband_gaps
+
+    streams = build_multiband_audio_streams(voc_audio, raw_audio, sr=sr)
+    uncovered_gaps = detect_uncovered_multiband_gaps(
+        results, voc_audio, raw_audio, streams=streams, sr=sr, max_window_s=10.0, min_gap_s=0.35
+    )
+
+    recovered_by_band = {"full_vocal": 0, "high": 0, "mid": 0, "low": 0, "raw_clean": 0}
+    verified_non_speech_gaps = []
+    rec_cnt = 0
+    total_dur = len(streams["raw_raw"]) / sr
+
+    if uncovered_gaps:
         print(
-            f"[PASS 2B ACOUSTIC RECOVERY] Probing {len(uncovered_bursts)} uncovered whisper/phone/vocal bursts...",
+            f"[PASS 2B MULTI-BAND RECOVERY] Probing {len(uncovered_gaps)} uncovered acoustic gaps "
+            f"(Full / High 900-7500Hz / Mid 300-3400Hz / Low 85-1400Hz + Reverse Refine)...",
             flush=True,
         )
-        rec_cnt = 0
-        for b in uncovered_bursts:
-            kind = b.get("kind", "normal")
-            pad_s = max(0.0, float(b["start"]) - 0.22)
-            pad_e = min(len(raw_audio) / sr, float(b["end"]) + 0.22)
-            s_idx, e_idx = int(round(pad_s * sr)), int(round(pad_e * sr))
-            # Whisper uses separated vocals (so BGM does not drown soft voice); phone_call uses telephony bandpass raw audio
-            if kind == "phone_call":
-                src_wave = tel_src
-            elif kind == "whisper":
-                src_wave = voc_bp
-            else:
-                src_wave = voc_audio
-            clip = src_wave[s_idx:min(len(src_wave), e_idx)]
-            if len(clip) < int(0.35 * sr):
-                continue
-            mx = float(np.max(np.abs(clip)))
-            if mx > 0.002:
-                clip = clip / mx * 0.85
-            sub_gen, _ = model.transcribe(
-                clip,
-                language=whisper_lang,
-                beam_size=5,
-                word_timestamps=True,
-                vad_filter=False,
-                condition_on_previous_text=False,
-                temperature=0.0,
+        p2b_t0 = time.time()
+        last_p2b_log = p2b_t0
+        for g_idx, g in enumerate(uncovered_gaps, 1):
+            gst, get = float(g["start"]), float(g["end"])
+            gdur = max(0.2, get - gst)
+            pad_s = max(0.0, gst - 0.25)
+            pad_e = min(total_dur, get + 0.25)
+            p_voc = float(g.get("peak_voc_rms", 0.0))
+
+            # Step 2B-1: Full-Vocal band probe first (catches clear speech dropped by Pass 1 Silero VAD)
+            all_cands = _probe_band_clip(
+                model=model,
+                wave=streams["full_vocal"],
+                pad_s=pad_s,
+                pad_e=pad_e,
+                gst=gst,
+                get=get,
+                band_name="full_vocal",
+                whisper_lang=whisper_lang,
+                source_lang=source_lang,
+                peak_voc_rms=p_voc,
+                sr=sr,
             )
-            sub_list = list(sub_gen)
-            for sg in sub_list:
-                rec_text = sg.text.strip()
-                if not rec_text or _is_hallucination(rec_text):
-                    continue
-                rec_prob = round(float(getattr(sg, "avg_logprob", -0.6)), 3)
-                no_sp = float(getattr(sg, "no_speech_prob", 0.0))
-                comp_r = float(getattr(sg, "compression_ratio", 1.0))
-                n_cjk = len([c for c in rec_text if "\u4e00" <= c <= "\u9fff"])
-                has_words = (n_cjk >= 2) if (source_lang == "zh") else (len(rec_text.strip()) >= 3)
-                if not (rec_prob > -0.95 and no_sp < 0.65 and comp_r <= 2.2 and has_words):
-                    continue
-                seg_st = round(max(float(b["start"]), pad_s + float(getattr(sg, "start", 0.0))), 3)
-                seg_et = round(min(float(b["end"]), pad_s + float(getattr(sg, "end", b["end"] - pad_s))), 3)
-                if seg_et - seg_st < 0.20:
-                    continue
+
+            # Check if Full-Vocal already covered >=65% of the gap with high confidence
+            hi_conf_cov = sum(
+                max(0.0, c["end"] - c["start"])
+                for c in all_cands
+                if c["avg_logprob"] > -0.42 and c["no_speech_prob"] < 0.30
+            )
+            need_multiband = (hi_conf_cov / gdur) < 0.65
+
+            # Step 2B-2: Multi-Band Spectral Sweep (High / Mid / Low in dominance order, early-stop on strong consensus)
+            probed_extra = []
+            if need_multiband:
+                for bname in g.get("probe_bands", ["high", "mid", "low"]):
+                    wave = streams.get(bname)
+                    if wave is None:
+                        continue
+                    probed_extra.append(bname)
+                    b_cands = _probe_band_clip(
+                        model=model,
+                        wave=wave,
+                        pad_s=pad_s,
+                        pad_e=pad_e,
+                        gst=gst,
+                        get=get,
+                        band_name=bname,
+                        whisper_lang=whisper_lang,
+                        source_lang=source_lang,
+                        peak_voc_rms=p_voc,
+                        sr=sr,
+                    )
+                    all_cands.extend(b_cands)
+                    # Early stop once >=2 distinct bands strongly cover >=65% of this gap
+                    strong_bands = {c["band"] for c in all_cands if c["avg_logprob"] > -0.45 and c["no_speech_prob"] < 0.25}
+                    if len(strong_bands) >= 2:
+                        strong_cov = sum(
+                            max(0.0, c["end"] - c["start"])
+                            for c in all_cands
+                            if c["band"] == bname and c["avg_logprob"] > -0.45 and c["no_speech_prob"] < 0.25
+                        )
+                        if (strong_cov / gdur) >= 0.65:
+                            break
+
+            # Step 2B-3: Reverse Cross-Check, Consensus Fusion & Energy-Onset Refine
+            refined = fuse_and_refine_multiband_candidates(
+                candidates=all_cands,
+                streams=streams,
+                gap_meta=g,
+                model=model,
+                whisper_lang=whisper_lang,
+                source_lang=source_lang,
+                sr=sr,
+            )
+
+            gap_added = 0
+            for item in refined:
+                seg_st, seg_et = float(item["start"]), float(item["end"])
                 ov_existing = sum(
                     max(0.0, min(seg_et, float(r["end"])) - max(seg_st, float(r["start"])))
                     for r in results
                 )
                 if (ov_existing / max(0.2, seg_et - seg_st)) >= 0.35:
                     continue
+                results.append(item)
                 rec_cnt += 1
-                results.append({
-                    "id": -1,
-                    "start": seg_st,
-                    "end": seg_et,
-                    "text": rec_text,
-                    "avg_logprob": rec_prob,
-                    "cue_type": kind,
-                    "source": f"pass2_acoustic_{kind}_recovery",
+                gap_added += 1
+                wb = item.get("winning_band", "full_vocal")
+                recovered_by_band[wb] = recovered_by_band.get(wb, 0) + 1
+
+            if gap_added == 0:
+                verified_non_speech_gaps.append({
+                    "start": gst,
+                    "end": get,
+                    "duration": round(gdur, 2),
+                    "kind": g.get("kind", "normal"),
+                    "probed_bands": ["full_vocal"] + probed_extra,
                 })
+            if time.time() - last_p2b_log >= 15.0:
+                print(
+                    f"[PROGRESS] Pass 2B probed {g_idx}/{len(uncovered_gaps)} gaps (recovered={rec_cnt}) "
+                    f"in {time.time()-p2b_t0:.1f}s",
+                    flush=True,
+                )
+                last_p2b_log = time.time()
+
         if rec_cnt:
             results.sort(key=lambda x: (x["start"], x["end"]))
             for idx, item in enumerate(results):
                 item["id"] = idx
-        print(f"[PASS 2B DONE] Recovered {rec_cnt} quiet/whisper/phone/vocal bursts via acoustic recovery.", flush=True)
 
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    print(f"[DONE] Saved {len(results)} total fine-grained ASR segments to {out_json} in {time.time()-t0:.2f}s", flush=True)
+        print(
+            f"[PASS 2B DONE] Recovered {rec_cnt} segments across {len(uncovered_gaps)} gaps "
+            f"(by_band={recovered_by_band}, verified_non_speech={len(verified_non_speech_gaps)}).",
+            flush=True,
+        )
+
+    report = {
+        "pipeline_version": ASR_PIPELINE_VERSION,
+        "gaps_probed": len(uncovered_gaps),
+        "recovered_total": rec_cnt,
+        "recovered_by_band": recovered_by_band,
+        "verified_non_speech_gaps": verified_non_speech_gaps,
+    }
+    if report_path:
+        os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as rf:
+            json.dump(report, rf, ensure_ascii=False, indent=2)
+    return results, report
 
 
 def main():
@@ -725,6 +1078,7 @@ def main():
     parser.add_argument("--workspace", required=True, help="Workspace directory path (workspace/<slug>).")
     parser.add_argument("--color-mode", default="white", choices=["white", "yellow", "auto"], help="Optional bbox scan color mode (only used with --with-bbox-scan).")
     parser.add_argument("--source-lang", default=None, help="Source language code for Whisper (e.g. zh, en, auto). Defaults to project_config/series_bible or 'zh'.")
+    parser.add_argument("--model", default=None, help="Whisper model size (default: AICN_WHISPER_MODEL or 'large-v3').")
     parser.add_argument("--with-bbox-scan", action="store_true", help="Opt-in to legacy 5fps pixel bbox scan (disabled by default in v2.0.0 dub+watermark pipeline).")
     parser.add_argument("--skip-scan", action="store_true", help="Deprecated no-op (bbox scan is already skipped by default).")
     parser.add_argument("--skip-asr", action="store_true", help="Skip Whisper ASR if 01_asr_raw_segments.json already exists.")
@@ -764,8 +1118,9 @@ def main():
         legacy_voc = os.path.join(args.workspace, "media", "demucs", "vocals.wav")
         vocals_path = stems_voc if os.path.exists(stems_voc) else legacy_voc
         source_lang = resolve_source_language(args.workspace, args.source_lang)
+        model_size = args.model or os.environ.get("AICN_WHISPER_MODEL", "large-v3")
         asr_key = _hashlib.sha256(
-            f"{ASR_PIPELINE_VERSION}|{_fast_file_sig(args.video)}|{_fast_file_sig(vocals_path)}|{_fast_file_sig(bbox_json)}|{source_lang}".encode()
+            f"{ASR_PIPELINE_VERSION}|{model_size}|{_fast_file_sig(args.video)}|{_fast_file_sig(vocals_path)}|{_fast_file_sig(bbox_json)}|{source_lang}".encode()
         ).hexdigest()[:16]
         asr_cache_p = os.path.join(args.workspace, ".cache", "stage1_asr_cache.json")
         prev_key = None
@@ -783,11 +1138,12 @@ def main():
                 vocals_path=vocals_path,
                 bbox_json=bbox_json,
                 out_json=asr_json,
+                model_size=model_size,
                 source_lang=source_lang,
             )
             os.makedirs(os.path.dirname(asr_cache_p), exist_ok=True)
             with open(asr_cache_p, "w", encoding="utf-8") as cf:
-                json.dump({"key": asr_key, "version": ASR_PIPELINE_VERSION, "source_lang": source_lang}, cf, indent=2)
+                json.dump({"key": asr_key, "version": ASR_PIPELINE_VERSION, "model": model_size, "source_lang": source_lang}, cf, indent=2)
 
     # Always run Multi-Band Acoustic Waveform & Sub-Clause Alignment Audit
     from analyze_voice_waveform import analyze_waveform_and_clauses

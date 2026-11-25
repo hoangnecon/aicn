@@ -98,11 +98,17 @@ def main():
         premature_cnt = wf_report.get("premature_lead_segments_count", 0)
         ac_bursts = wf_report["acoustic_voice_bursts_count"]
         ac_ratio = wf_report["acoustic_speech_coverage_ratio"]
+        uncov_ac = wf_report.get("uncovered_acoustic_bursts_count", 0)
+        max_gap_s = float(wf_report.get("longest_uncovered_vocal_gap_s", 0.0))
+        p2b_sum = wf_report.get("multiband_pass2b_summary", {})
 
         metrics["bloated_segments_count"] = bloated_cnt
         metrics["premature_lead_segments_count"] = premature_cnt
         metrics["acoustic_voice_bursts_count"] = ac_bursts
         metrics["acoustic_speech_coverage_ratio"] = ac_ratio
+        metrics["uncovered_acoustic_bursts_count"] = uncov_ac
+        metrics["longest_uncovered_vocal_gap_s"] = max_gap_s
+        metrics["multiband_pass2b_summary"] = p2b_sum
 
         ac_ok = (
             (ac_ratio >= 0.90)
@@ -111,7 +117,9 @@ def main():
             and (len(unresolved_gaps) == 0)
         )
         ac_detail = (
-            f"acoustic_cov={ac_ratio*100:.1f}% (need >=90.0%), bursts={ac_bursts}, "
+            f"acoustic_cov={ac_ratio*100:.1f}% (need >=90.0%), bursts={ac_bursts}, uncovered={uncov_ac}, "
+            f"max_unprobed_vocal_gap={max_gap_s:.1f}s, pass2b_rec={p2b_sum.get('recovered_total', 0)} "
+            f"({p2b_sum.get('recovered_by_band', {})}), "
             f"bloated={bloated_cnt} (need 0), premature_lead={premature_cnt} (need 0)"
         )
 

@@ -46,7 +46,7 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-WAVEFORM_CACHE_VERSION = "wf-2.2"
+WAVEFORM_CACHE_VERSION = "wf-3.0"
 
 
 def _fast_file_sig(path: str) -> str:
@@ -115,12 +115,302 @@ def compute_audio_spectral_profile(audio_arr: np.ndarray, sr: int = 16000) -> di
     }
 
 
-def _bandpass_in_ram(x: np.ndarray, lo_hz: float, hi_hz: float, sr: int = 16000) -> np.ndarray:
-    """Fast zero-disk Butterworth bandpass filter in RAM (avoids redundant ffmpeg MP4 decodes)."""
+def _bandpass_in_ram(x: np.ndarray, lo_hz: float, hi_hz: float, sr: int = 16000, order: int = 4) -> np.ndarray:
+    """Fast zero-disk 4th-order Butterworth SOS bandpass filter in RAM (-24 dB/oct isolation, zero ffmpeg spawns)."""
     from scipy.signal import butter, sosfilt
     nyq = 0.5 * sr
-    sos = butter(2, [max(10.0, lo_hz) / nyq, min(nyq * 0.95, hi_hz) / nyq], btype="band", output="sos")
+    sos = butter(order, [max(10.0, lo_hz) / nyq, min(nyq * 0.95, hi_hz) / nyq], btype="band", output="sos")
     return sosfilt(sos, np.asarray(x, dtype=np.float32)).astype(np.float32)
+
+
+def _local_rms_norm(x: np.ndarray, sr: int = 16000, win_s: float = 0.10, floor: float = 0.035) -> np.ndarray:
+    """Fast in-RAM dynamic gain normalization (replaces slow ffmpeg dynaudnorm passes)."""
+    arr = np.asarray(x, dtype=np.float32)
+    if arr.size == 0:
+        return arr
+    win_n = max(16, int(round(win_s * sr)))
+    env = np.sqrt(np.convolve(arr ** 2, np.ones(win_n, dtype=np.float32) / win_n, mode="same") + 1e-8)
+    return np.clip(arr / np.maximum(env * 3.0, floor), -0.95, 0.95).astype(np.float32)
+
+
+def build_multiband_audio_streams(voc_arr: np.ndarray, raw_arr: np.ndarray, sr: int = 16000) -> dict:
+    """
+    Decompose vocals + raw full-mix audio into 4 speech-targeted frequency bands + clean raw reference:
+      - full_vocal (120-7500 Hz, 70% voc + 30% raw): clean full-spectrum speech (VAD recovery)
+      - high       (900-7500 Hz, 55% voc + 45% raw): child/cartoon high-pitch voices, bright female voices, breathy whispers
+      - mid        (300-3400 Hz, 35% voc + 65% raw): core speech formants, phone/radio/PA comms (immune to Demucs phone loss)
+      - low        ( 85-1400 Hz, 75% voc + 25% raw): deep male voices & muffled speech drowned by high-frequency SFX
+      - raw_clean  (100-7500 Hz, 100% raw):          reverse cross-check stream when Demucs strips a voice into accomp
+    Returns both raw band waveforms (`<band>_raw`) for energy measurement and locally-normalized (`<band>`) for ASR.
+    """
+    min_len = min(len(voc_arr), len(raw_arr))
+    v = np.asarray(voc_arr[:min_len], dtype=np.float32)
+    r = np.asarray(raw_arr[:min_len], dtype=np.float32)
+
+    full_mix = 0.70 * v + 0.30 * r
+    high_mix = 0.55 * v + 0.45 * r
+    mid_mix = 0.35 * v + 0.65 * r
+    low_mix = 0.75 * v + 0.25 * r
+
+    full_bp = _bandpass_in_ram(full_mix, 120.0, 7500.0, sr=sr)
+    high_bp = _bandpass_in_ram(high_mix, 900.0, 7500.0, sr=sr)
+    mid_bp = _bandpass_in_ram(mid_mix, 300.0, 3400.0, sr=sr)
+    low_bp = _bandpass_in_ram(low_mix, 85.0, 1400.0, sr=sr)
+    raw_clean_bp = _bandpass_in_ram(r, 100.0, 7500.0, sr=sr)
+
+    return {
+        "full_vocal_raw": full_bp,
+        "high_raw": high_bp,
+        "mid_raw": mid_bp,
+        "low_raw": low_bp,
+        "raw_clean_raw": raw_clean_bp,
+        "full_vocal": _local_rms_norm(full_bp, sr=sr, floor=0.040),
+        "high": _local_rms_norm(high_bp, sr=sr, floor=0.030),
+        "mid": _local_rms_norm(mid_bp, sr=sr, floor=0.035),
+        "low": _local_rms_norm(low_bp, sr=sr, floor=0.040),
+        "raw_clean": _local_rms_norm(raw_clean_bp, sr=sr, floor=0.040),
+        "voc_raw": v,
+        "raw_raw": r,
+    }
+
+
+def _hop_rms_and_zcr(x: np.ndarray, n_hops: int, hop: int):
+    blks = x[: n_hops * hop].reshape(n_hops, hop)
+    rms = np.sqrt(np.mean(blks ** 2, axis=1) + 1e-12)
+    zcr = np.mean(np.abs(np.diff(np.sign(blks), axis=1)), axis=1) / 2.0
+    return rms, zcr
+
+
+def _sliding_mod_cv(rms_arr: np.ndarray, win_hops: int = 10) -> np.ndarray:
+    """Compute local syllable envelope modulation CV (std/mean) in a sliding window (~0.5s at 50ms hop)."""
+    n = len(rms_arr)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    w = max(3, min(win_hops, n))
+    kernel = np.ones(w, dtype=np.float32) / w
+    mean = np.convolve(rms_arr, kernel, mode="same")
+    mean_sq = np.convolve(rms_arr ** 2, kernel, mode="same")
+    var = np.maximum(0.0, mean_sq - mean ** 2)
+    return (np.sqrt(var) / (mean + 1e-6)).astype(np.float32)
+
+
+def detect_uncovered_multiband_gaps(
+    existing_segments: list,
+    voc_arr: np.ndarray,
+    raw_arr: np.ndarray,
+    streams: dict = None,
+    sr: int = 16000,
+    max_window_s: float = 10.0,
+    min_gap_s: float = 0.35,
+) -> list:
+    """
+    Gap-First Multi-Band Uncovered Speech Scanner (independent of hardsubs):
+      1. Masks out timeline regions ALREADY covered by `existing_segments` FIRST (eliminating giant-blob swallowing).
+      2. Scans EVERY uncovered 50ms hop across 4 frequency bands (full_vocal, high, mid, low) with adaptive per-band
+         noise floors and syllable modulation checks — eliminating the old 0.024-0.080 RMS dead zone.
+      3. Automatically splits any contiguous uncovered speech region longer than `max_window_s` (default 10s) at its
+         lowest-energy valley so Whisper never suffers 30s window drift.
+      4. Annotates each gap with per-band normalized dominance scores and recommended probe order.
+    """
+    if streams is None:
+        streams = build_multiband_audio_streams(voc_arr, raw_arr, sr=sr)
+
+    hop = int(0.05 * sr)
+    n_samples = min(len(streams["voc_raw"]), len(streams["raw_raw"]), len(streams["full_vocal_raw"]))
+    n_hops = n_samples // hop
+    if n_hops <= 0:
+        return []
+
+    # 1. Build covered mask from existing ASR segments (inset by 0.05s so adjacent missed speech stays exposed)
+    covered = np.zeros(n_hops, dtype=bool)
+    for s in existing_segments or []:
+        st = float(s.get("start", 0.0)) + 0.05
+        et = float(s.get("end", 0.0)) - 0.05
+        if et <= st:
+            st = float(s.get("start", 0.0))
+            et = float(s.get("end", 0.0))
+        i0 = max(0, int(round(st / 0.05)))
+        i1 = min(n_hops, int(round(et / 0.05)))
+        if i1 > i0:
+            covered[i0:i1] = True
+
+    # 2. Per-band 50ms RMS, ZCR, and local syllable modulation CV
+    voc_rms, voc_zcr = _hop_rms_and_zcr(streams["voc_raw"], n_hops, hop)
+    full_rms, full_zcr = _hop_rms_and_zcr(streams["full_vocal_raw"], n_hops, hop)
+    hi_rms, hi_zcr = _hop_rms_and_zcr(streams["high_raw"], n_hops, hop)
+    mid_rms, mid_zcr = _hop_rms_and_zcr(streams["mid_raw"], n_hops, hop)
+    lo_rms, lo_zcr = _hop_rms_and_zcr(streams["low_raw"], n_hops, hop)
+    raw_hi_bp = _bandpass_in_ram(streams["raw_raw"][: n_hops * hop], 3600.0, 7200.0, sr=sr)
+    raw_hi_rms, _ = _hop_rms_and_zcr(raw_hi_bp, n_hops, hop)
+    voc_hi_bp = _bandpass_in_ram(streams["voc_raw"][: n_hops * hop], 900.0, 7500.0, sr=sr)
+    voc_hi_rms, _ = _hop_rms_and_zcr(voc_hi_bp, n_hops, hop)
+    voc_lo_bp = _bandpass_in_ram(streams["voc_raw"][: n_hops * hop], 85.0, 1400.0, sr=sr)
+    voc_lo_rms, _ = _hop_rms_and_zcr(voc_lo_bp, n_hops, hop)
+
+    voc_mod = _sliding_mod_cv(voc_rms, 10)
+    full_mod = _sliding_mod_cv(full_rms, 10)
+    hi_mod = _sliding_mod_cv(hi_rms, 10)
+    mid_mod = _sliding_mod_cv(mid_rms, 10)
+    lo_mod = _sliding_mod_cv(lo_rms, 10)
+
+    def _floor(arr, lo_cap, hi_cap):
+        return max(lo_cap, min(hi_cap, float(np.percentile(arr, 15))))
+
+    voc_fl = _floor(voc_rms, 0.0020, 0.0070)
+    hi_fl = _floor(hi_rms, 0.0015, 0.0065)
+    mid_fl = _floor(mid_rms, 0.0025, 0.0100)
+    lo_fl = _floor(lo_rms, 0.0025, 0.0100)
+
+    # Active speech masks across all 4 bands (zero dead zone between whisper and loud speech!)
+    is_full = (voc_rms > max(0.0075, voc_fl * 2.1)) & (voc_zcr >= 0.015) & (voc_zcr <= 0.45) & (
+        (voc_rms > max(0.018, voc_fl * 3.2)) | (voc_mod >= 0.14)
+    )
+    # High band: child/cartoon voices (high pitch & ZCR up to 0.62) + breathy whispers
+    is_high = (
+        (hi_rms > max(0.0050, hi_fl * 2.2))
+        & (hi_zcr >= 0.04)
+        & (hi_zcr <= 0.62)
+        & (hi_mod >= 0.15)
+        & ((voc_hi_rms > max(0.0030, hi_fl * 1.4)) | (hi_rms > max(0.012, hi_fl * 3.5)))
+    )
+    # Mid band: telephony/radio/PA (300-3400 Hz roll-off above 3.6 kHz) or strong syllable-modulated mid-band speech
+    mid_vs_hi = mid_rms / (raw_hi_rms + 1e-6)
+    is_mid = (
+        (mid_rms > max(0.0065, mid_fl * 2.2))
+        & (mid_zcr >= 0.02)
+        & (mid_zcr <= 0.42)
+        & (mid_mod >= 0.16)
+        & (
+            (mid_vs_hi > 1.8)
+            | (voc_rms > max(0.010, voc_fl * 2.4))
+            | ((mid_rms > max(0.015, mid_fl * 3.5)) & (mid_mod >= 0.22))
+        )
+    )
+    # Low band: deep male voices / muffled speech where vocals stem has strong low-band speech modulation
+    is_low = (
+        (lo_rms > max(0.0080, lo_fl * 2.2))
+        & (voc_lo_rms > max(0.0060, lo_fl * 1.8))
+        & (lo_zcr >= 0.01)
+        & (lo_zcr <= 0.28)
+        & (lo_mod >= 0.15)
+    )
+
+    uncovered_active = (~covered) & (is_full | is_high | is_mid | is_low)
+
+    # 3. Group uncovered active hops across <= 0.25s syllable pauses (never crossing covered hops!)
+    raw_spans = []
+    i = 0
+    while i < n_hops:
+        if uncovered_active[i]:
+            j = i + 1
+            while j < n_hops:
+                if uncovered_active[j]:
+                    j += 1
+                    continue
+                # Bridge up to 5 hops (0.25s) of silence ONLY if none of those hops are covered
+                bridge = 0
+                while (j + bridge) < n_hops and bridge < 5 and (not uncovered_active[j + bridge]) and (not covered[j + bridge]):
+                    bridge += 1
+                if bridge < 5 and (j + bridge) < n_hops and uncovered_active[j + bridge]:
+                    j = j + bridge + 1
+                else:
+                    break
+            raw_spans.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    # 4. Split any long uncovered span (> max_window_s) at lowest-energy valleys so Whisper stays in crisp short windows
+    min_hops = max(2, int(round(min_gap_s / 0.05)))
+    max_hops = max(min_hops + 4, int(round(max_window_s / 0.05)))
+    min_split_hops = max(min_hops, int(round(3.5 / 0.05)))
+    composite_env = np.maximum(voc_rms, 0.65 * full_rms)
+
+    split_spans = []
+    for i0, i1 in raw_spans:
+        cur = i0
+        while (i1 - cur) > max_hops:
+            lo_cut = cur + min_split_hops
+            hi_cut = min(i1 - min_hops, cur + max_hops)
+            if hi_cut <= lo_cut:
+                cut = min(i1, cur + max_hops)
+            else:
+                rel_min = int(np.argmin(composite_env[lo_cut:hi_cut + 1]))
+                cut = lo_cut + rel_min
+            split_spans.append((cur, cut))
+            cur = cut
+        if (i1 - cur) >= min_hops:
+            split_spans.append((cur, i1))
+
+    # 5. Filter steady sustained instruments/BGM and score dominant frequency bands per gap
+    gaps = []
+    for i0, i1 in split_spans:
+        dur = round((i1 - i0) * 0.05, 2)
+        if dur < min_gap_s:
+            continue
+        p_voc = float(np.max(voc_rms[i0:i1]))
+        p_full = float(np.max(full_rms[i0:i1]))
+        p_hi = float(np.max(hi_rms[i0:i1]))
+        p_mid = float(np.max(mid_rms[i0:i1]))
+        p_lo = float(np.max(lo_rms[i0:i1]))
+
+        m_voc = float(np.std(voc_rms[i0:i1]) / (np.mean(voc_rms[i0:i1]) + 1e-6))
+        m_hi = float(np.std(hi_rms[i0:i1]) / (np.mean(hi_rms[i0:i1]) + 1e-6))
+        m_mid = float(np.std(mid_rms[i0:i1]) / (np.mean(mid_rms[i0:i1]) + 1e-6))
+        m_lo = float(np.std(lo_rms[i0:i1]) / (np.mean(lo_rms[i0:i1]) + 1e-6))
+        best_mod = max(m_voc, m_hi, m_mid, m_lo)
+
+        # Reject steady unmodulated hum / sustained solo instrument unless vocals stem is clearly loud speech
+        if best_mod < 0.14 and p_voc < 0.035:
+            continue
+
+        # Normalized band SNR above floor to rank probe priority (full_vocal, high, mid, low)
+        band_snr = {
+            "full_vocal": round(float(np.mean(full_rms[i0:i1])) / max(1e-4, voc_fl), 2),
+            "high": round(float(np.mean(hi_rms[i0:i1])) / max(1e-4, hi_fl), 2),
+            "mid": round(float(np.mean(mid_rms[i0:i1])) / max(1e-4, mid_fl), 2),
+            "low": round(float(np.mean(lo_rms[i0:i1])) / max(1e-4, lo_fl), 2),
+        }
+        band_hits = {
+            "full_vocal": int(is_full[i0:i1].sum()),
+            "high": int(is_high[i0:i1].sum()),
+            "mid": int(is_mid[i0:i1].sum()),
+            "low": int(is_low[i0:i1].sum()),
+        }
+        active_bands = [b for b in ("high", "mid", "low") if band_hits[b] >= 2 or band_snr[b] >= 1.8]
+        active_bands.sort(key=lambda b: (band_hits[b], band_snr[b]), reverse=True)
+        if not active_bands:
+            active_bands = sorted(("high", "mid", "low"), key=lambda b: band_snr[b], reverse=True)[:2]
+
+        dominant = max(("full_vocal", "high", "mid", "low"), key=lambda b: (band_hits[b], band_snr[b]))
+        if band_hits["mid"] > band_hits["full_vocal"] and band_hits["mid"] >= 3 and p_voc < p_mid * 0.75:
+            kind = "phone_call"
+        elif band_hits["high"] >= band_hits["full_vocal"] and band_hits["high"] >= 3 and p_voc < 0.030:
+            kind = "high_voice"
+        elif p_voc < 0.022 and band_hits["full_vocal"] >= 2:
+            kind = "whisper"
+        elif band_hits["low"] > band_hits["high"] and band_hits["low"] >= 3 and p_voc < 0.035:
+            kind = "low_voice"
+        else:
+            kind = "normal"
+
+        gaps.append({
+            "start": round(i0 * 0.05, 2),
+            "end": round(i1 * 0.05, 2),
+            "duration": dur,
+            "kind": kind,
+            "dominant_band": dominant,
+            "probe_bands": active_bands,
+            "band_snr": band_snr,
+            "peak_voc_rms": round(p_voc, 4),
+            "peak_full_rms": round(p_full, 4),
+            "peak_high_rms": round(p_hi, 4),
+            "peak_mid_rms": round(p_mid, 4),
+            "peak_low_rms": round(p_lo, 4),
+            "mod_cv": round(best_mod, 3),
+        })
+
+    return gaps
 
 
 def compute_voice_mask_and_bursts(
@@ -714,7 +1004,19 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
                         })
                         break
 
-    # 3. Check acoustic voice bursts overlapping visual sub-clauses + quiet/whisper/phone bursts
+    # 3. Check acoustic voice bursts overlapping visual sub-clauses + multi-band Pass 2B recovery audit
+    pass2b_report_path = os.path.join(data_dir, "01_pass2b_recovery_report.json")
+    pass2b_report = {}
+    verified_non_speech = []
+    if os.path.exists(pass2b_report_path):
+        try:
+            with open(pass2b_report_path, "r", encoding="utf-8") as pf:
+                pass2b_report = json.load(pf)
+            verified_non_speech = list(pass2b_report.get("verified_non_speech_gaps", []))
+        except Exception:
+            pass2b_report = {}
+            verified_non_speech = []
+
     speech_bursts_covered = 0
     speech_bursts_total = 0
     uncovered_acoustic_bursts = []
@@ -726,18 +1028,82 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         has_sub_clause = any(max(0.0, min(bet, sc["end"]) - max(bst, sc["start"])) >= 0.25 for sc in sub_clauses)
         ov = sum(max(0.0, min(bet, float(s["end"])) - max(bst, float(s["start"]))) for s in segs)
         ov_ratio = ov / max(0.2, bdur)
-        if has_sub_clause or b["peak_voc_rms"] >= 0.035 or b.get("kind") in ("whisper", "phone_call"):
+        non_speech_ov = sum(
+            max(0.0, min(bet, float(ns["end"])) - max(bst, float(ns["start"])))
+            for ns in verified_non_speech
+        )
+        non_speech_ratio = non_speech_ov / max(0.2, bdur)
+        # Smart Acoustic Gate (v2.5.0): never blindly mark unprobed strong vocal bursts as covered when sub_clauses is empty.
+        # Pure BGM/SFX bursts explicitly probed across High/Mid/Low/Full bands by Pass 2B (`verified_non_speech_gaps`)
+        # do not deadlock Stage 1 (preserving L-015), while unprobed strong vocal gaps are caught immediately.
+        if has_sub_clause:
             speech_bursts_total += 1
-            if ov_ratio >= 0.40 or not has_sub_clause:
+            if ov_ratio >= 0.40:
                 speech_bursts_covered += 1
             else:
                 uncovered_acoustic_bursts.append({**b, "coverage_ratio": round(ov_ratio, 3)})
+        elif b["peak_voc_rms"] >= 0.035:
+            speech_bursts_total += 1
+            if ov_ratio >= 0.40 or (ov_ratio + non_speech_ratio) >= 0.60:
+                speech_bursts_covered += 1
+            else:
+                uncovered_acoustic_bursts.append({
+                    **b,
+                    "coverage_ratio": round(ov_ratio, 3),
+                    "probed_non_speech_ratio": round(non_speech_ratio, 3),
+                })
+        elif b.get("kind") in ("whisper", "phone_call"):
+            speech_bursts_total += 1
+            if ov_ratio >= 0.40 or non_speech_ratio >= 0.50 or not verified_non_speech:
+                speech_bursts_covered += 1
+            else:
+                uncovered_acoustic_bursts.append({
+                    **b,
+                    "coverage_ratio": round(ov_ratio, 3),
+                    "probed_non_speech_ratio": round(non_speech_ratio, 3),
+                })
+
+    # Compute longest contiguous unprobed active-vocal gap (catches 20-90s Whisper stalls immediately)
+    covered_or_verified = np.zeros(n_hops, dtype=bool)
+    for s in segs:
+        i0 = max(0, int(round(float(s["start"]) / 0.05)))
+        i1 = min(n_hops, int(round(float(s["end"]) / 0.05)))
+        if i1 > i0:
+            covered_or_verified[i0:i1] = True
+    for ns in verified_non_speech:
+        i0 = max(0, int(round(float(ns["start"]) / 0.05)))
+        i1 = min(n_hops, int(round(float(ns["end"]) / 0.05)))
+        if i1 > i0:
+            covered_or_verified[i0:i1] = True
+    unprobed_vocal = voice_mask & (~covered_or_verified)
+    longest_gap_hops = 0
+    cur_run = 0
+    gap_tol = 0
+    for k in range(n_hops):
+        if unprobed_vocal[k]:
+            cur_run += 1 + gap_tol
+            gap_tol = 0
+            if cur_run > longest_gap_hops:
+                longest_gap_hops = cur_run
+        elif cur_run > 0 and (not covered_or_verified[k]) and gap_tol < 8:
+            gap_tol += 1
+        else:
+            cur_run = 0
+            gap_tol = 0
+    longest_uncovered_vocal_gap_s = round(longest_gap_hops * 0.05, 2)
 
     sc_ratio = (covered_cnt / len(sub_clauses)) if sub_clauses else 1.0
     ac_ratio = (speech_bursts_covered / speech_bursts_total) if speech_bursts_total else 1.0
     seg_durs = [max(0.0, float(s["end"]) - float(s["start"])) for s in segs]
     total_dur_min = max(0.01, float(profile.get("duration", n_hops * 0.05)) / 60.0)
     active_voice_pct = round(100.0 * float(voice_mask.mean()), 2) if n_hops else 0.0
+
+    multiband_summary = {
+        "gaps_probed": int(pass2b_report.get("gaps_probed", 0)),
+        "recovered_total": int(pass2b_report.get("recovered_total", 0)),
+        "recovered_by_band": pass2b_report.get("recovered_by_band", {}),
+        "verified_non_speech_gaps_count": len(verified_non_speech),
+    }
 
     report = {
         "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -768,6 +1134,8 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         "acoustic_speech_coverage_ratio": round(ac_ratio, 4),
         "uncovered_acoustic_bursts_count": len(uncovered_acoustic_bursts),
         "uncovered_acoustic_bursts": uncovered_acoustic_bursts[:25],
+        "longest_uncovered_vocal_gap_s": longest_uncovered_vocal_gap_s,
+        "multiband_pass2b_summary": multiband_summary,
         "source_spectral_profile": spectral_summary,
         "vocals_spectral_profile": vocal_spectral_summary,
     }
@@ -779,7 +1147,9 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
     print(
         f"[DONE] Waveform & Spectral Audit: clauses={len(segs)} ({report['clause_cadence']['clauses_per_min']}/min), "
         f"sub_clauses={covered_cnt}/{len(sub_clauses)} ({sc_ratio*100:.1f}%), "
-        f"whispers={whisper_bursts_count}, phone_calls={phone_call_bursts_count}, uncovered_acoustic={len(uncovered_acoustic_bursts)}, "
+        f"whispers={whisper_bursts_count}, phone_calls={phone_call_bursts_count}, "
+        f"uncovered_acoustic={len(uncovered_acoustic_bursts)}, max_unprobed_vocal_gap={longest_uncovered_vocal_gap_s}s, "
+        f"pass2b_rec={multiband_summary['recovered_total']}, "
         f"HP/LP_hint={spectral_summary.get('recommended_hp_hz')}/{spectral_summary.get('recommended_lp_hz')}Hz, "
         f"bloated={len(bloated_segments)}, premature_lead={len(premature_lead_segments)}, "
         f"internal_blank_gaps={len(internal_blank_gap_segments)} -> {out_audit} in {time.time()-t0:.2f}s",

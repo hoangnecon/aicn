@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.5.0 (2026-11-25)
+- **Stage 1 Anti-Stall Pass 1, Gap-First Multi-Band Frequency Pass 2B (High / Mid / Low + Reverse Cross-Check & Refine) & Smart Acoustic Gate (`vendor/video-asr-visual-audit/scripts/`, `L-017`)**:
+  - **Pass 1 Hardening (`asr-3.0`, `run_asr_and_scan.py`):** Set `condition_on_previous_text=False`, added Simplified Chinese `initial_prompt` for `faster-whisper`, added `--model` CLI flag (hashed into Stage 1 ASR cache key alongside `asr-3.0`), tuned VAD (`threshold=0.20`, `speech_pad_ms=200`), and filtered Pass 1 hallucinations/repetition loops so stale context cannot blank out 30–90s dialogue stretches.
+  - **Gap-First Multi-Band Spectral Scanner (`analyze_voice_waveform.py`, `wf-3.0`):** Added `build_multiband_audio_streams()` (`full_vocal` 120–7500 Hz, `high` 900–7500 Hz, `mid` 300–3400 Hz, `low` 85–1400 Hz, `raw_clean` 100–7500 Hz) and `detect_uncovered_multiband_gaps()` which masks already-transcribed Pass 1 spans FIRST, eliminates the `0.024–0.080` RMS dead zone, and splits uncovered regions `> 10s` at energy valleys so Whisper always decodes crisp short windows.
+  - **Multi-Band Pass 2B + Reverse Cross-Check & Refine (`run_asr_and_scan.py`):** Added `run_multiband_pass2b_recovery()` and `fuse_and_refine_multiband_candidates()` — probes `full_vocal` first, sweeps active `high` / `mid` / `low` bands whenever uncovered `< 65%` or borderline confidence, runs reverse cross-check on `raw_clean` when Demucs attenuated vocals (child/cartoon/phone voices), fuses candidates by cross-band consensus + text overlap, keeps high-confidence 1-char CJK exclamations, trims spans to active band energy onset/offset, and writes `data/01_pass2b_recovery_report.json`.
+  - **Smart Acoustic Gate (`analyze_voice_waveform.py`, `verify_stage_1.py`):** Removed the blind `or not has_sub_clause` exemption; unprobed strong vocal bursts (`peak_voc_rms >= 0.035`) are now flagged alongside `longest_uncovered_vocal_gap_s`, while pure BGM/SFX gaps explicitly confirmed in `verified_non_speech_gaps` remain deadlock-free (`L-015`).
+  - **Tests (`tests/test_stage1_multiband_asr.py`):** Added 5 regression tests covering dead-zone Gap-First splitting, High/Mid/Low + reverse recovery, 1-char exclamation & hallucination guards, and Smart Acoustic Gate enforcement.
+
 ## 2.4.0 (2026-11-25)
 - **VieNeu-TTS v3 Turbo CUDA Single-Process `infer_batch()` (`scripts/aicn_audio.py`, `L-016`)**:
   - Replaced multi-process CPU-style `ProcessPoolExecutor` spawning on CUDA machines with a single in-process PyTorch GPU `Vieneu` instance using `infer_batch(batch_size=16)` (configurable via `tts_batch_size` in `config/audio_mix.json`, or `AICN_TTS_DEVICE=cpu` override), grouped by `(voice, temperature, top_k)` with atomic per-chunk cache writes.

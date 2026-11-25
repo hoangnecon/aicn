@@ -161,3 +161,11 @@ Structured log of verified production failures, user corrections, and API change
 - **Guardrail Implemented (`v2.6.1`):**
   1. Removed `initial_prompt` from all `vad_filter=False` Pass 2B calls, enforced `_is_hallucination(sg.text)` on the full unchopped segment before slot splitting, added word-probability + `max_ok_dur` anti-bloat caps + near-silent vocals consensus filtering, and recorded all probed gaps in `verified_non_speech_gaps` (`asr-3.2`).
   2. Clamped bloated Pass 1 spans inside `detect_uncovered_multiband_gaps()`, widened loud high-pitch ZCR to `0.58`, and aligned `analyze_waveform_and_clauses()` (`wf-3.2`) with `< 1.0s` BGM micro-tick filtering and `voice_mask` hop coverage inside wide BGM-bridged bursts, backed by regression tests (`68/68` passing).
+
+## L-020 (2026-11-25) — `run-series --phase prep` Cross-Process `gpu.lock` Self-Deadlock
+- **Symptom:** Running `aicn.py run-series --phase prep` on `v2.6.0`/`v2.6.1` froze indefinitely at `START <unit>:separate[CUDA] -> [GPU-LOCK] Waiting for exclusive lock (gpu.lock)...` with 0% GPU utilization across every tab on the machine.
+- **Verified Root Cause:** `cmd_run_series` (`_prep_one`) acquired the OS-level exclusive lock `ap.gpu_lock()` (`msvcrt.locking` / `fcntl.flock`) in the parent `aicn.py` process and then spawned child subprocesses (`aicn_audio.py separate` and `run_asr_and_scan.py`) that also called `ap.gpu_lock()`. Because `file_lock(reentrant=True)` only tracked in-process thread-local depth (`_LOCAL_LOCK_DEPTH`), the child subprocess saw depth `0` and blocked forever waiting for its own parent to release `gpu.lock`.
+- **Guardrail Implemented (`v2.6.2`):**
+  1. Added thread-safe `ap.child_env_with_held_locks()` in `scripts/aicn_platform.py` propagating only the calling thread's held locks via `AICN_HELD_LOCKS`, and updated `file_lock(reentrant=True)` to honor inherited locks without re-acquiring the OS lock.
+  2. Updated `aicn.py` `cmd_run_series._run()` to pass `env=ap.child_env_with_held_locks()` to `subprocess.run()`.
+  3. Added cross-process re-entrancy regression test `test_file_lock_child_process_reentrant_no_deadlock` in `tests/test_aicn_platform.py` (`69/69` passing).

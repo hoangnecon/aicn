@@ -157,6 +157,28 @@ class PlatformBackends(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
             self.assertIn("OK", res.stdout)
 
+    def test_file_lock_child_process_reentrant_no_deadlock(self):
+        """Parent holding file_lock() spawning child with child_env_with_held_locks() must not self-deadlock."""
+        import subprocess
+        import tempfile
+
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        with tempfile.TemporaryDirectory() as td:
+            lp = os.path.join(td, "nested.lock")
+            with ap.file_lock(lp, reentrant=True):
+                res = subprocess.run(
+                    [
+                        sys.executable, "-c",
+                        f"import sys\nsys.path.insert(0, r'{os.path.join(root, 'scripts')}')\n"
+                        f"import aicn_platform as ap\n"
+                        f"with ap.file_lock(r'{lp}', reentrant=True):\n    print('CHILD_LOCK_OK')\n",
+                    ],
+                    env=ap.child_env_with_held_locks(),
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+                self.assertIn("CHILD_LOCK_OK", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

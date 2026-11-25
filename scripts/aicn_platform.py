@@ -398,22 +398,44 @@ def machine_lock_dir() -> str:
     return str(base)
 
 
+def _env_held_locks() -> set[str]:
+    raw = os.environ.get("AICN_HELD_LOCKS", "")
+    if not raw:
+        return set()
+    return {os.path.normcase(os.path.abspath(p)) for p in raw.split(os.pathsep) if p.strip()}
+
+
+def child_env_with_held_locks(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a subprocess env propagating locks currently held by THIS thread so child scripts
+    calling ap.gpu_lock() / ap.file_lock(reentrant=True) inherit ownership without self-deadlocking."""
+    env = dict(os.environ if base_env is None else base_env)
+    held = _env_held_locks()
+    depths = getattr(_LOCAL_LOCK_DEPTH, "depths", None) or {}
+    for k, v in depths.items():
+        if v > 0:
+            held.add(k)
+    if held:
+        env["AICN_HELD_LOCKS"] = os.pathsep.join(sorted(held))
+    return env
+
+
 @contextlib.contextmanager
 def file_lock(path: str | Path, reentrant: bool = True, label: str = "") -> Iterator[None]:
     """Cross-platform advisory + process file lock using fcntl (POSIX) or msvcrt (Windows).
-    Re-entrant within the same thread when `reentrant=True` so nested GPU/engine calls never self-deadlock."""
+    Re-entrant within the same thread AND across child subprocesses spawned with
+    `child_env_with_held_locks()` when `reentrant=True`, so nested GPU/engine calls never self-deadlock."""
     lp = os.path.abspath(str(path))
     norm_key = os.path.normcase(lp)
     depths = getattr(_LOCAL_LOCK_DEPTH, "depths", None)
     if depths is None:
         depths = {}
         _LOCAL_LOCK_DEPTH.depths = depths
-    if reentrant and depths.get(norm_key, 0) > 0:
-        depths[norm_key] += 1
+    if reentrant and (depths.get(norm_key, 0) > 0 or norm_key in _env_held_locks()):
+        depths[norm_key] = depths.get(norm_key, 0) + 1
         try:
             yield
         finally:
-            depths[norm_key] -= 1
+            depths[norm_key] = max(0, depths.get(norm_key, 1) - 1)
         return
 
     os.makedirs(os.path.dirname(lp), exist_ok=True)

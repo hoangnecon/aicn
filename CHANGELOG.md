@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.6.2 (2026-11-25)
+- **Fix Cross-Process `gpu.lock` Self-Deadlock in `run-series --phase prep` (`scripts/aicn_platform.py`, `scripts/aicn.py`, `L-020`)**:
+  - Added thread-safe `ap.child_env_with_held_locks()` propagating only the calling thread's held locks via `AICN_HELD_LOCKS`, and updated `ap.file_lock(reentrant=True)` to honor inherited lock ownership across parent→child subprocess boundaries (fixing the `v2.6.0`/`v2.6.1` self-deadlock where `aicn.py run-series --phase prep` held `gpu.lock` while spawning `aicn_audio.py separate` / `run_asr_and_scan.py` which also requested `gpu.lock`).
+  - Added cross-process regression test `test_file_lock_child_process_reentrant_no_deadlock` in `tests/test_aicn_platform.py` (`69/69` passing).
+
 ## 2.6.1 (2026-11-25)
 - **Stitched Pass 2B Pre-Chop Hallucination Guard, Bloated-Span Exposure & Acoustic Gate Alignment (`asr-3.2`, `wf-3.2`, `L-019`)**:
   - **Stitched Pass 2B Anti-Hallucination Hardening (`run_asr_and_scan.py`, `asr-3.2`):**

@@ -1033,7 +1033,7 @@ def cmd_run_series(a):
         t0 = time.time()
         print(f"[run-series] START {tag}", flush=True)
         if not a.dry_run:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, env=ap.child_env_with_held_locks())
         print(f"[run-series] DONE  {tag} ({time.time() - t0:.1f}s)", flush=True)
 
     t_all = time.time()

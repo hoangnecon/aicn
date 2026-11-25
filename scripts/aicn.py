@@ -801,22 +801,29 @@ def cmd_verify_overlay(a):
 # ----------------------------------------------------------------- clean / merge-series
 def cmd_clean(a):
     """Safely prune heavy regenerable intermediates AFTER final_<unit>_vi.mp4 exists.
-    Default keeps all Stage 0-5 gate-hashed artifacts (PPPPPP stays green); --deep also removes
-    .staging_render.mp4 and master_audio_48k.wav (Stage 5 stays P, Stage 3/4 become x)."""
+    Default keeps all Stage 0-5 gate-hashed artifacts (PPPPPP stays green) while removing stems,
+    premaster/dub WAVs, per-segment TTS WAVs, rubberband clause cache, and waveform .npy caches;
+    --deep also removes .staging_render.mp4, master_audio_48k.wav, and unit source copies."""
     ws = os.path.abspath(a.unit)
     finals = glob.glob(os.path.join(ws, "media", "final_*_vi.mp4")) + glob.glob(os.path.join(ws, "deliverables", "16x9", "*.mp4"))
     if not finals and not a.force:
         sys.exit(f"[clean] refusing to prune {ws}: no final MP4 found (pass --force to override)")
     targets = [
         os.path.join(ws, "media", "stems"),
+        os.path.join(ws, "media", "tts_segments"),
+        os.path.join(ws, "media", "source_audio.wav"),
         os.path.join(ws, "media", "audio", "premaster_48k.wav"),
         os.path.join(ws, "media", "audio", "dub_voice_48k.wav"),
         os.path.join(ws, "media", ".staging_final.mp4"),
+        os.path.join(ws, ".cache", "rb_clause"),
+        *glob.glob(os.path.join(ws, ".cache", "waveform_features_*.npy")),
     ]
     if getattr(a, "deep", False):
         targets += [
             os.path.join(ws, "media", ".staging_render.mp4"),
             os.path.join(ws, "media", "master_audio_48k.wav"),
+            os.path.join(ws, "source", "master_source.mp4"),
+            os.path.join(ws, "source", "episodes"),
         ]
     freed = 0
     for p in targets:
@@ -947,6 +954,20 @@ def cmd_merge_series(a):
                     out_f.write(f"{cue_idx}\n{_fmt_srt(st + offset)} --> {_fmt_srt(et + offset)}\n{txt}\n\n")
                     cue_idx += 1
             offset += dur
+    # Prune redundant per-unit slice copies inside hub/deliverables/ so deliverables/ holds ONLY the single full-series master
+    for sub_d in (os.path.join(hub, "deliverables", "16x9"), os.path.join(hub, "deliverables", "9x16")):
+        for up in glob.glob(os.path.join(sub_d, "final_*_vi*.mp4")):
+            if os.path.abspath(up) != os.path.abspath(out_mp4):
+                try:
+                    os.remove(up)
+                except OSError:
+                    pass
+    for up_srt in glob.glob(os.path.join(hub, "deliverables", "subtitles", "*_vi.srt")):
+        if os.path.abspath(up_srt) != os.path.abspath(out_srt):
+            try:
+                os.remove(up_srt)
+            except OSError:
+                pass
     sz_mb = os.path.getsize(out_mp4) / 1e6
     ep_note = f", {total_eps} eps" if total_eps else ""
     hub_log = os.path.join(hub, "CHANGELOG.md")
@@ -1001,11 +1022,12 @@ def cmd_run_series(a):
     asr_tag = "Metal" if ap.detect_asr_backend(py, gpu_info)["device"] == "mps" else ("CUDA" if gpu_info.get("cuda") else "CPU")
     vid_tag = {"videotoolbox": "MediaEngine", "nvenc": "NVENC", "cpu": "CPU"}[ap.detect_video_backend()]
 
-    lock_dir = os.path.join(hub, ".cache", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
+    lock_dir = ap.machine_lock_dir()
 
     def _engine_lock(kind):
-        return ap.file_lock(os.path.join(lock_dir, f"{kind}.lock"))
+        if kind == "gpu":
+            return ap.gpu_lock()
+        return ap.file_lock(os.path.join(lock_dir, f"{kind}.lock"), reentrant=True, label=f"{kind.upper()}-LOCK")
 
     def _run(tag, cmd):
         t0 = time.time()
@@ -1024,7 +1046,7 @@ def cmd_run_series(a):
             src = os.path.join(u, "source", "master_source.mp4")
             with _engine_lock("gpu"):
                 _run(f"{bn}:separate[{demucs_tag}]", [py, audio_py, "separate", "--unit", u])
-                _run(f"{bn}:asr[{asr_tag}]", [py, os.path.join(s1_dir, "run_asr_and_scan.py"), "--video", src, "--workspace", u])
+                _run(f"{bn}:asr[{asr_tag}]", [py, os.path.join(s1_dir, "run_asr_and_scan.py"), "--video", src, "--workspace", u, "--skip-waveform"])
             with _engine_lock("cpu"):
                 _run(f"{bn}:waveform[CPU]", [py, os.path.join(s1_dir, "analyze_voice_waveform.py"), "--workspace", u, "--snap-and-split"])
                 _run(f"{bn}:audit-frames[CPU]", [py, os.path.join(s1_dir, "extract_audit_frames.py"), "--video", src, "--workspace", u])
@@ -1035,7 +1057,7 @@ def cmd_run_series(a):
         print(f"[run-series] prep finished in {(time.time() - t_all) / 60:.1f} min. Next: visually inspect frames/audit/ and run verify_stage_1.py.", flush=True)
         return
 
-    # phase == "produce": 3-engine overlapped pipeline across batches with Stage 2 PASS
+    # phase == "produce": overlapped pipeline across batches with Stage 2 PASS (aicn_audio.py acquires GPU lock only for Demucs/CUDA-TTS)
     todo = [u for u in units if len(gate_status(u)) >= 6 and gate_status(u)[2] == "P" and gate_status(u)[5] != "P"]
     print(f"[run-series] phase=produce hub={os.path.basename(hub)} batches={len(todo)}/{len(units)} dry_run={a.dry_run}", flush=True)
     render_flags = []
@@ -1050,11 +1072,8 @@ def cmd_run_series(a):
         bn = os.path.basename(u)
         gs = gate_status(u)
         if gs[3] != "P":
-            with _engine_lock("gpu"):
-                _run(f"{bn}:separate[{demucs_tag}]", [py, audio_py, "separate", "--unit", u])
-            with _engine_lock("cpu"):
-                for step in ("dub", "mix", "master", "verify"):
-                    _run(f"{bn}:{step}[CPU]", [py, audio_py, step, "--unit", u])
+            # Single Python process runs separate -> dub (CUDA infer_batch under gpu_lock) -> mix -> master -> verify
+            _run(f"{bn}:audio-all", [py, audio_py, "all", "--unit", u])
         qa_man = os.path.join(u, "data", "04_qa_frames_manifest.json")
         if gs[4] != "P" or not os.path.exists(qa_man):
             with _engine_lock("media"):

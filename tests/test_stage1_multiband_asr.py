@@ -62,8 +62,8 @@ class TestStage1MultiBandASR(unittest.TestCase):
         # [5..7s] Mid-band phone call (700+1500 Hz) sandwiched between 90 Hz bass AND 5200 Hz high-freq hiss -> ONLY mid isolates it!
         phone_mid = (syl * (0.060 * np.sin(2 * np.pi * 700 * t2) + 0.045 * np.sin(2 * np.pi * 1500 * t2))).astype(np.float32)
         hi_hiss = (0.14 * np.sin(2 * np.pi * 5200 * t2)).astype(np.float32)
-        # [9..11s] Deep male voice (240+420 Hz) in vocals, drowned by loud 5500 Hz high-freq SFX in raw
-        male_lo = (syl * (0.050 * np.sin(2 * np.pi * 240 * t2) + 0.040 * np.sin(2 * np.pi * 420 * t2))).astype(np.float32)
+        # [9..11s] Deep male voice (130+220 Hz, below mid's 300 Hz cutoff) in vocals, drowned by loud 5500 Hz high-freq SFX in raw
+        male_lo = (syl * (0.055 * np.sin(2 * np.pi * 130 * t2) + 0.045 * np.sin(2 * np.pi * 220 * t2))).astype(np.float32)
         hi_sfx = (0.16 * np.sin(2 * np.pi * 5500 * t2)).astype(np.float32)
         # [13..15s] Steady unmodulated 1500 Hz solo instrument (must NOT trigger)
         steady = (0.045 * np.sin(2 * np.pi * 1500 * t2)).astype(np.float32)
@@ -77,8 +77,8 @@ class TestStage1MultiBandASR(unittest.TestCase):
                 spec = np.abs(np.fft.rfft(clip)) ** 2
                 freqs = np.fft.rfftfreq(len(clip), 1.0 / sr)
                 tot = float(spec.sum() + 1e-12)
-                e_bass = float(spec[freqs < 160].sum()) / tot
-                e_lo = float(spec[(freqs >= 160) & (freqs < 480)].sum()) / tot
+                e_bass = float(spec[freqs < 105].sum()) / tot
+                e_lo = float(spec[(freqs >= 110) & (freqs < 280)].sum()) / tot
                 e_mid = float(spec[(freqs >= 550) & (freqs < 1800)].sum()) / tot
                 e_hi = float(spec[(freqs >= 2100) & (freqs < 4500)].sum()) / tot
                 e_sfx = float(spec[freqs >= 4600].sum()) / tot
@@ -178,9 +178,131 @@ class TestStage1MultiBandASR(unittest.TestCase):
             self.assertEqual(rep2["longest_uncovered_vocal_gap_s"], 0.0)
 
     def test_pass1_pipeline_version_and_defaults(self):
-        self.assertEqual(ras.ASR_PIPELINE_VERSION, "asr-3.0")
+        self.assertEqual(ras.ASR_PIPELINE_VERSION, "asr-3.1")
+        self.assertEqual(avw.WAVEFORM_CACHE_VERSION, "wf-3.1")
         self.assertEqual(ras._initial_prompt_for("zh"), "以下是普通话的句子，使用简体中文。")
         self.assertIsNone(ras._initial_prompt_for("en"))
+
+    def test_reentrant_gpu_lock_and_content_sha256_survives_move(self):
+        scripts_dir = os.path.abspath(os.path.join(HERE, "..", "scripts"))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import aicn_platform as ap
+        import shutil
+        with tempfile.TemporaryDirectory() as td:
+            old_lock_dir = os.environ.get("AICN_LOCK_DIR")
+            old_cache_dir = os.environ.get("AICN_CACHE_DIR")
+            os.environ["AICN_LOCK_DIR"] = os.path.join(td, "locks")
+            os.environ["AICN_CACHE_DIR"] = os.path.join(td, "gcache")
+            try:
+                # Re-entrant GPU lock in same thread must never self-deadlock
+                with ap.gpu_lock():
+                    with ap.gpu_lock():
+                        pass
+                p1 = os.path.join(td, "a", "sample.bin")
+                p2 = os.path.join(td, "b", "renamed.bin")
+                os.makedirs(os.path.dirname(p1), exist_ok=True)
+                os.makedirs(os.path.dirname(p2), exist_ok=True)
+                with open(p1, "wb") as f:
+                    f.write(b"identical-video-payload-123456")
+                h1 = avw._fast_file_sig(p1)
+                shutil.copyfile(p1, p2)
+                os.utime(p2, (1700000000, 1700000000))
+                h2 = avw._fast_file_sig(p2)
+                self.assertEqual(h1, h2, "Moving/recreating identical media must preserve content SHA-256")
+            finally:
+                if old_lock_dir is None:
+                    os.environ.pop("AICN_LOCK_DIR", None)
+                else:
+                    os.environ["AICN_LOCK_DIR"] = old_lock_dir
+                if old_cache_dir is None:
+                    os.environ.pop("AICN_CACHE_DIR", None)
+                else:
+                    os.environ["AICN_CACHE_DIR"] = old_cache_dir
+
+    def test_stitched_multigap_batching_packs_gaps_into_one_call(self):
+        sr = self.sr
+        t = np.arange(sr * 20) / sr
+        wave = (0.08 * np.sin(2 * np.pi * 900 * t)).astype(np.float32)
+        gaps = [
+            (0, {"start": 1.0, "end": 2.2, "peak_voc_rms": 0.05}),
+            (1, {"start": 5.0, "end": 6.4, "peak_voc_rms": 0.05}),
+            (2, {"start": 10.0, "end": 11.3, "peak_voc_rms": 0.05}),
+            (3, {"start": 15.0, "end": 16.2, "peak_voc_rms": 0.05}),
+        ]
+        calls = []
+
+        class _FakeWord:
+            def __init__(self, start, end, word):
+                self.start, self.end, self.word = start, end, word
+
+        class _BatchSpyModel:
+            def transcribe(self, buf, **kwargs):
+                calls.append(len(buf) / sr)
+                # Slot 0 starts at 0.0s (~1.7s long), sep 0.65s -> Slot 1 starts ~2.35s, etc.
+                s0 = _FakeSeg(0.25, 1.35, "第一句", avg_logprob=-0.20, no_speech_prob=0.05)
+                s0.words = [_FakeWord(0.30, 0.80, "第一"), _FakeWord(0.80, 1.30, "句")]
+                s1 = _FakeSeg(2.65, 3.85, "第二句", avg_logprob=-0.22, no_speech_prob=0.06)
+                s1.words = [_FakeWord(2.70, 3.30, "第二"), _FakeWord(3.30, 3.80, "句")]
+                return [s0, s1], {}
+
+        out = ras._probe_band_gaps_stitched(
+            model=_BatchSpyModel(),
+            wave=wave,
+            gap_entries=gaps,
+            band_name="full_vocal",
+            whisper_lang="zh",
+            source_lang="zh",
+            total_dur=20.0,
+            sr=sr,
+            force_stitch=True,
+        )
+        self.assertEqual(len(calls), 1, f"4 short gaps must be packed into 1 single Whisper call, got {calls}")
+        self.assertEqual(out[0][0]["text"], "第一句")
+        self.assertGreaterEqual(out[0][0]["start"], 1.0)
+        self.assertLessEqual(out[0][0]["end"], 2.2)
+        self.assertEqual(out[1][0]["text"], "第二句")
+        self.assertGreaterEqual(out[1][0]["start"], 5.0)
+        self.assertLessEqual(out[1][0]["end"], 6.4)
+        self.assertEqual(out[2], [])
+        self.assertEqual(out[3], [])
+
+    def test_pcm16_wav_halves_disk_footprint_and_migrates_legacy_tts_cache(self):
+        scripts_dir = os.path.abspath(os.path.join(HERE, "..", "scripts"))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import aicn_audio
+        x = (0.4 * np.sin(2 * np.pi * 440 * np.arange(48000) / 48000)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as td:
+            p16 = os.path.join(td, "pcm16.wav")
+            p32 = os.path.join(td, "flt32.wav")
+            aicn_audio._write_wav16(p16, x, 48000)
+            soundfile.write(p32, x, 48000, subtype="FLOAT")
+            self.assertLess(os.path.getsize(p16), os.path.getsize(p32) * 0.55)
+            y, _ = soundfile.read(p16, dtype="float32")
+            self.assertLess(float(np.max(np.abs(x - y))), 5e-5)
+
+            # Verify legacy <ws>/.cache/tts_sent migration to global cache
+            old_cache = os.environ.get("AICN_CACHE_DIR")
+            os.environ["AICN_CACHE_DIR"] = os.path.join(td, "global_cache")
+            try:
+                ws = os.path.join(td, "unit_01")
+                leg_dir = os.path.join(ws, ".cache", "tts_sent")
+                os.makedirs(leg_dir, exist_ok=True)
+                os.makedirs(os.path.join(ws, "config"), exist_ok=True)
+                with open(os.path.join(ws, "config", "project_config.json"), "w", encoding="utf-8") as f:
+                    json.dump({}, f)
+                leg_wav = os.path.join(leg_dir, "abc123.wav")
+                aicn_audio._write_wav16(leg_wav, x, 48000)
+                g_dir = aicn_audio._tts_cache_dir(ws)
+                resolved = aicn_audio._resolve_tts_cached_path(ws, g_dir, "abc123")
+                self.assertTrue(os.path.exists(resolved))
+                self.assertTrue(resolved.startswith(os.path.join(td, "global_cache")))
+            finally:
+                if old_cache is None:
+                    os.environ.pop("AICN_CACHE_DIR", None)
+                else:
+                    os.environ["AICN_CACHE_DIR"] = old_cache
 
 
 if __name__ == "__main__":

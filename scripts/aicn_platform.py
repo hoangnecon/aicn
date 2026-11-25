@@ -349,9 +349,10 @@ def find_chrome() -> str | None:
     return None
 
 
-# ----------------------------------------------------------------- Cross-platform file locking
+# ----------------------------------------------------------------- Cross-platform file locking & global cache
 _THREAD_LOCKS_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
+_LOCAL_LOCK_DEPTH = threading.local()
 
 
 def _get_thread_lock(key: str) -> threading.Lock:
@@ -363,12 +364,62 @@ def _get_thread_lock(key: str) -> threading.Lock:
         return lk
 
 
+def find_project_root(start_path: str | Path | None = None) -> Path | None:
+    """Walk up from start_path (or cwd) to find the AICN project root containing config/machine.json or workspace/."""
+    cur = Path(os.path.abspath(str(start_path or os.getcwd())))
+    if cur.is_file():
+        cur = cur.parent
+    for p in [cur, *cur.parents]:
+        if (p / "config" / "machine.json").is_file():
+            return p
+        if p.name == "workspace" and p.parent.exists():
+            return p.parent
+    return None
+
+
+def global_cache_dir(hint_path: str | Path | None = None) -> str:
+    """Return persistent cross-series cache root (<project_root>/.cache or AICN_CACHE_DIR or ~/.cache/aicn).
+    Survives pruning individual workspace/<series>/ folders."""
+    env_dir = os.environ.get("AICN_CACHE_DIR", "").strip()
+    if env_dir:
+        os.makedirs(env_dir, exist_ok=True)
+        return os.path.abspath(env_dir)
+    proj = find_project_root(hint_path)
+    base = (proj / ".cache") if proj is not None else (Path.home() / ".cache" / "aicn")
+    os.makedirs(base, exist_ok=True)
+    return str(base)
+
+
+def machine_lock_dir() -> str:
+    """Return machine-wide lock directory (~/.cache/aicn/locks or AICN_LOCK_DIR) shared across all series/agents."""
+    env_dir = os.environ.get("AICN_LOCK_DIR", "").strip()
+    base = Path(env_dir) if env_dir else (Path.home() / ".cache" / "aicn" / "locks")
+    os.makedirs(base, exist_ok=True)
+    return str(base)
+
+
 @contextlib.contextmanager
-def file_lock(path: str | Path) -> Iterator[None]:
-    """Cross-platform advisory + process file lock using fcntl (POSIX) or msvcrt (Windows)."""
+def file_lock(path: str | Path, reentrant: bool = True, label: str = "") -> Iterator[None]:
+    """Cross-platform advisory + process file lock using fcntl (POSIX) or msvcrt (Windows).
+    Re-entrant within the same thread when `reentrant=True` so nested GPU/engine calls never self-deadlock."""
     lp = os.path.abspath(str(path))
+    norm_key = os.path.normcase(lp)
+    depths = getattr(_LOCAL_LOCK_DEPTH, "depths", None)
+    if depths is None:
+        depths = {}
+        _LOCAL_LOCK_DEPTH.depths = depths
+    if reentrant and depths.get(norm_key, 0) > 0:
+        depths[norm_key] += 1
+        try:
+            yield
+        finally:
+            depths[norm_key] -= 1
+        return
+
     os.makedirs(os.path.dirname(lp), exist_ok=True)
-    tlk = _get_thread_lock(os.path.normcase(lp))
+    tlk = _get_thread_lock(norm_key)
+    t_wait0 = time.time()
+    logged_wait = False
     with tlk:
         if is_windows():
             import msvcrt
@@ -383,10 +434,18 @@ def file_lock(path: str | Path) -> Iterator[None]:
                         msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
                         break
                     except OSError:
+                        if label and not logged_wait and (time.time() - t_wait0) >= 1.0:
+                            print(f"[{label}] Waiting for exclusive lock ({lp})...", flush=True)
+                            logged_wait = True
                         time.sleep(0.05)
+                waited = time.time() - t_wait0
+                if label and logged_wait:
+                    print(f"[{label}] Acquired lock after {waited:.1f}s.", flush=True)
+                depths[norm_key] = depths.get(norm_key, 0) + 1
                 try:
                     yield
                 finally:
+                    depths[norm_key] = max(0, depths.get(norm_key, 1) - 1)
                     lf.seek(0)
                     try:
                         msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
@@ -395,11 +454,68 @@ def file_lock(path: str | Path) -> Iterator[None]:
         else:
             import fcntl
             with open(lp, "a+") as lf:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                while True:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if label and not logged_wait and (time.time() - t_wait0) >= 1.0:
+                            print(f"[{label}] Waiting for exclusive lock ({lp})...", flush=True)
+                            logged_wait = True
+                        time.sleep(0.05)
+                waited = time.time() - t_wait0
+                if label and logged_wait:
+                    print(f"[{label}] Acquired lock after {waited:.1f}s.", flush=True)
+                depths[norm_key] = depths.get(norm_key, 0) + 1
                 try:
                     yield
                 finally:
+                    depths[norm_key] = max(0, depths.get(norm_key, 1) - 1)
                     fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def gpu_lock() -> Iterator[None]:
+    """Machine-wide exclusive GPU lock preventing concurrent Whisper/Demucs/VieNeu CUDA/Metal VRAM thrashing."""
+    with file_lock(os.path.join(machine_lock_dir(), "gpu.lock"), reentrant=True, label="GPU-LOCK"):
+        yield
+
+
+def content_sha256(path: str | Path | None, cache_dir: str | Path | None = None) -> str:
+    """Fast content-addressed SHA-256 backed by a persistent (size, mtime_ns) stat index.
+    Unlike path+mtime signatures, moving or recreating identical media preserves the exact same hash!"""
+    if not path or not os.path.exists(path):
+        return "missing"
+    ap_str = os.path.abspath(str(path))
+    st = os.stat(ap_str)
+    idx_dir = str(cache_dir) if cache_dir else global_cache_dir(ap_str)
+    idx_path = os.path.join(idx_dir, "global_stat_hash.json")
+    db: dict[str, Any] = {}
+    if os.path.exists(idx_path):
+        try:
+            with open(idx_path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+        except Exception:
+            db = {}
+    rec = db.get(ap_str)
+    if rec and rec.get("size") == st.st_size and rec.get("mtime_ns") == st.st_mtime_ns and rec.get("sha256"):
+        return str(rec["sha256"])
+    import hashlib
+    h = hashlib.sha256()
+    with open(ap_str, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    db[ap_str] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": digest}
+    try:
+        os.makedirs(idx_dir, exist_ok=True)
+        tmp = f"{idx_path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(db, f)
+        os.replace(tmp, idx_path)
+    except Exception:
+        pass
+    return digest
 
 
 # ----------------------------------------------------------------- Path normalization & concat

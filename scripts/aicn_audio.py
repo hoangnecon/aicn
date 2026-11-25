@@ -137,8 +137,17 @@ def follow_hold(g, fps, att, hold_s, rel):
     return out
 
 
+def _write_wav16(path, arr, sr=SR):
+    """Write compact lossless 16-bit PCM WAV atomically (-50% disk vs FLOAT32, -96 dB dynamic range)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".part.wav"
+    sf.write(tmp, np.clip(np.asarray(arr, dtype=np.float32), -1.0, 0.999969), sr, subtype="PCM_16")
+    os.replace(tmp, path)
+
+
 # ---------------------------------------------------------------- separate
 def cmd_separate(ws, c, fh):
+    import contextlib
     src = source_path(ws)
     if not src or not os.path.exists(src):
         sys.exit("[aicn-audio] no source video (source/master_source.mp4)")
@@ -151,23 +160,25 @@ def cmd_separate(ws, c, fh):
     bk = ap.detect_demucs_backend(sys.executable)
     if bk["engine"] == "missing":
         sys.exit("[aicn-audio] Demucs not available: install `demucs` in AICN_PY or install `uv` (for uvx)")
-    with tempfile.TemporaryDirectory() as tmp:
-        wav = os.path.join(tmp, "source.wav")
-        run([ap.find_tool("ffmpeg"), "-v", "error", "-y", "-i", src, "-vn", "-ac", "2", "-ar", "44100", wav])
-        if bk["engine"] == "mlx":
-            run([ap.find_tool("uvx"), "--from", "demucs-mlx", "demucs-mlx", "-n", c["demucs_model"], "-o", tmp, wav])
-        else:
-            dev = "cuda" if bk["engine"] == "torch-cuda" else "cpu"
-            run([sys.executable, "-m", "demucs.separate", "--two-stems=vocals", "--device", dev,
-                 "-n", c["demucs_model"], "-o", tmp, wav])
-        sd = os.path.join(tmp, c["demucs_model"], "source")
-        if not os.path.isdir(sd):
-            sd = os.path.join(tmp, "source")
-        voc = load(os.path.join(sd, "vocals.wav"))
-        no_voc = os.path.join(sd, "no_vocals.wav")
-        acc = load(no_voc) if os.path.exists(no_voc) else sum(load(os.path.join(sd, f"{s}.wav")) for s in ("drums", "bass", "other"))
-    sf.write(os.path.join(d, "vocals.wav"), voc, SR, subtype="FLOAT")
-    sf.write(os.path.join(d, "accomp.wav"), acc, SR, subtype="FLOAT")
+    lock_ctx = ap.gpu_lock() if bk["engine"] in ("mlx", "torch-cuda") else contextlib.nullcontext()
+    with lock_ctx:
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = os.path.join(tmp, "source.wav")
+            run([ap.find_tool("ffmpeg"), "-v", "error", "-y", "-i", src, "-vn", "-ac", "2", "-ar", "44100", wav])
+            if bk["engine"] == "mlx":
+                run([ap.find_tool("uvx"), "--from", "demucs-mlx", "demucs-mlx", "-n", c["demucs_model"], "-o", tmp, wav])
+            else:
+                dev = "cuda" if bk["engine"] == "torch-cuda" else "cpu"
+                run([sys.executable, "-m", "demucs.separate", "--two-stems=vocals", "--device", dev,
+                     "-n", c["demucs_model"], "-o", tmp, wav])
+            sd = os.path.join(tmp, c["demucs_model"], "source")
+            if not os.path.isdir(sd):
+                sd = os.path.join(tmp, "source")
+            voc = load(os.path.join(sd, "vocals.wav"))
+            no_voc = os.path.join(sd, "no_vocals.wav")
+            acc = load(no_voc) if os.path.exists(no_voc) else sum(load(os.path.join(sd, f"{s}.wav")) for s in ("drums", "bass", "other"))
+    _write_wav16(os.path.join(d, "vocals.wav"), voc, SR)
+    _write_wav16(os.path.join(d, "accomp.wav"), acc, SR)
     aicn.jdump(meta_p, {"key": key, "source": src, "model": c["demucs_model"], "backend": bk["engine"], "seconds": round(time.time() - t0, 1)})
     print(f"[separate] {c['demucs_model']} ({bk['label']}) -> media/stems in {time.time() - t0:.1f}s")
 
@@ -255,36 +266,34 @@ def _tts_init(threads=0, device="auto", max_batch_size=16):
 def _tts_job(job):
     text, voice, temp, top_k, path = job
     w = _TTS.infer(text=text, voice=voice, temperature=temp, top_k=top_k)
-    sf.write(path + ".part.wav", w, SR, subtype="FLOAT")
-    os.replace(path + ".part.wav", path)
+    _write_wav16(path, w, SR)
     return path
 
 
 def presynth(jobs, workers, threads=0, batch_size=16):
     """Synthesize missing sentences.
-    - CUDA GPU: single in-process PyTorch instance using infer_batch() (avoids multi-process
-      RAM/VRAM duplication & ~3-4x faster at ~0.5 GB VRAM).
+    - CUDA GPU: single in-process PyTorch instance under machine-wide gpu_lock using infer_batch()
+      (avoids multi-process RAM/VRAM duplication & ~3-4x faster at ~0.5 GB VRAM).
     - CPU / Apple Silicon: ONNX fp32 ProcessPoolExecutor when >=8 jobs."""
     if not jobs:
         return
     if _tts_cuda_available():
         bs = max(1, int(batch_size or 16))
-        if _TTS is None:
-            _tts_init(device="cuda", max_batch_size=bs)
-        # Group by (voice, temperature, top_k) while preserving order; flush each batch to cache
         from collections import defaultdict
         by_cfg = defaultdict(list)
         for j in jobs:
             text, voice, temp, top_k, path = j
             by_cfg[(voice, temp, top_k)].append((text, path))
-        for (voice, temp, top_k), items in by_cfg.items():
-            for start in range(0, len(items), bs):
-                chunk = items[start:start + bs]
-                texts = [t for t, _ in chunk]
-                wavs = _TTS.infer_batch(texts=texts, voice=voice, temperature=temp, top_k=top_k, batch_size=bs)
-                for (_, path), w in zip(chunk, wavs):
-                    sf.write(path + ".part.wav", w, SR, subtype="FLOAT")
-                    os.replace(path + ".part.wav", path)
+        with ap.gpu_lock():
+            if _TTS is None:
+                _tts_init(device="cuda", max_batch_size=bs)
+            for (voice, temp, top_k), items in by_cfg.items():
+                for start in range(0, len(items), bs):
+                    chunk = items[start:start + bs]
+                    texts = [t for t, _ in chunk]
+                    wavs = _TTS.infer_batch(texts=texts, voice=voice, temperature=temp, top_k=top_k, batch_size=bs)
+                    for (_, path), w in zip(chunk, wavs):
+                        _write_wav16(path, w, SR)
         return
     if workers <= 1 or len(jobs) < 8:
         if _TTS is None:
@@ -302,13 +311,28 @@ def presynth(jobs, workers, threads=0, batch_size=16):
 
 
 def _tts_cache_dir(ws):
-    hub = aicn.resolve_unit_hub(ws)
-    if hub and os.path.isdir(hub):
-        d = os.path.join(hub, ".cache", "tts_sent")
-    else:
-        d = os.path.join(ws, ".cache", "tts_sent")
+    """Return persistent cross-series TTS cache (<project_root>/.cache/tts_sent) so pruning a series hub never wipes cached voices."""
+    d = os.path.join(ap.global_cache_dir(ws), "tts_sent")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _resolve_tts_cached_path(ws, cache_dir, key):
+    """Return target cache path, migrating from legacy <hub>/.cache/tts_sent or <ws>/.cache/tts_sent if present."""
+    dst = os.path.join(cache_dir, key + ".wav")
+    if os.path.exists(dst):
+        return dst
+    hub = aicn.resolve_unit_hub(ws)
+    for leg_base in ([os.path.join(hub, ".cache", "tts_sent")] if hub else []) + [os.path.join(ws, ".cache", "tts_sent")]:
+        leg = os.path.join(leg_base, key + ".wav")
+        if os.path.exists(leg) and os.path.abspath(leg) != os.path.abspath(dst):
+            try:
+                os.link(leg, dst)
+            except OSError:
+                import shutil
+                shutil.copy2(leg, dst)
+            return dst
+    return dst
 
 
 def _resolve_tts_parallelism(c):
@@ -364,7 +388,7 @@ def cmd_dub(ws, c, fh):
         text = " ".join(segs[i]["tts_text"].strip() for i in g)
         voice = segs[g[0]].get("voice") or c["voice"]
         key = aicn.h_obj({"t": text, "v": voice, "e": aicn.TTS_ENGINE_TAG, "temp": c["temperature"], "k": c["top_k"]})
-        p_ = os.path.join(cache, key + ".wav")
+        p_ = _resolve_tts_cached_path(ws, cache, key)
         if not os.path.exists(p_) and p_ not in seen:
             seen.add(p_); jobs.append((text, voice, c["temperature"], c["top_k"], p_))
     tts_w, tts_th = _resolve_tts_parallelism(c)
@@ -376,7 +400,7 @@ def cmd_dub(ws, c, fh):
         text = " ".join(segs[i]["tts_text"].strip() for i in g)
         voice = segs[g[0]].get("voice") or c["voice"]
         key = aicn.h_obj({"t": text, "v": voice, "e": aicn.TTS_ENGINE_TAG, "temp": c["temperature"], "k": c["top_k"]})
-        raw_p = os.path.join(cache, key + ".wav")
+        raw_p = _resolve_tts_cached_path(ws, cache, key)
         w_raw = clean(sf.read(raw_p, dtype="float32")[0], c)
         st = float(segs[g[0]]["start"])
         nxt_grp = float(segs[groups[gi + 1][0]]["start"]) if gi + 1 < len(groups) else dur - 0.05
@@ -405,8 +429,7 @@ def cmd_dub(ws, c, fh):
         if not c.get("_force") and os.path.exists(cp):
             return sf.read(cp, dtype="float32")[0], True
         out = stretch(raw_p, tempo_j)
-        sf.write(cp + ".part.wav", out, SR, subtype="FLOAT")
-        os.replace(cp + ".part.wav", cp)
+        _write_wav16(cp, out, SR)
         return out, False
 
     rb_workers = min(8, os.cpu_count() or 4, max(1, len(prep_clauses)))
@@ -448,7 +471,7 @@ def cmd_dub(ws, c, fh):
                     "tempo": round(max(piece_tempos, default=1.0), 3), "overflow_s": round(overflow, 2),
                     "syl_per_s": round(syl / max(0.05, piece_durs), 2), "text": text})
     os.makedirs(os.path.dirname(dub_wav_p), exist_ok=True)
-    sf.write(dub_wav_p, track, SR, subtype="FLOAT")
+    _write_wav16(dub_wav_p, track, SR)
     aicn.jdump(aligned_p, aligned)
     aicn.jdump(log_p, log)
     with open(srt_p, "w", encoding="utf-8") as f:
@@ -819,7 +842,7 @@ def cmd_mix(ws, c, fh):
     gB = follow_hold(1 - W * (1 - gB_raw), fps, c["attack_s"], hold_s, c["release_s"])
     mix = istft_from_Z(ZV, gV, band_of_bin, n) + istft_from_Z(ZB, gB, band_of_bin, n) + T[:, None]
     os.makedirs(os.path.join(ws, "media", "audio"), exist_ok=True)
-    sf.write(os.path.join(ws, "media", "audio", "premaster_48k.wav"), mix.astype(np.float32), SR, subtype="FLOAT")
+    _write_wav16(os.path.join(ws, "media", "audio", "premaster_48k.wav"), mix.astype(np.float32), SR)
     on = talk > 0.5
     comp = (PV[SPEECH] * gV[SPEECH] ** 2 + PB[SPEECH] * gB[SPEECH] ** 2).sum(0)
     snr = 10 * np.log10(PT[SPEECH].sum(0)[on] / (comp[on] + 1e-12) + 1e-12) if on.any() else np.array([99.0])

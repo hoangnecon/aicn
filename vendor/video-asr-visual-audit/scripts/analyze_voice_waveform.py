@@ -46,12 +46,15 @@ def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-WAVEFORM_CACHE_VERSION = "wf-3.0"
+WAVEFORM_CACHE_VERSION = "wf-3.1"
 
 
 def _fast_file_sig(path: str) -> str:
+    """Content-addressed SHA-256 signature (stat-cached via aicn_platform so moving/rebuilding identical media hits cache)."""
     if not path or not os.path.exists(path):
         return "missing"
+    if ap is not None and hasattr(ap, "content_sha256"):
+        return ap.content_sha256(path)
     st = os.stat(path)
     return f"{os.path.abspath(path)}:{st.st_size}:{st.st_mtime_ns}"
 
@@ -363,6 +366,14 @@ def detect_uncovered_multiband_gaps(
         # Reject steady unmodulated hum / sustained solo instrument unless vocals stem is clearly loud speech
         if best_mod < 0.14 and p_voc < 0.035:
             continue
+
+        # Short inter-clause pause filter (< 1.0s): reject brief BGM/SFX breath ticks unless vocals stem or phone band is clearly speech
+        if dur < 1.0:
+            pk_mid_ratio = float(np.max(mid_vs_hi[i0:i1])) if i1 > i0 else 0.0
+            has_short_vocal = p_voc >= max(0.018, voc_fl * 3.2)
+            has_short_phone = (p_mid >= max(0.018, mid_fl * 3.2)) and (m_mid >= 0.20 or pk_mid_ratio > 2.4)
+            if not (has_short_vocal or has_short_phone):
+                continue
 
         # Normalized band SNR above floor to rank probe priority (full_vocal, high, mid, low)
         band_snr = {

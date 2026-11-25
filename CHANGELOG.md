@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.6.0 (2026-11-25)
+- **Machine-Wide GPU Lock, Persistent Global SHA-256 Caches, Stitched Multi-Gap Pass 2B (~15× Faster) & -50% WAV Disk Footprint (`L-018`)**:
+  - **Machine-Wide Re-Entrant GPU Lock & Single-Process Stage 3 (`scripts/aicn_platform.py`, `scripts/aicn.py`, `scripts/aicn_audio.py`, `run_asr_and_scan.py`):**
+    - Added `ap.machine_lock_dir()` + re-entrant `ap.gpu_lock()` (`~/.cache/aicn/locks/gpu.lock`) enforced directly inside Demucs (`cmd_separate`), Whisper (`run_multipass_whisper_asr`, with explicit VRAM release on exit), and VieNeu CUDA `presynth()`, preventing multi-series VRAM thrashing on 6 GB GPUs.
+    - Fixed `aicn.py cmd_run_series` (`produce` previously ran CUDA `dub` under per-hub `cpu.lock` across 4 separate Python subprocesses): now executes `aicn_audio.py all` in 1 process and passes `--skip-waveform` in `prep` to avoid duplicate waveform passes.
+  - **True Content-Addressed SHA-256 & Cross-Series Persistent Cache (`ap.global_cache_dir`, `ap.content_sha256`):**
+    - Replaced brittle `abspath + mtime_ns` Stage 1 signatures with stat-indexed content SHA-256 (`ap.content_sha256`), persisting ASR + Pass 2B JSONs in `<project_root>/.cache/asr/<sha256>.json` (~40 KB/unit) and VieNeu sentence WAVs in `<project_root>/.cache/tts_sent/` (with automatic migration from legacy `<hub>/.cache/tts_sent`). Pruning a 15 GB series workspace no longer wipes ASR or TTS caches, and `stage1_key` is now synced into `build_state.json` for `aicn.py plan`.
+  - **Stitched Multi-Gap Batching & Short-Pause Filter in Pass 2B (`asr-3.1`, `wf-3.1`):**
+    - Added `_probe_band_gaps_stitched()`: packs consecutive uncovered gaps into `<= 22s` buffers separated by `0.65s` digital-zero barriers so 8–12 gaps decode in ONE 30s-padded Whisper encoder pass (~12–20× fewer GPU passes), plus filters `< 1.0s` inter-clause BGM/SFX breath ticks unless `vocals.wav` or telephony speech is clearly present.
+  - **-50% WAV Disk Bloat & Clean-Up Overhaul (`aicn_audio.py`, `aicn.py`):**
+    - Switched intermediate/cached WAVs (`vocals.wav`, `accomp.wav`, `tts_sent`, `rb_clause`, `dub_voice_48k.wav`, `premaster_48k.wav`) from `FLOAT32` to lossless `PCM_16` (`-96 dB` dynamic range, keeping `master_audio_48k.wav` at 24-bit `pcm_s24le`), saving ~560 MB per 10-min unit (~8 GB per series) during active builds.
+    - Upgraded `aicn.py clean` to also prune `media/tts_segments`, `.cache/rb_clause`, `media/source_audio.wav`, and `waveform_features_*.npy` while keeping `PPPPPP` gates green (and `source/*` in `--deep`), and updated `merge-series` to remove redundant per-unit MP4/SRT links under `<hub>/deliverables/{16x9,9x16,subtitles}/`.
+
 ## 2.5.0 (2026-11-25)
 - **Stage 1 Anti-Stall Pass 1, Gap-First Multi-Band Frequency Pass 2B (High / Mid / Low + Reverse Cross-Check & Refine) & Smart Acoustic Gate (`vendor/video-asr-visual-audit/scripts/`, `L-017`)**:
   - **Pass 1 Hardening (`asr-3.0`, `run_asr_and_scan.py`):** Set `condition_on_previous_text=False`, added Simplified Chinese `initial_prompt` for `faster-whisper`, added `--model` CLI flag (hashed into Stage 1 ASR cache key alongside `asr-3.0`), tuned VAD (`threshold=0.20`, `speech_pad_ms=200`), and filtered Pass 1 hallucinations/repetition loops so stale context cannot blank out 30–90s dialogue stretches.

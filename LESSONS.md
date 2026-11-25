@@ -169,3 +169,11 @@ Structured log of verified production failures, user corrections, and API change
   1. Added thread-safe `ap.child_env_with_held_locks()` in `scripts/aicn_platform.py` propagating only the calling thread's held locks via `AICN_HELD_LOCKS`, and updated `file_lock(reentrant=True)` to honor inherited locks without re-acquiring the OS lock.
   2. Updated `aicn.py` `cmd_run_series._run()` to pass `env=ap.child_env_with_held_locks()` to `subprocess.run()`.
   3. Added cross-process re-entrancy regression test `test_file_lock_child_process_reentrant_no_deadlock` in `tests/test_aicn_platform.py` (`69/69` passing).
+
+## L-021 (2026-11-25) — Missing Poster Localization Playbook, `brand-poster` Automation & Caption Format Drift
+- **Symptom:** When the user requested Vietnamese upload captions, official thumbnail lookup, and poster localization prompts after completing a series, the agent had to inspect a previous series' `posters/` folder on Google Drive (`trong-sinh-thanh-meo-an-sap-ca-nuoc`) to recover the exact `9:16` branded layout and `#daudonho` + emoji caption convention.
+- **Verified Root Cause:** `channel_branding_and_watermark_guide.md` only documented Tier-2 filenames and video watermarks (no poster localization prompt templates, no HD Hongguo `~tplv-resize:1440:0.image` rule, and no CLI to rename/resize/brand user-dropped raw posters), while `SKILL.md` still had the older `[TRỌN BỘ THUYẾT MINH]` caption template without `#daudonho` and emojis.
+- **Guardrail Implemented (`v2.7.0`):**
+  1. Added `references/poster_and_caption_guide.md` with the complete HD official poster pull, `9:16` / `16:9` prompt templates, and updated 2-line upload caption standard (`<Hook> <2 emojis> | Full N Tập` + `#daudonho ...`).
+  2. Added `aicn.py brand-poster` to standardize any user-generated raw poster into `_raw`, `_clean.png`, and dual-corner `_branded.png` (with optional `--remove-star` and `--delete-source`), backed by unit tests in `tests/test_aicn.py`.
+  3. Updated `SKILL.md` and `references/folder_contract.md`.

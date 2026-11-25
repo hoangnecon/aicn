@@ -15,6 +15,8 @@ video-localization-qa-review) and adds:
                   watermark (--brand-dir) -> media/.staging_render.mp4
   verify-overlay  Stage 4 gate (alias: verify-render): A/V sync, codec/audio
                   compliance, and frame integrity on media/.staging_render.mp4
+  merge-series    concatenate all verified units into 1 full-series MP4 + SRT
+  brand-poster    rename, resize, optionally de-star & dual-corner brand a poster
   progress        rebuild the hub PROGRESS.md table
   log             append a line to CHANGELOG.md and refresh PROGRESS.md
 
@@ -1208,6 +1210,168 @@ def cmd_doctor(a):
     print(f"[doctor] {m['chip']} | {m['cores']} cores | {m['ram_gb']} GB RAM -> {out}")
 
 
+def _poster_detect_aspect(w, h, requested="auto"):
+    if requested and requested != "auto":
+        return requested
+    ratio = float(w) / max(float(h), 1.0)
+    if ratio < 0.65:
+        return "9x16"
+    if ratio > 1.25:
+        return "16x9"
+    return "3x4"
+
+
+def _poster_inpaint_corner_star(im):
+    """Smoothly inpaint a Flow/Imagen bottom-right 4-point corner star via boundary Laplace fill."""
+    import numpy as np
+    from PIL import Image
+
+    arr = np.asarray(im.convert("RGB"), dtype=np.float32).copy()
+    h, w, _ = arr.shape
+    cx = int(round(w * (1285.0 / 1376.0)))
+    cy = int(round(h * (662.0 / 768.0)))
+    rad = max(16, int(round(min(w, h) * 0.048)))
+    y0, y1 = max(2, cy - rad), min(h - 2, cy + rad)
+    x0, x1 = max(2, cx - rad), min(w - 2, cx + rad)
+    patch = arr[y0 - 2:y1 + 2, x0 - 2:x1 + 2].copy()
+    ph, pw, _ = patch.shape
+    yy, xx = np.ogrid[:ph, :pw]
+    cy_l, cx_l = ph / 2.0, pw / 2.0
+    mask = ((yy - cy_l) ** 2 + (xx - cx_l) ** 2) <= (rad * 0.92) ** 2
+    mask[:2, :] = False; mask[-2:, :] = False; mask[:, :2] = False; mask[:, -2:] = False
+    ring = (((yy - cy_l) ** 2 + (xx - cx_l) ** 2) <= (rad * 1.15) ** 2) & (~mask)
+    if np.any(ring):
+        fill_val = np.median(patch[ring], axis=0)
+        patch[mask] = fill_val
+        for _ in range(40):
+            avg = 0.25 * (patch[:-2, 1:-1] + patch[2:, 1:-1] + patch[1:-1, :-2] + patch[1:-1, 2:])
+            patch[1:-1, 1:-1][mask[1:-1, 1:-1]] = avg[mask[1:-1, 1:-1]]
+        arr[y0 - 2:y1 + 2, x0 - 2:x1 + 2] = patch
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def _poster_resize_cover(im, target_w, target_h):
+    """Aspect-preserving center crop + Lanczos resize to exact target dimensions."""
+    from PIL import Image
+
+    w, h = im.size
+    target_ar = target_w / float(target_h)
+    cur_ar = w / float(h)
+    if abs(cur_ar - target_ar) > 0.015:
+        if cur_ar > target_ar:
+            new_w = int(round(h * target_ar))
+            x0 = (w - new_w) // 2
+            im = im.crop((x0, 0, x0 + new_w, h))
+        else:
+            new_h = int(round(w / target_ar))
+            y0 = (h - new_h) // 2
+            im = im.crop((0, y0, w, y0 + new_h))
+    if im.size != (target_w, target_h):
+        im = im.resize((target_w, target_h), Image.LANCZOS)
+    return im
+
+
+def cmd_brand_poster(a):
+    """Standardize a localized Vietnamese poster into Tier 2 _raw, _clean.png, and _branded.png."""
+    try:
+        from PIL import Image
+    except ImportError:
+        py = ap.find_python()
+        if os.path.abspath(py) != os.path.abspath(sys.executable):
+            subprocess.run([py] + sys.argv, check=True)
+            return
+        sys.exit("[brand-poster] Pillow (PIL) is required. Run with $AICN_PY.")
+
+    src = os.path.abspath(a.input)
+    if not os.path.isfile(src):
+        sys.exit(f"[brand-poster] input image not found: {src}")
+
+    if a.hub:
+        hub = os.path.abspath(a.hub)
+        out_dir = os.path.abspath(a.out_dir) if a.out_dir else os.path.join(hub, "posters")
+        cfg = jload(os.path.join(hub, "config", "series_config.json"), {}) or {}
+        slug = a.slug or cfg.get("series_slug") or os.path.basename(hub)
+    else:
+        if not a.out_dir or not a.slug:
+            sys.exit("[brand-poster] provide --hub <series_hub> OR both --out-dir and --slug")
+        out_dir = os.path.abspath(a.out_dir)
+        slug = a.slug
+
+    os.makedirs(out_dir, exist_ok=True)
+    with Image.open(src) as _im:
+        im = _im.convert("RGB")
+    aspect = _poster_detect_aspect(im.size[0], im.size[1], a.aspect)
+    targets = {"9x16": (1080, 1920), "16x9": (1920, 1080), "3x4": (1080, 1440)}
+    tw, th = targets[aspect]
+
+    src_ext = os.path.splitext(src)[1].lower() or ".png"
+    if src_ext not in (".jpg", ".jpeg", ".png", ".webp"):
+        src_ext = ".png"
+    raw_path = os.path.join(out_dir, f"poster_{slug}_vi_{aspect}_raw{src_ext}")
+    clean_path = os.path.join(out_dir, f"poster_{slug}_vi_{aspect}_clean.png")
+    branded_path = os.path.join(out_dir, f"poster_{slug}_vi_{aspect}_branded.png")
+
+    if os.path.abspath(src) != os.path.abspath(raw_path):
+        shutil.copy2(src, raw_path)
+    clean_im = im
+    if a.remove_star:
+        clean_im = _poster_inpaint_corner_star(clean_im)
+    clean_im = _poster_resize_cover(clean_im, tw, th)
+    clean_im.save(clean_path, "PNG", optimize=True)
+
+    result = {
+        "slug": slug,
+        "aspect": aspect,
+        "size": [tw, th],
+        "raw": raw_path,
+        "clean": clean_path,
+        "branded": None,
+    }
+
+    if a.brand_dir:
+        bd = os.path.abspath(a.brand_dir)
+        tl_p = os.path.join(bd, "13_top_left_logo_large.png")
+        tr_p = os.path.join(bd, "15_top_right_vietsub_floating.png")
+        if not (os.path.isfile(tl_p) and os.path.isfile(tr_p)):
+            sys.exit(f"[brand-poster] --brand-dir missing 13_top_left_logo_large.png or 15_top_right_vietsub_floating.png in {bd}")
+        with Image.open(tl_p) as _tl, Image.open(tr_p) as _tr:
+            tl = _tl.convert("RGBA")
+            tr = _tr.convert("RGBA")
+        canvas = clean_im.convert("RGBA")
+        if aspect == "16x9":
+            tl_x, tl_y = 42, 22
+            center_y = tl_y + tl.size[1] // 2
+            tr_x = tw - tr.size[0] - 42
+            tr_y = center_y - tr.size[1] // 2
+        elif aspect == "3x4":
+            tl_x, tl_y = 38, 38
+            center_y = tl_y + tl.size[1] // 2
+            tr_x = tw - tr.size[0] - 36
+            tr_y = center_y - tr.size[1] // 2
+        else:  # 9x16 (1080x1920)
+            tl_x, tl_y = 38, 46
+            center_y = tl_y + tl.size[1] // 2
+            tr_x = tw - tr.size[0] - 36
+            tr_y = center_y - tr.size[1] // 2
+        canvas.alpha_composite(tl, dest=(tl_x, tl_y))
+        canvas.alpha_composite(tr, dest=(tr_x, tr_y))
+        canvas.convert("RGB").save(branded_path, "PNG", optimize=True)
+        result["branded"] = branded_path
+
+    if a.delete_source and os.path.abspath(src) != os.path.abspath(raw_path):
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+
+    print(f"[brand-poster] {slug} ({aspect} {tw}x{th})")
+    print(f"  raw:     {raw_path}")
+    print(f"  clean:   {clean_path}")
+    if result["branded"]:
+        print(f"  branded: {result['branded']}")
+    return result
+
+
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1262,6 +1426,16 @@ def main():
     p = sp.add_parser("log"); p.add_argument("--unit", required=True); p.add_argument("--kind", default="edit",
                       choices=["init", "stage", "edit", "fix", "render", "release", "note"]); p.add_argument("--message", required=True)
     p.set_defaults(f=cmd_log)
+    p = sp.add_parser("brand-poster", help="standardize, optionally de-star, and dual-corner brand a localized poster")
+    p.add_argument("--hub", default=None, help="Series Hub directory (infers --out-dir <hub>/posters and --slug)")
+    p.add_argument("--out-dir", default=None, help="output posters/ directory (optional if --hub is set)")
+    p.add_argument("--slug", default=None, help="series slug override")
+    p.add_argument("--input", required=True, help="path to raw localized Vietnamese poster image")
+    p.add_argument("--brand-dir", default=None, help="folder with 13_top_left_logo_large.png & 15_top_right_vietsub_floating.png")
+    p.add_argument("--aspect", choices=["auto", "9x16", "16x9", "3x4"], default="auto")
+    p.add_argument("--remove-star", action="store_true", help="inpaint Flow/Imagen bottom-right corner star before resizing")
+    p.add_argument("--delete-source", action="store_true", help="remove original messy-named input file after archiving as _raw")
+    p.set_defaults(f=cmd_brand_poster)
     p = sp.add_parser("progress"); p.add_argument("--hub", required=True); p.set_defaults(f=cmd_progress)
     a = ap.parse_args()
     a.f(a)

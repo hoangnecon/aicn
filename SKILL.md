@@ -79,7 +79,9 @@ Original-platform engines: **`jackotom/hongguo-drama`** (thin wrapper `scripts/h
 - **No-Watermark / 1080p Downloads:**
   - Hongguo: `node <skill>/scripts/hg_tool.cjs download <series_id> --episodes 1-10 --out <inbox_batch_dir> --quality 1080p`
   - Douyin: `tools/.venv-dy/bin/python <skill>/scripts/dy_tool.py download <aweme_id_or_mix_id> --out <inbox_batch_dir>` (clean watermark-free MP4)
-- **Facebook Caption Standard (when user asks for upload metadata):** 2-line minimal format — Line 1: `[TRỌN BỘ THUYẾT MINH] <Hook Title> | Full N Tập`; Line 2: all-lowercase broad hashtags (`#aishortfilmdrama #aishortdrama #aifilm #phimai #phimngan #phimthuyetminh #phimtrungquoc ...`, never awkward genre calque tags).
+- **Upload Caption & Poster Packaging Standard:** Full guide in `references/poster_and_caption_guide.md`.
+  - **Caption (2-line minimal format):** Line 1: `<Catchy Vietnamese Hook Title> <2 emojis> | Full N Tập`; Line 2: `#daudonho #aishortfilmdrama #aishortdrama #aifilm #phimai #phimngan #phimthuyetminh #phimtrungquoc #<topic1> #<topic2>` (all-lowercase, no awkward genre calque tags).
+  - **Poster / Thumbnail workflow:** Pull HD official source poster (`~tplv-resize:1440:0.image`) into `posters/official_poster_<slug>_zh.jpg`, provide `9:16` / `16:9` localization prompts (user generates externally via Nano Banana 2 / Flow or requests agent generation), then standardize & composite dual-corner branding via `aicn.py brand-poster --hub <hub> --input <raw_file> --brand-dir <brand_dir> --delete-source` and visually inspect `_branded.png` via `read_file`.
 
 ## 2. Folder contract
 

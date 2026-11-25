@@ -378,5 +378,50 @@ class CLI(unittest.TestCase):
             self.assertIn("asr", m["choose"])
 
 
+    def test_brand_poster_renames_resizes_and_brands_9x16_and_16x9(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("PIL not installed in current test python")
+        with tempfile.TemporaryDirectory() as td:
+            hub = os.path.join(td, "my-test-series")
+            os.makedirs(os.path.join(hub, "config"))
+            os.makedirs(os.path.join(hub, "posters"))
+            aicn.jdump(os.path.join(hub, "config", "series_config.json"), {"series_slug": "my-test-series"})
+            bd = os.path.join(td, "brand")
+            os.makedirs(bd)
+            Image.new("RGBA", (284, 142), (220, 20, 40, 255)).save(os.path.join(bd, "13_top_left_logo_large.png"))
+            Image.new("RGBA", (295, 70), (240, 200, 60, 255)).save(os.path.join(bd, "15_top_right_vietsub_floating.png"))
+
+            # 9:16 raw poster with messy Flow filename + --delete-source + --remove-star
+            raw_in = os.path.join(hub, "posters", "Editing_Vietnamese_anime_poster_abc123.jpg")
+            Image.new("RGB", (768, 1376), (30, 110, 210)).save(raw_in, "JPEG")
+            res = aicn.cmd_brand_poster(type("A", (), {
+                "hub": hub, "out_dir": None, "slug": None, "input": raw_in,
+                "brand_dir": bd, "aspect": "auto", "remove_star": True, "delete_source": True,
+            })())
+            self.assertFalse(os.path.exists(raw_in))
+            self.assertEqual(res["aspect"], "9x16")
+            self.assertTrue(os.path.isfile(os.path.join(hub, "posters", "poster_my-test-series_vi_9x16_raw.jpg")))
+            with Image.open(os.path.join(hub, "posters", "poster_my-test-series_vi_9x16_clean.png")) as clean_im:
+                self.assertEqual(clean_im.size, (1080, 1920))
+            with Image.open(os.path.join(hub, "posters", "poster_my-test-series_vi_9x16_branded.png")) as branded_im:
+                self.assertEqual(branded_im.size, (1080, 1920))
+                # Verify top-left red logo and top-right gold badge were composited
+                self.assertGreater(branded_im.getpixel((100, 100))[0], 180)
+                self.assertGreater(branded_im.getpixel((900, 110))[1], 160)
+
+            # 16:9 widescreen thumbnail
+            raw_16 = os.path.join(td, "thumb_wide.png")
+            Image.new("RGB", (1376, 768), (20, 40, 80)).save(raw_16, "PNG")
+            res16 = aicn.cmd_brand_poster(type("A", (), {
+                "hub": hub, "out_dir": None, "slug": None, "input": raw_16,
+                "brand_dir": bd, "aspect": "auto", "remove_star": False, "delete_source": False,
+            })())
+            self.assertEqual(res16["aspect"], "16x9")
+            with Image.open(res16["branded"]) as b16:
+                self.assertEqual(b16.size, (1920, 1080))
+
+
 if __name__ == "__main__":
     unittest.main()

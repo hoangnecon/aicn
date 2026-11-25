@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.7.0 (2026-11-25)
+- **Poster Localization, `brand-poster` CLI & Updated Upload Caption Standard (`references/poster_and_caption_guide.md`, `scripts/aicn.py`, `SKILL.md`, `L-021`)**:
+  - Added `references/poster_and_caption_guide.md` codifying the full Tier-2 `posters/` release packaging flow: pulling HD unshrunk Hongguo official posters (`~tplv-resize:1440:0.image` -> `official_poster_<slug>_zh.jpg`), standardized `9:16` vertical poster & `16:9` horizontal thumbnail localization prompt templates (compatible with user-generated external Flow / Nano Banana 2 / Gemini assets), and the updated 2-line upload caption format (`<Hook Title> <2 emojis> | Full N Tập` + `#daudonho #aishortfilmdrama ...`).
+  - Added `aicn.py brand-poster --hub <hub> --input <raw_file> [--brand-dir <dir>] [--aspect auto|9x16|16x9|3x4] [--remove-star] [--delete-source]` to automatically archive `_raw`, resize cleanly to exact `1080x1920` / `1920x1080` / `1080x1440` (`_clean.png`), optionally inpaint the Flow/Imagen bottom-right corner star `✦`, and composite dual-corner channel branding (`_branded.png`).
+  - Updated `SKILL.md`, `references/folder_contract.md`, and added `test_brand_poster_renames_resizes_and_brands_9x16_and_16x9` in `tests/test_aicn.py`.
+
 ## 2.6.2 (2026-11-25)
 - **Fix Cross-Process `gpu.lock` Self-Deadlock in `run-series --phase prep` (`scripts/aicn_platform.py`, `scripts/aicn.py`, `L-020`)**:
   - Added thread-safe `ap.child_env_with_held_locks()` propagating only the calling thread's held locks via `AICN_HELD_LOCKS`, and updated `ap.file_lock(reentrant=True)` to honor inherited lock ownership across parent→child subprocess boundaries (fixing the `v2.6.0`/`v2.6.1` self-deadlock where `aicn.py run-series --phase prep` held `gpu.lock` while spawning `aicn_audio.py separate` / `run_asr_and_scan.py` which also requested `gpu.lock`).

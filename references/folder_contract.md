@@ -36,7 +36,12 @@ workspace/<series-slug>/
 │   ├── 16x9/                             # Hardlinked verified batch MP4s (input to merge-series)
 │   ├── 9x16/                             # Optional vertical exports
 │   └── episodes/                         # Optional per-episode splits
-├── posters/                              # Thumbnails & series artwork
+├── posters/                              # Series artwork (see references/poster_and_caption_guide.md)
+│   ├── cover.jpg                         # Catalog thumbnail (~640px)
+│   ├── official_poster_<slug>_zh.jpg     # HD unshrunk official source poster (1440px+)
+│   ├── poster_<slug>_vi_<ratio>_raw.*    # Archived raw localized poster (9x16 | 16x9 | 3x4)
+│   ├── poster_<slug>_vi_<ratio>_clean.png    # Resized clean PNG (optional star removal)
+│   └── poster_<slug>_vi_<ratio>_branded.png  # Final publish-ready dual-corner branded poster
 └── .cache/                               # Hub-level concat list & shared cache (safe to delete)
 ```
 

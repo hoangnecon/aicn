@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.4.0 (2026-11-25)
+- **VieNeu-TTS v3 Turbo CUDA Single-Process `infer_batch()` (`scripts/aicn_audio.py`, `L-016`)**:
+  - Replaced multi-process CPU-style `ProcessPoolExecutor` spawning on CUDA machines with a single in-process PyTorch GPU `Vieneu` instance using `infer_batch(batch_size=16)` (configurable via `tts_batch_size` in `config/audio_mix.json`, or `AICN_TTS_DEVICE=cpu` override), grouped by `(voice, temperature, top_k)` with atomic per-chunk cache writes.
+  - Measured on NVIDIA RTX 2060 6 GB: **4.23s for 16 sentences (RTF 0.127, 3.78 sent/s, peak VRAM 498 MB)** — ~3–4× faster than multi-process single-sentence calls while eliminating Windows `DefaultCPUAllocator` RAM OOM spikes. Non-CUDA (macOS Apple Silicon / CPU) machines seamlessly keep the ONNX `fp32` `ProcessPoolExecutor` path.
+- **Whisper `large-v3` Default ASR & Stage 1 `v2.0.0+` Acoustic Recovery Fix (`vendor/video-asr-visual-audit/scripts/`, `L-015`, `L-016`)**:
+  - Upgraded default Whisper ASR model in `run_asr_and_scan.py` from `small` to `large-v3` (overridable via `AICN_WHISPER_MODEL`), prioritizing `int8_float16` before `float16` on CUDA for comfortable 6 GB VRAM headroom and dramatically fewer Chinese homophone errors.
+  - Fixed Stage 1 `analyze_voice_waveform.py` (`v2.0.0+` non-hardsub mode) so unverified `"phone_call"` / `"whisper"` BGM bursts already probed by Pass 2B do not deadlock `verify_stage_1.py`.
+  - Fixed Pass 2B in `run_asr_and_scan.py` to emit exact per-sub-segment `[pad_s + sg.start, pad_s + sg.end]` spans and skip sub-segments overlapping Pass 1 segments `>= 35%`.
+- **Tests (`tests/test_aicn_audio.py`)**:
+  - Added regression test verifying `presynth()` uses single-process CUDA `infer_batch()` batching and atomic WAV caching.
+
 ## 2.3.0 (2026-11-24)
 - **Thin Dynamic Hongguo Wrapper & Mandatory Upstream Release Preflight (`scripts/hg_tool.cjs`, `scripts/aicn_radar.py`, `SKILL.md`, `L-014`)**:
   - Updated for upstream `jackotom/hongguo-drama v8.2` (merging PR #189 cross-platform SDK v5 helper + `--serve` JSONL reuse, PR #190 up-to-8 batch SDK resolution + `1001`/`1004` content types, and unified official V8/current-app entry first -> SDK fallback).

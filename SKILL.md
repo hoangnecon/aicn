@@ -43,7 +43,7 @@ python <skill>/scripts/aicn.py doctor --root <project-root>
 
 It writes `config/machine.json` and prints the stack to use (`scripts/aicn_platform.py`).
 - **macOS Apple Silicon**: Whisper on MLX (Metal), Demucs MLX (`uvx`), ffmpeg one-pass render with `h264_videotoolbox` / `hevc_videotoolbox` (hardware decode + quality VBR), `rubberband`.
-- **Windows 10/11 + NVIDIA CUDA**: `faster-whisper` on CUDA (`float16`), PyTorch `demucs` on CUDA, ffmpeg one-pass render with `h264_nvenc` / `hevc_nvenc` (`-rc vbr -cq`), `rubberband` (or `libx264` CPU fallback). Python never touches video frames on the default path.
+- **Windows 10/11 + NVIDIA CUDA**: `faster-whisper` (`large-v3`, CUDA `int8_float16`), PyTorch `demucs` on CUDA, single-process VieNeu-TTS v3 Turbo CUDA `infer_batch()`, ffmpeg one-pass render with `h264_nvenc` / `hevc_nvenc` (`-rc vbr -cq`), `rubberband` (or `libx264` CPU fallback). Python never touches video frames on the default path.
 
 ## 1. On entry: read the root
 

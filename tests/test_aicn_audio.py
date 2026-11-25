@@ -368,6 +368,28 @@ class Signal(unittest.TestCase):
         self.assertLess(short_s, 0.8)
         self.assertGreater(long_s, 3.0)
 
+    def test_presynth_uses_cuda_infer_batch_single_process(self):
+        calls = []
+        sr = self.sr
+        class _FakeCudaTTS:
+            def infer_batch(self, texts, voice, temperature, top_k, batch_size):
+                calls.append((list(texts), voice, temperature, top_k, batch_size))
+                return [np.zeros(sr // 10, dtype=np.float32) for _ in texts]
+        orig_cuda = self.m._tts_cuda_available
+        orig_tts = self.m._TTS
+        try:
+            self.m._tts_cuda_available = lambda: True
+            self.m._TTS = _FakeCudaTTS()
+            with tempfile.TemporaryDirectory() as td:
+                jobs = [(f"Câu {i}", "Trúc Ly", 0.8, 25, os.path.join(td, f"j{i}.wav")) for i in range(5)]
+                self.m.presynth(jobs, workers=4, threads=4, batch_size=2)
+                self.assertEqual([len(c[0]) for c in calls], [2, 2, 1])
+                for _, _, _, _, p in jobs:
+                    self.assertTrue(os.path.exists(p))
+        finally:
+            self.m._tts_cuda_available = orig_cuda
+            self.m._TTS = orig_tts
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -403,7 +403,8 @@ def load_whisper(size):
             pass
     from faster_whisper import WhisperModel
     if eng == "faster-cuda":
-        for ctype in ("float16", "int8_float16"):
+        ctypes = ("int8_float16", "float16") if "large" in size else ("float16", "int8_float16")
+        for ctype in ctypes:
             try:
                 print(f"[ASR] engine=faster-whisper ({size}) on CUDA ({ctype})", flush=True)
                 return WhisperModel(size, device="cuda", compute_type=ctype)
@@ -437,7 +438,7 @@ def run_multipass_whisper_asr(
     vocals_path: str,
     bbox_json: str,
     out_json: str,
-    model_size: str = "small",
+    model_size: str = os.environ.get("AICN_WHISPER_MODEL", "large-v3"),
     source_lang: str = "zh",
 ):
     """
@@ -676,25 +677,37 @@ def run_multipass_whisper_asr(
                 temperature=0.0,
             )
             sub_list = list(sub_gen)
-            texts = [sg.text.strip() for sg in sub_list if sg.text.strip() and not _is_hallucination(sg.text)]
-            if texts:
-                rec_text = " ".join(texts)
-                rec_prob = round(float(getattr(sub_list[0], "avg_logprob", -0.6)), 3)
-                no_sp = float(getattr(sub_list[0], "no_speech_prob", 0.0))
-                comp_r = float(getattr(sub_list[0], "compression_ratio", 1.0))
+            for sg in sub_list:
+                rec_text = sg.text.strip()
+                if not rec_text or _is_hallucination(rec_text):
+                    continue
+                rec_prob = round(float(getattr(sg, "avg_logprob", -0.6)), 3)
+                no_sp = float(getattr(sg, "no_speech_prob", 0.0))
+                comp_r = float(getattr(sg, "compression_ratio", 1.0))
                 n_cjk = len([c for c in rec_text if "\u4e00" <= c <= "\u9fff"])
                 has_words = (n_cjk >= 2) if (source_lang == "zh") else (len(rec_text.strip()) >= 3)
-                if rec_prob > -0.95 and no_sp < 0.65 and comp_r <= 2.2 and has_words:
-                    rec_cnt += 1
-                    results.append({
-                        "id": -1,
-                        "start": round(float(b["start"]), 3),
-                        "end": round(float(b["end"]), 3),
-                        "text": rec_text,
-                        "avg_logprob": rec_prob,
-                        "cue_type": kind,
-                        "source": f"pass2_acoustic_{kind}_recovery",
-                    })
+                if not (rec_prob > -0.95 and no_sp < 0.65 and comp_r <= 2.2 and has_words):
+                    continue
+                seg_st = round(max(float(b["start"]), pad_s + float(getattr(sg, "start", 0.0))), 3)
+                seg_et = round(min(float(b["end"]), pad_s + float(getattr(sg, "end", b["end"] - pad_s))), 3)
+                if seg_et - seg_st < 0.20:
+                    continue
+                ov_existing = sum(
+                    max(0.0, min(seg_et, float(r["end"])) - max(seg_st, float(r["start"])))
+                    for r in results
+                )
+                if (ov_existing / max(0.2, seg_et - seg_st)) >= 0.35:
+                    continue
+                rec_cnt += 1
+                results.append({
+                    "id": -1,
+                    "start": seg_st,
+                    "end": seg_et,
+                    "text": rec_text,
+                    "avg_logprob": rec_prob,
+                    "cue_type": kind,
+                    "source": f"pass2_acoustic_{kind}_recovery",
+                })
         if rec_cnt:
             results.sort(key=lambda x: (x["start"], x["end"]))
             for idx, item in enumerate(results):

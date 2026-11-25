@@ -30,6 +30,7 @@ STEMS_VERSION = "aicn-audio-1.0"  # unchanged Demucs separation; keep cache-comp
 DEFAULTS = {
     "voice": "Trúc Ly",
     "tts_workers": 0, "tts_threads": 0,         # 0=auto-scale CPU fp32 ONNX workers (2x4 on 8-core M1, up to 4x4 on 16+ core desktop)
+    "tts_batch_size": 16,                       # CUDA PyTorch static batch size (single process, ~0.5-0.8 GB VRAM, 3-4x faster than multi-proc)
     "temperature": 0.8, "top_k": 25,            # VieNeu v3 Turbo defaults (same as its app)
     "group_max_gap_s": 0.6,                     # clauses of one speaker closer than this are read as one sentence
     "base_tempo": 1.10,                         # model reads ~5.2 syl/s; 1.10 brings it to ~5.7
@@ -232,10 +233,23 @@ def split_points(w, weights):
 _TTS = None
 
 
-def _tts_init(threads=0):
+def _tts_cuda_available():
+    if os.environ.get("AICN_TTS_DEVICE", "").lower() == "cpu":
+        return False
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _tts_init(threads=0, device="auto", max_batch_size=16):
     global _TTS
     from vieneu import Vieneu
-    _TTS = Vieneu(mode="v3turbo", precision="fp32", threads=int(threads))
+    if device == "cuda":
+        _TTS = Vieneu(mode="v3turbo", device="cuda", max_batch_size=int(max_batch_size))
+    else:
+        _TTS = Vieneu(mode="v3turbo", precision="fp32", threads=int(threads), device=device)
 
 
 def _tts_job(job):
@@ -246,14 +260,35 @@ def _tts_job(job):
     return path
 
 
-def presynth(jobs, workers, threads=0):
-    """Synthesize missing sentences on CPU fp32 ONNX. Spawns multiple workers with capped per-worker
-    threads only when there are enough jobs (>=8) to amortize process startup."""
+def presynth(jobs, workers, threads=0, batch_size=16):
+    """Synthesize missing sentences.
+    - CUDA GPU: single in-process PyTorch instance using infer_batch() (avoids multi-process
+      RAM/VRAM duplication & ~3-4x faster at ~0.5 GB VRAM).
+    - CPU / Apple Silicon: ONNX fp32 ProcessPoolExecutor when >=8 jobs."""
     if not jobs:
+        return
+    if _tts_cuda_available():
+        bs = max(1, int(batch_size or 16))
+        if _TTS is None:
+            _tts_init(device="cuda", max_batch_size=bs)
+        # Group by (voice, temperature, top_k) while preserving order; flush each batch to cache
+        from collections import defaultdict
+        by_cfg = defaultdict(list)
+        for j in jobs:
+            text, voice, temp, top_k, path = j
+            by_cfg[(voice, temp, top_k)].append((text, path))
+        for (voice, temp, top_k), items in by_cfg.items():
+            for start in range(0, len(items), bs):
+                chunk = items[start:start + bs]
+                texts = [t for t, _ in chunk]
+                wavs = _TTS.infer_batch(texts=texts, voice=voice, temperature=temp, top_k=top_k, batch_size=bs)
+                for (_, path), w in zip(chunk, wavs):
+                    sf.write(path + ".part.wav", w, SR, subtype="FLOAT")
+                    os.replace(path + ".part.wav", path)
         return
     if workers <= 1 or len(jobs) < 8:
         if _TTS is None:
-            _tts_init(threads=0)
+            _tts_init(threads=0, device="cpu")
         for j in jobs:
             _tts_job(j)
         return
@@ -262,7 +297,7 @@ def presynth(jobs, workers, threads=0):
     n_w = min(workers, len(jobs))
     t_per_w = int(threads) if threads else max(1, (os.cpu_count() or 4) // n_w)
     with ProcessPoolExecutor(max_workers=n_w, mp_context=mp.get_context("spawn"),
-                             initializer=_tts_init, initargs=(t_per_w,)) as ex:
+                             initializer=_tts_init, initargs=(t_per_w, "cpu")) as ex:
         list(ex.map(_tts_job, jobs))
 
 
@@ -333,7 +368,7 @@ def cmd_dub(ws, c, fh):
         if not os.path.exists(p_) and p_ not in seen:
             seen.add(p_); jobs.append((text, voice, c["temperature"], c["top_k"], p_))
     tts_w, tts_th = _resolve_tts_parallelism(c)
-    presynth(jobs, tts_w, tts_th); synth = len(jobs)
+    presynth(jobs, tts_w, tts_th, batch_size=c.get("tts_batch_size", 16)); synth = len(jobs)
     # Prepare raw cleaned waves, split into per-clause pieces, and run rubberband time-stretch with per-clause cache
     prep_clauses = []
     group_meta = []

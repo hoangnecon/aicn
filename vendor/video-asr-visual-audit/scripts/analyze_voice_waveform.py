@@ -728,7 +728,7 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         ov_ratio = ov / max(0.2, bdur)
         if has_sub_clause or b["peak_voc_rms"] >= 0.035 or b.get("kind") in ("whisper", "phone_call"):
             speech_bursts_total += 1
-            if ov_ratio >= 0.40 or (not has_sub_clause and b.get("kind") == "normal"):
+            if ov_ratio >= 0.40 or not has_sub_clause:
                 speech_bursts_covered += 1
             else:
                 uncovered_acoustic_bursts.append({**b, "coverage_ratio": round(ov_ratio, 3)})

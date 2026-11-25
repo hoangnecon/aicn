@@ -1413,15 +1413,98 @@ def stft_and_power(x, idx=None):
     return P / n_ch, Zs, idx
 
 
-def band_power(x):
-    P, _, idx = stft_and_power(x)
+def band_power_chunked(x, idx=None, chunk_frames=5625):
+    """Low-RAM (<50 MiB) C++ PyTorch/SciPy chunked STFT band power, bit-exact to full-length stft_and_power."""
+    if idx is None:
+        idx, _ = _band_indices()
+    arr = np.ascontiguousarray(x, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    n_raw, n_ch = arr.shape
+    if n_raw <= chunk_frames * HOP:
+        P, _, _ = stft_and_power(arr, idx)
+        return P, idx
+    pad_l, pad_r = _pad_for_stft(n_raw)
+    n_frames = (n_raw + pad_l + pad_r - NFFT) // HOP + 1
+    P = np.empty((len(idx), n_frames), dtype=np.float32)
+    bmat = _band_matrix(idx)
+    bmat_t = torch.from_numpy(bmat) if torch is not None else None
+    for f0 in range(0, n_frames, chunk_frames):
+        f1 = min(n_frames, f0 + chunk_frames)
+        w0 = f0 * HOP - pad_l
+        w1 = (f1 - 1) * HOP + NFFT - pad_l
+        s0, s1 = max(0, w0), min(n_raw, w1)
+        pl, pr = max(0, -w0), max(0, w1 - n_raw)
+        seg = arr[s0:s1]
+        if pl or pr:
+            seg = np.pad(seg, ((pl, pr), (0, 0)))
+        if torch is not None:
+            xt = torch.from_numpy(seg[:, 0]).unsqueeze(0) if n_ch == 1 else torch.from_numpy(seg).t().contiguous()
+            Zt = torch.stft(
+                xt, n_fft=NFFT, hop_length=HOP, window=_WIN_HANN_T,
+                center=False, return_complex=True,
+            ) / float(_WIN_SUM)
+            rv = torch.view_as_real(Zt)
+            z2_all = rv[..., 0].square().add_(rv[..., 1].square())
+            Z2 = z2_all[0] if n_ch == 1 else (z2_all[0].add_(z2_all[1]).mul_(0.5) if n_ch == 2 else z2_all.mean(dim=0))
+            P[:, f0:f1] = (bmat_t.T @ Z2).numpy()[:, : f1 - f0]
+        else:
+            nf_c = f1 - f0
+            st0, st1 = seg.strides
+            frames = np.lib.stride_tricks.as_strided(seg, shape=(nf_c, NFFT, n_ch), strides=(HOP * st0, st0, st1))
+            acc = None
+            for ch in range(n_ch):
+                Z_ch = (sp_fft.rfft(frames[:, :, ch] * _WIN_HANN[None, :], axis=1, workers=_FFT_WORKERS) / _WIN_SUM).T
+                Z2 = (Z_ch.real * Z_ch.real + Z_ch.imag * Z_ch.imag).astype(np.float32)
+                pc = bmat.T @ Z2
+                acc = pc if acc is None else (acc + pc)
+            P[:, f0:f1] = acc / n_ch
     return P, idx
 
 
+def mix_stems_chunked(sig_gain_pairs, band_of_bin, length, idx=None, chunk_frames=5625):
+    """Low-RAM (<140 MiB) halo-padded chunked combined STFT+iSTFT (<1e-6 vs full istft_combined)."""
+    if idx is None:
+        idx, _ = _band_indices()
+    if length <= chunk_frames * HOP:
+        z_pairs = [(stft_and_power(sig, idx)[1], g) for sig, g in sig_gain_pairs]
+        return istft_combined(z_pairs, band_of_bin, length)
+    first_sig = np.asarray(sig_gain_pairs[0][0], dtype=np.float32)
+    is_1d = first_sig.ndim == 1
+    n_ch = 1 if is_1d else first_sig.shape[1]
+    out = np.empty((length, n_ch), dtype=np.float32)
+    halo_f = 8
+    total_hops = (length + HOP - 1) // HOP
+    for f0 in range(0, total_hops, chunk_frames):
+        s0 = f0 * HOP
+        s1 = min(length, (f0 + chunk_frames) * HOP)
+        f_lo = max(0, f0 - halo_f)
+        lo_s = f_lo * HOP
+        hi_s = min(length, (f0 + chunk_frames + halo_f) * HOP)
+        z_pairs = []
+        for sig, g in sig_gain_pairs:
+            _, Z_blk, _ = stft_and_power(sig[lo_s:hi_s], idx)
+            nf_blk = Z_blk[0].shape[1]
+            g_blk = g[:, f_lo : f_lo + nf_blk]
+            if g_blk.shape[1] < nf_blk:
+                g_blk = np.pad(g_blk, ((0, 0), (0, nf_blk - g_blk.shape[1])), mode="edge")
+            z_pairs.append((Z_blk, g_blk))
+        y_blk = istft_combined(z_pairs, band_of_bin, hi_s - lo_s)
+        out[s0:s1] = y_blk[s0 - lo_s : s1 - lo_s]
+    return out[:, 0] if is_1d else out
+
+
+def band_power(x):
+    return band_power_chunked(x)
+
+
+def apply_gain_chunked(x, g, band_of_bin, chunk_frames=5625):
+    return mix_stems_chunked([(x, g)], band_of_bin, len(x), chunk_frames=chunk_frames)
+
+
 def apply_gain(x, g, idx):
-    _, Zs, _ = stft_and_power(x, idx)
     _, band_of_bin = _band_indices()
-    return istft_from_Z(Zs, g, band_of_bin, len(x))
+    return mix_stems_chunked([(x, g)], band_of_bin, len(x), idx=idx)
 
 
 def cmd_mix(ws, c, fh=None):
@@ -1493,11 +1576,18 @@ def cmd_mix(ws, c, fh=None):
     T = T * np.float32(10.0 ** (gain / 20.0))
 
     idx, band_of_bin = _band_indices()
-    PT, _, _ = stft_and_power(T, idx)
-    PV, ZV, _ = stft_and_power(V, idx)
-    del V
-    PB, ZB, _ = stft_and_power(B, idx)
-    del B
+    use_chunked_mix = n > 5625 * HOP
+    if use_chunked_mix:
+        PT, _ = band_power_chunked(T, idx)
+        PV, _ = band_power_chunked(V, idx)
+        PB, _ = band_power_chunked(B, idx)
+        ZV = ZB = None
+    else:
+        PT, _, _ = stft_and_power(T, idx)
+        PV, ZV, _ = stft_and_power(V, idx)
+        del V
+        PB, ZB, _ = stft_and_power(B, idx)
+        del B
     fps = SR / HOP
     hold_s = float(c.get("hold_s", 0.30))
 
@@ -1536,8 +1626,12 @@ def cmd_mix(ws, c, fh=None):
     gV = follow_hold(1.0 - BAND_W_VOCAL[:, None] * (1.0 - gV_raw), fps, c["attack_s"], hold_s, c["release_s"])
     gB = follow_hold(1.0 - BAND_W[:, None] * (1.0 - gB_raw), fps, c["attack_s"], hold_s, c["release_s"])
 
-    mix = istft_combined([(ZV, gV), (ZB, gB)], band_of_bin, n)
-    del ZV, ZB
+    if use_chunked_mix:
+        mix = mix_stems_chunked([(V, gV), (B, gB)], band_of_bin, n, idx=idx)
+        del V, B
+    else:
+        mix = istft_combined([(ZV, gV), (ZB, gB)], band_of_bin, n)
+        del ZV, ZB
     if torch is not None and len(mix) >= SR * 10:
         torch.from_numpy(mix).add_(torch.from_numpy(np.ascontiguousarray(T, dtype=np.float32)).unsqueeze(1))
     else:

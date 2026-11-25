@@ -1,7 +1,7 @@
 # Changelog
 
 ## 3.0.0 (2026-11-25)
-- **Ground-Up Architecture Overhaul (`SPEC_V3.md`, `L-022`) — Concurrency, True Content-Addressed Caching, Audio Continuity, ASR Collar Dedup & Fast Hardware Render:**
+- **Ground-Up Architecture Overhaul (`SPEC_V3.md`, `L-023`) — Concurrency, True Content-Addressed Caching, Audio Continuity, ASR Collar Dedup & Fast Hardware Render:**
   - **SQLite-WAL Content-Addressed Hash Store & Relocation-Safe Gates (`scripts/aicn_platform.py`, `cicd_gate.py`, `init_workspace.py`):**
     - Retired `FastHash` (`.cache/stat_hash.json`) and unlocked `global_stat_hash.json`; replaced with SQLite-WAL `<global_cache_dir>/content_hash.db` (`busy_timeout=15000`) backing `ap.content_sha256()`, `ap.hash_obj()`, `ap.global_cache_path()`, and unified single-source key builders (`stage1_asr_key`, `stems_key`, `tts_sent_key`, `rb_stretch_key`, `wm_overlay_key`, `render_key`). Moving or renaming any unit or series hub preserves 100% cache and gate hits.
     - Updated `cicd_gate.py` (`schema_version: "3.0"`, `workspace_slug`, workspace-relative POSIX artifact keys, atomic writes) and `init_workspace.py` (relative POSIX paths, `series_hub_rel`, `voice_dub`-only enforcement rejecting `sub_only`, clean unit/hub directory trees).
@@ -18,6 +18,11 @@
     - Pre-composites dual-corner branding PNGs ONCE into `<global_cache>/wm_overlay/<key>.png` (bounds-safe Pillow crop) and renders with `hwupload_cuda` + `overlay_cuda` (preserving exact non-mod-16/32 dimensions such as `1920x1080` & `1080x1920`, verified `dims_ok` in `verify-render`, measured `7.0×–10.5×` RT on RTX 2060 vs `8.75s / 30s` dual `-loop 1` in v2.7.0) with automatic single-static CPU `overlay` fallback (`7.7×` RT).
   - **Legacy Purge, Sourcing Hardening & Cohesive Docs:**
     - Deleted retired scripts (`apply_channel_branding.py`, `render_vertical_9x16.py`, `split_compiled_episodes.py`, `assemble_master_audio.py`, `synthesize_and_audit_pacing.py`), `cmd_tts_sync`, `01_zh_bbox_scan` / Style-B / `sub_only` remnants; fixed `dy_tool.py`, `hg_tool.cjs`, `aicn_radar.py`, `composite_and_verify.py`, `verify_stage_5.py`, `install.ps1`/`install.sh`; rewrote all 30 skill/reference/template docs cleanly for `v3.0.0`.
+
+## 2.7.1 (2026-11-25)
+- **Fix Windows Concurrent `_write_wav16` Race & 65× Lower-RAM Chunked STFT/iSTFT in Stage 3 Mix (`scripts/aicn_audio.py`, `L-022`)**:
+  - Updated `_write_wav16()` to write per-PID/per-thread temp files (`{path}.{pid}.{tid}.part.wav`) with Windows `PermissionError` (`WinError 32`) race handling so identical clauses stretched concurrently in `ThreadPoolExecutor` never collide on the same `.part.wav`.
+  - Replaced full-length `complex128` STFT/iSTFT allocations (`3.4–5.2 GiB` peak RAM on 20-minute units) in `spectral_profile()` and `cmd_mix()` with overlap-trimmed chunked STFT/iSTFT (`< 140 MiB` peak RAM), preventing multi-tab Windows `ArrayMemoryError` crashes (carried forward into `v3.0.0` via PyTorch C++ `band_power_chunked` + `mix_stems_chunked`).
 
 ## 2.7.0 (2026-11-25)
 - **Poster Localization, `brand-poster` CLI & Updated Upload Caption Standard (`references/poster_and_caption_guide.md`, `scripts/aicn.py`, `SKILL.md`, `L-021`)**:

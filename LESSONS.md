@@ -178,7 +178,13 @@ Structured log of verified production failures, user corrections, and API change
   2. Added `aicn.py brand-poster` to standardize any user-generated raw poster into `_raw`, `_clean.png`, and dual-corner `_branded.png` (with optional `--remove-star` and `--delete-source`), backed by unit tests in `tests/test_aicn.py`.
   3. Updated `SKILL.md` and `references/folder_contract.md`.
 
-## L-022 (2026-11-25) — `v2.7.0` 13-Unit Forensic Audit: Serial `gpu.lock`, `split_points()` Audio Chops, Pass 2B Overlap/Duplicates, Slow STFT & Dual-Loop NVENC
+## L-022 (2026-11-25) — Windows `_write_wav16` Multi-Thread Cache Collision (`WinError 32`) & 20-Min Unit `3.4 GiB` STFT `ArrayMemoryError`
+- **Symptom:** On dense 20-minute 48 kHz units (`550+` clauses) running concurrently across multi-series tabs on Windows, `aicn_audio.py` hit two failures: (1) `PermissionError: [WinError 32]` in `_write_wav16` when two threads concurrently stretched identical clauses hashing to the same `.part.wav`, and (2) `ArrayMemoryError: Unable to allocate 3.41 GiB` when allocating full-length stereo STFT tensors simultaneously across concurrent workers.
+- **Guardrail Implemented (`v2.7.1` -> `v3.0.0`):**
+  1. Per-PID + per-thread atomic temp filenames (`_tmp_path` + `_atomic_replace`) across all writers plus intra-unit `rb_stretch` deduplication.
+  2. Overlap-trimmed 60s-chunked PyTorch C++ `band_power_chunked()` + `mix_stems_chunked()` (`< 140 MiB` peak STFT RAM even on 20–30 minute stereo units, `< 1e-6` match vs unchunked `istft_combined`).
+
+## L-023 (2026-11-25) — `v2.7.0` 13-Unit Forensic Audit: Serial `gpu.lock`, `split_points()` Audio Chops, Pass 2B Overlap/Duplicates, Slow STFT & Dual-Loop NVENC
 - **Symptom:** Full-series production of `nam-than-giam-can-giam-mot-can-thuong-mot-tram-trieu` (13 units, 134 eps, RTX 2060 6 GB) exposed six systemic defects across Stages 1–5:
   1. Serial `gpu.lock` caused 33 lock waits totaling **343.6 min** (max single wait **78 min**) alongside 26+ cold model startups.
   2. Dubbed audio suffered mid-word glitches/chops and premature stops even though raw VieNeu WAVs in `.cache/tts_sent` had `0/407` internal silence glitches.

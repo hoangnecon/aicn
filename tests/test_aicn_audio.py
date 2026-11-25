@@ -778,6 +778,30 @@ class WarmBatchAndStage3Gates(unittest.TestCase, _TempEnvMixin):
         self.assertLess(short_s, 0.8)
         self.assertGreater(long_s, 3.0)
 
+    def test_chunked_stft_istft_equivalence_and_concurrent_write_wav16(self):
+        from concurrent.futures import ThreadPoolExecutor
+        rng = np.random.default_rng(7)
+        v = (rng.standard_normal((self.sr * 4 + 137, 2)) * 0.25).astype(np.float32)
+        b = (rng.standard_normal((self.sr * 4 + 137, 2)) * 0.20).astype(np.float32)
+        idx, bob = self.m._band_indices()
+        P_ref, Zv, _ = self.m.stft_and_power(v, idx)
+        _, Zb, _ = self.m.stft_and_power(b, idx)
+        P_chk, _ = self.m.band_power_chunked(v, idx, chunk_frames=100)
+        self.assertEqual(P_ref.shape, P_chk.shape)
+        self.assertLess(float(np.max(np.abs(P_ref - P_chk)) / (np.max(P_ref) + 1e-12)), 1e-5)
+        gV = np.clip(0.25 + 0.65 * rng.random(P_ref.shape), 0.1, 1.0)
+        gB = np.clip(0.30 + 0.60 * rng.random(P_ref.shape), 0.1, 1.0)
+        y_ref = self.m.istft_combined([(Zv, gV), (Zb, gB)], bob, len(v))
+        y_chk = self.m.mix_stems_chunked([(v, gV), (b, gB)], bob, len(v), idx=idx, chunk_frames=100)
+        self.assertLess(float(np.max(np.abs(y_ref - y_chk))), 1e-5)
+
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "same_hash.wav")
+            wav = np.zeros(self.sr // 5, dtype=np.float32)
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(lambda _: self.m._write_wav16(target, wav, self.sr), range(12)))
+            self.assertTrue(os.path.isfile(target))
+
 
 if __name__ == "__main__":
     unittest.main()

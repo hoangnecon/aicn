@@ -251,10 +251,11 @@ def detect_uncovered_multiband_gaps(
     mid_fl = _floor(mid_rms, 0.0025, 0.0100)
     lo_fl = _floor(lo_rms, 0.0025, 0.0100)
 
-    # 2. Build covered mask from existing ASR segments, clamping bloated Pass 1 spans to their densest
-    # active-energy window (<= n_chars * 0.35 + 1.35s) so Pass 1 silence tails NEVER hide adjacent speech
-    # before --snap-and-split shrinks them!
+    # 2. Build covered mask from existing ASR segments. When a bloated Pass 1 span (> n_chars * 0.35 + 1.35s)
+    # bridges across a >= 0.45s silent gap into an adjacent speech cluster (or carries long leading/trailing silence),
+    # restrict `covered` to the primary active speech cluster(s) fitting <= max_cov_dur so adjacent utterances stay exposed!
     covered = np.zeros(n_hops, dtype=bool)
+    seg_act_mask = (voc_rms > max(0.0080, voc_fl * 2.1)) | (full_rms > max(0.0100, voc_fl * 2.5))
     for s in existing_segments or []:
         raw_st = float(s.get("start", 0.0))
         raw_et = float(s.get("end", 0.0))
@@ -264,13 +265,34 @@ def detect_uncovered_multiband_gaps(
         if n_ch > 0 and (raw_et - raw_st) > max_cov_dur:
             a0 = max(0, int(round(raw_st / 0.05)))
             a1 = min(n_hops, int(round(raw_et / 0.05)))
-            w_h = max(2, int(round(max_cov_dur / 0.05)))
-            if (a1 - a0) > w_h:
-                csum = np.concatenate([[0.0], np.cumsum(full_rms[a0:a1])])
-                win_sums = csum[w_h:] - csum[:-w_h]
-                best_off = int(np.argmax(win_sums))
-                raw_st = (a0 + best_off) * 0.05
-                raw_et = (a0 + best_off + w_h) * 0.05
+            act_idx = [k for k in range(a0, a1) if seg_act_mask[k]]
+            if act_idx:
+                # Group active hops into clusters separated by >= 0.45s (9 hops) of non-vocal silence
+                cl_list = [[act_idx[0], act_idx[0] + 1, float(full_rms[act_idx[0]])]]
+                for k in act_idx[1:]:
+                    if (k - cl_list[-1][1]) < 9:
+                        cl_list[-1][1] = k + 1
+                        cl_list[-1][2] += float(full_rms[k])
+                    else:
+                        cl_list.append([k, k + 1, float(full_rms[k])])
+                if len(cl_list) >= 2:
+                    # Multiple clusters bridged across >=0.45s silence: pick highest-energy contiguous cluster range <= max_cov_dur
+                    best_e, best_pair = -1.0, None
+                    for ci in range(len(cl_list)):
+                        acc_e = 0.0
+                        for cj in range(ci, len(cl_list)):
+                            if ((cl_list[cj][1] - cl_list[ci][0]) * 0.05) > max_cov_dur and cj > ci:
+                                break
+                            acc_e += cl_list[cj][2]
+                            if acc_e > best_e:
+                                best_e, best_pair = acc_e, (ci, cj)
+                    if best_pair is not None:
+                        raw_st = max(raw_st, cl_list[best_pair[0]][0] * 0.05 - 0.10)
+                        raw_et = min(raw_et, cl_list[best_pair[1]][1] * 0.05 + 0.10)
+                else:
+                    # Single cluster with bloated leading/trailing silence: trim dead silence outside cluster
+                    raw_st = max(raw_st, cl_list[0][0] * 0.05 - 0.10)
+                    raw_et = min(raw_et, cl_list[0][1] * 0.05 + 0.10)
         st = raw_st + 0.05
         et = raw_et - 0.05
         if et <= st:

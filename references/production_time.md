@@ -13,7 +13,7 @@ Measured bottlenecks on a real 13-unit / 134-episode `1080×1920` production run
 | **Stage 3 VieNeu TTS** | Cold-started 13+ times across units; post-synthesis clause slicing chopped words | Single in-process CUDA `infer_batch(16)` (`4.23s` for 16 sents, `RTF 0.127`, `498 MB` VRAM on RTX 2060) + indivisible utterance placement + global `tts_sent/` & `rb_stretch/` cache | Zero mid-word chops; `cmd_dub` fails fast (`exit 2`) before `cmd_mix` (saving ~28 min across 15 overflowed runs) |
 | **Stage 3 DSP Mix** | **113.8s/unit** avg (8 STFT/iSTFT passes + Python `follow_hold()` loop + `ffmpeg` pipe `lufs()`) | PyTorch Welch `spectral_profile_fast()` + anti-denormal `sosfilt` + in-RAM BS.1770-4 `lufs()` + C-speed chunked `follow_hold()` + PyTorch CPU `torch.stft`/`torch.istft` (`scipy.fft` fallback) combined synthesis | **`11.56s`** measured on 10-min (`600s`) 48 kHz stereo (**9.8× faster**; `dub_snr_speech_db_median = 17.4 dB`, `p10 = 16.48 dB`) |
 | **Stage 3 Master** | Legacy 192 kHz 2-pass `loudnorm` (`115.4s`) | Native 48 kHz `acompressor` + `ebur128` + `alimiter` (`master_mode="fast"`) | **`~4.1s`** (**28× faster**) |
-| **Stage 4 Hardware Render** | **154.7s/unit** (`8.75s` on 30s 1080p30 slice due to dual `-framerate 30 -loop 1` CPU `overlay`) | Pre-composited top-band RGBA PNG (`wm_overlay/` cache) + `-hwaccel cuda` + `overlay_cuda` (or single static `overlay` fallback), lock-free parallel (`AICN_MAX_RENDER_JOBS=2`) | **`2.87s` / 30s** (`10.5×` RT, **3.05× faster** with `overlay_cuda`); **`3.90s` / 30s** (`7.7×` RT single CPU `overlay` fallback) |
+| **Stage 4 Hardware Render** | **154.7s/unit** (`8.75s` on 30s 1080p30 slice due to dual `-framerate 30 -loop 1` CPU `overlay`) | Pre-composited top-band RGBA PNG (`wm_overlay/` cache) + `hwupload_cuda` + `overlay_cuda` (or single static `overlay` fallback), lock-free parallel (`AICN_MAX_RENDER_JOBS=2`) | **`2.87s` / 30s** (`10.5×` RT, **3.05× faster** with `overlay_cuda`); **`3.90s` / 30s** (`7.7×` RT single CPU `overlay` fallback) |
 | **Stage 5 QA Extract** | Sequential under `media.lock` | Hardlink `.staging_render.mp4 → .staging_final.mp4` (`0 B`) + 4-worker parallel extract, lock-free | **~3–4s** per unit |
 
 ## 2. Measured Hardware Benchmark Reference Points
@@ -31,7 +31,7 @@ Measured bottlenecks on a real 13-unit / 134-episode `1080×1920` production run
 
 | Change | Typical Time | Work Performed |
 |---|---|---|
-| Reword external `.srt` (`sub_text` only) | ≈ `0.1 min` | `validate_bilingual_script.py` → re-export `subtitles_full.srt` → `merge-series` (0 TTS, 0 mix, 0 render) |
+| Reword external `.srt` (`sub_text` only) | ≈ `0.1 min` | `validate_bilingual_script.py` → `aicn_audio.py dub` (100% cache hit, rewrites `subtitles_full.srt`) → `verify` → `merge-series` (0 TTS, 0 mix, 0 render) |
 | Change one dubbed line (`tts_text`) | ≈ `1–1.5 min` | 1 VieNeu utterance + 1 `rubberband` (all other lines hit `tts_sent`/`rb_stretch` cache) → `< 12s` `mix` → `~4s` `master` → 1 fast hardware `render` → QA → `merge-series` |
 | Tune `config/audio_mix.json` only | ≈ `0.5 min` + render | `< 12s` `mix` → `~4s` `master` → `verify` → 1 fast hardware `render` → `merge-series` |
 | Change codec or `--brand-dir` | `render` + QA | Global `wm_overlay` composited once → 1 fast hardware `render` (or instant `-c:v copy` if unbranded) |

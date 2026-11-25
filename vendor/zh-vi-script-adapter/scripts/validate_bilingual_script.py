@@ -71,11 +71,80 @@ def estimate_vieneu_tts_seconds(tts_text: str) -> float:
     return (0.185 * vi_syls) + 0.22 + (en_words * 0.32) + (soft_pauses * 0.08) + (hard_pauses * 0.14)
 
 
+def _load_stage3_pacing_cfg(ws: str | None) -> tuple[dict, dict]:
+    """Read config/audio_mix.json + series_bible.json speaker->voice map so Stage 2 matches Stage 3 exactly."""
+    c = {
+        "voice": "Trúc Ly",
+        "group_max_gap_s": 0.12,
+        "max_group_clauses": 3,
+        "max_group_span_s": 4.5,
+        "lead_gap_s": 0.05,
+        "max_overhang_s": 1.20,
+        "max_tempo": 1.28,
+        "max_tempo_short": 1.32,
+    }
+    spk_map = {}
+    if not ws:
+        return c, spk_map
+    mix_p = os.path.join(ws, "config", "audio_mix.json")
+    if os.path.exists(mix_p):
+        try:
+            with open(mix_p, "r", encoding="utf-8") as f:
+                c.update(json.load(f) or {})
+        except Exception:
+            pass
+    bible_paths = []
+    pc_p = os.path.join(ws, "config", "project_config.json")
+    if os.path.exists(pc_p):
+        try:
+            with open(pc_p, "r", encoding="utf-8") as f:
+                pc = json.load(f) or {}
+            rel = pc.get("series_hub_rel")
+            if rel:
+                cand_h = os.path.abspath(os.path.join(ws, str(rel)))
+                if os.path.isdir(cand_h):
+                    bible_paths.append(os.path.join(cand_h, "config", "series_bible.json"))
+        except Exception:
+            pass
+    bible_paths.append(os.path.join(ws, "config", "series_bible.json"))
+    for bp in bible_paths:
+        if os.path.exists(bp):
+            try:
+                with open(bp, "r", encoding="utf-8") as bf:
+                    b = json.load(bf) or {}
+                for ch in b.get("characters") or []:
+                    if isinstance(ch, dict) and ch.get("speaker_id") and ch.get("voice_id"):
+                        spk_map[str(ch["speaker_id"]).strip()] = str(ch["voice_id"]).strip()
+                if isinstance(b.get("voices"), dict):
+                    for spk, vid in b["voices"].items():
+                        if spk and vid:
+                            spk_map[str(spk).strip()] = str(vid).strip()
+            except Exception:
+                pass
+    if isinstance(c.get("voices"), dict):
+        for spk, vid in c["voices"].items():
+            if spk and vid:
+                spk_map[str(spk).strip()] = str(vid).strip()
+    return c, spk_map
+
+
+def _eff_voice(seg: dict, spk_map: dict | None, default_voice: str = "Trúc Ly") -> str:
+    v = str(seg.get("voice") or "").strip()
+    if v:
+        return v
+    spk = str(seg.get("speaker") or "").strip()
+    if spk and spk_map and spk in spk_map:
+        return spk_map[spk]
+    return default_voice
+
+
 def group_script_utterances_v3(
     segments: list,
     max_gap_s: float = 0.12,
     max_clauses: int = 3,
     max_span_s: float = 4.5,
+    spk_map: dict | None = None,
+    default_voice: str = "Trúc Ly",
 ) -> list[list[int]]:
     """Mirror Stage 3 v3.0.0 indivisible utterance grouping: gap <= 0.12s, <= 3 clauses, span <= 4.5s."""
     groups, cur = [], []
@@ -85,7 +154,7 @@ def group_script_utterances_v3(
             chained = not re.search(r"[.!?…]\s*$", (p.get("tts_text") or "").strip())
             span_ok = (float(s.get("end", 0.0)) - float(segments[cur[0]].get("start", 0.0))) <= max_span_s
             same_speaker = s.get("speaker") == p.get("speaker")
-            same_voice = s.get("voice") == p.get("voice")
+            same_voice = _eff_voice(s, spk_map, default_voice) == _eff_voice(p, spk_map, default_voice)
             gap_ok = (float(s.get("start", 0.0)) - float(p.get("end", 0.0))) <= max_gap_s
             if chained and len(cur) < max_clauses and span_ok and same_speaker and same_voice and gap_ok:
                 cur.append(i)
@@ -97,34 +166,53 @@ def group_script_utterances_v3(
     return groups
 
 
-def check_tts_duration_budgets(segments: list, video_dur: float = 0.0) -> list[str]:
+def check_tts_duration_budgets(
+    segments: list,
+    video_dur: float = 0.0,
+    pacing_cfg: dict | None = None,
+    spk_map: dict | None = None,
+) -> list[str]:
     """
     Validate every v3 utterance group (both single-line utterances and continuous <=0.12s comma chains)
     against Stage 3's exact elastic window:
-      avail = min(next_group_start - 0.05, group_end + 1.20) - group_start
-    at cap 1.26x (1.30x for <=2-syllable interjections), without falsely charging inter-utterance
-    startup overhead or 50ms gaps to interior clauses of a valid continuous group.
+      avail = min(next_group_start - lead_gap, group_end + max_overhang) - group_start
+    at cap (max_tempo - 0.02) (or max_tempo_short - 0.02 for <=2-syllable interjections).
     """
     errors = []
     if not segments:
         return errors
 
-    groups = group_script_utterances_v3(segments)
+    cfg = pacing_cfg or {}
+    default_voice = str(cfg.get("voice") or "Trúc Ly")
+    lead_gap = float(cfg.get("lead_gap_s", 0.05))
+    max_overhang = float(cfg.get("max_overhang_s", 1.20))
+    cap_norm = max(1.05, float(cfg.get("max_tempo", 1.28)) - 0.02)
+    cap_short = max(cap_norm, float(cfg.get("max_tempo_short", 1.32)) - 0.02)
+
+    groups = group_script_utterances_v3(
+        segments,
+        max_gap_s=float(cfg.get("group_max_gap_s", 0.12)),
+        max_clauses=int(cfg.get("max_group_clauses", 3)),
+        max_span_s=float(cfg.get("max_group_span_s", 4.5)),
+        spk_map=spk_map,
+        default_voice=default_voice,
+    )
     for gi, g in enumerate(groups):
         g_st = float(segments[g[0]]["start"])
         g_et = float(segments[g[-1]]["end"])
-        nxt_g_st = (
-            float(segments[groups[gi + 1][0]]["start"])
-            if gi + 1 < len(groups)
-            else (video_dur if video_dur > g_st else g_et + 1.20)
-        )
-        avail = max(0.15, min(nxt_g_st - 0.05, g_et + 1.20) - g_st)
+        if gi + 1 < len(groups):
+            nxt_g_st = float(segments[groups[gi + 1][0]]["start"])
+            eff_ceil = min(nxt_g_st - lead_gap, g_et + max_overhang)
+        else:
+            nxt_g_st = video_dur if video_dur > g_st else (g_et + max_overhang)
+            eff_ceil = min(nxt_g_st, g_et + max_overhang)
+        avail = max(0.15, eff_ceil - g_st)
         joined_tts = " ".join((segments[i].get("tts_text") or "").strip() for i in g).strip()
         if not joined_tts:
             continue
         est_s = estimate_vieneu_tts_seconds(joined_tts)
         syls = count_tts_syllables(joined_tts)
-        cap = 1.30 if syls <= 2 else 1.26
+        cap = cap_short if syls <= 2 else cap_norm
         ratio = est_s / avail
         if ratio > cap:
             trim_need = max(1, int(np.ceil((est_s - cap * avail) / 0.185)))
@@ -177,6 +265,10 @@ def main():
     with open(asr_path, "r", encoding="utf-8") as f:
         raw_asr = json.load(f)
 
+    pacing_cfg, spk_map = _load_stage3_pacing_cfg(ws)
+    lead_gap = float(pacing_cfg.get("lead_gap_s", 0.05))
+    max_overhang = float(pacing_cfg.get("max_overhang_s", 1.20))
+
     max_syl_cap = 6.8
     mean_syl_cap = 5.6
 
@@ -212,16 +304,22 @@ def main():
             alphanum_errors.append(f"Seg #{sid}: Unwrapped mixed alphanumeric token outside <en>: {tts}")
 
         words = len(sub.split())
-        syl_rate = words / max(0.15, dur)
+        if idx + 1 < len(segments):
+            nxt_st = float(segments[idx + 1].get("start", et))
+            eff_dur = max(dur, min(nxt_st - lead_gap, et + max_overhang) - st)
+        else:
+            end_bound = video_dur if video_dur > st else (et + max_overhang)
+            eff_dur = max(dur, min(end_bound, et + max_overhang) - st)
+        syl_rate = words / max(0.15, eff_dur)
         syl_rates.append(syl_rate)
         char_lengths.append(len(sub))
 
         if len(sub) > 96:
             budget_errors.append(f"Seg #{sid}: sub_text length={len(sub)} chars (>96 max): {sub}")
         if syl_rate > max_syl_cap:
-            budget_errors.append(f"Seg #{sid}: syllable rate={syl_rate:.2f} syl/s (>{max_syl_cap} max): {sub}")
+            budget_errors.append(f"Seg #{sid}: syllable rate={syl_rate:.2f} syl/s (>{max_syl_cap} max over elastic {eff_dur:.2f}s): {sub}")
 
-    budget_errors.extend(check_tts_duration_budgets(segments, video_dur=video_dur))
+    budget_errors.extend(check_tts_duration_budgets(segments, video_dur=video_dur, pacing_cfg=pacing_cfg, spk_map=spk_map))
 
     first_asr_start = float(raw_asr[0]["start"]) if raw_asr else 0.0
     last_asr_end = float(raw_asr[-1]["end"]) if raw_asr else 0.0

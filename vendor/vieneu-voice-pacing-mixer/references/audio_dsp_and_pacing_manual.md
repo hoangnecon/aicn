@@ -16,11 +16,11 @@ This manual specifies the acoustic signal-processing rules, indivisible utteranc
 ### Preset Voice Selection
 | Voice Name | Gender / Timbre | Best Used For |
 | :--- | :--- | :--- |
-| `Trúc Ly` | Balanced default (`DEFAULTS["voice"]`) | General short-drama narration & default fallback |
-| `Hải Đăng` | Male, crisp, analytical, modern Northern cadence | Tech reviews, AI essays, tutorials, male leads |
-| `Bình` | Male, warm, steady narrative gravitas | Documentaries, male authority / narrator roles |
-| `Ngọc` | Female, clear, expressive natural warmth | Female drama leads, conversational explainers |
-| `Tuyên` | Male, authoritative news/commentary projection | News briefings, formal announcements |
+| `Trúc Ly` | Female, balanced natural warmth (`DEFAULTS["voice"]`) | Female drama leads, general narration & default fallback |
+| `Hải Đăng` | Male, crisp, analytical, modern Northern cadence | Male leads, tech reviews, AI essays, tutorials |
+| `Thanh Bình` | Male, warm, steady narrative gravitas | Documentaries, male authority / narrator roles |
+| `Ngọc Huyền` | Female, clear, expressive natural cadence | Female supporting leads, conversational explainers |
+| `Phạm Tuyên` | Male, authoritative commentary projection | News briefings, formal announcements |
 
 ---
 

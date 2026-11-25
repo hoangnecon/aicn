@@ -126,6 +126,16 @@ def write_gate_token(
             }
 
     status = "PASS" if (all_passed and score == 100.0) else "FAIL"
+    upstream_sig = None
+    if stage > 0:
+        prev_gf = gate_path(workspace, stage - 1)
+        if os.path.exists(prev_gf):
+            try:
+                with open(prev_gf, "r", encoding="utf-8") as pf:
+                    upstream_sig = json.load(pf).get("signature")
+            except Exception:
+                upstream_sig = None
+
     payload = {
         "schema_version": "3.0",
         "stage": stage,
@@ -138,6 +148,8 @@ def write_gate_token(
         "checks": checks_out,
         "artifacts": artifacts_hashed,
     }
+    if upstream_sig:
+        payload["upstream_signature"] = upstream_sig
     # Compute integrity signature over the relocation-safe gate payload
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     payload["signature"] = hashlib.sha256(canonical).hexdigest()
@@ -160,17 +172,12 @@ def write_gate_token(
     return payload
 
 
-def require_gate(workspace: str, required_stage: int, verify_hashes: bool = True) -> Dict[str, Any]:
-    """
-    Enforce that `stage_{required_stage}_gate.json` exists, has status == 'PASS' and score == 100.0,
-    and that all hashed artifacts remain unmodified on disk.
-    """
-    workspace = os.path.abspath(workspace)
-    gfile = gate_path(workspace, required_stage)
+def _verify_single_gate(workspace: str, stage_num: int, verify_hashes: bool = True) -> tuple[Dict[str, Any], str]:
+    gfile = gate_path(workspace, stage_num)
     if not os.path.exists(gfile):
         print(
-            f"[CI/CD GATE BLOCKED] Cannot proceed: Stage {required_stage} gate token is missing ({gfile}).\n"
-            f"You MUST run Stage {required_stage} verification and pass 100/100 before running this step.",
+            f"[CI/CD GATE BLOCKED] Cannot proceed: Stage {stage_num} gate token is missing ({gfile}).\n"
+            f"You MUST run Stage {stage_num} verification and pass 100/100 before running this step.",
             file=sys.stderr,
             flush=True,
         )
@@ -184,7 +191,7 @@ def require_gate(workspace: str, required_stage: int, verify_hashes: bool = True
     expected_sig = hashlib.sha256(canonical).hexdigest()
     if sig != expected_sig:
         print(
-            f"[CI/CD GATE BLOCKED] Stage {required_stage} gate token signature mismatch! Manual tampering detected in {gfile}.",
+            f"[CI/CD GATE BLOCKED] Stage {stage_num} gate token signature mismatch! Manual tampering detected in {gfile}.",
             file=sys.stderr,
             flush=True,
         )
@@ -192,7 +199,7 @@ def require_gate(workspace: str, required_stage: int, verify_hashes: bool = True
 
     if data.get("status") != "PASS" or float(data.get("score", 0)) < 100.0:
         print(
-            f"[CI/CD GATE BLOCKED] Stage {required_stage} gate status is {data.get('status')} ({data.get('score')}/100).",
+            f"[CI/CD GATE BLOCKED] Stage {stage_num} gate status is {data.get('status')} ({data.get('score')}/100).",
             file=sys.stderr,
             flush=True,
         )
@@ -203,7 +210,7 @@ def require_gate(workspace: str, required_stage: int, verify_hashes: bool = True
             p = rel_path if os.path.isabs(rel_path) else os.path.join(workspace, rel_path)
             if not os.path.exists(p):
                 print(
-                    f"[CI/CD GATE BLOCKED] Stage {required_stage} verified artifact was deleted: {p}",
+                    f"[CI/CD GATE BLOCKED] Stage {stage_num} verified artifact was deleted: {p}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -211,15 +218,42 @@ def require_gate(workspace: str, required_stage: int, verify_hashes: bool = True
             cur_hash = sha256_file(p)
             if cur_hash != meta.get("sha256"):
                 print(
-                    f"[CI/CD GATE BLOCKED] Artifact '{rel_path}' was modified after Stage {required_stage} gate was signed!\n"
-                    f"Re-run Stage {required_stage} validator to re-verify and update the gate token.",
+                    f"[CI/CD GATE BLOCKED] Artifact '{rel_path}' was modified after Stage {stage_num} gate was signed!\n"
+                    f"Re-run Stage {stage_num} validator to re-verify and update the gate token.",
                     file=sys.stderr,
                     flush=True,
                 )
                 sys.exit(GATE_EXIT_CODE)
+    return data, sig
 
-    print(f"[CI/CD GATE OK] Verified Stage {required_stage} ({data.get('stage_name')}) token & artifact SHA-256 hashes.", flush=True)
-    return data
+
+def require_gate(workspace: str, required_stage: int, verify_hashes: bool = True) -> Dict[str, Any]:
+    """
+    Enforce that `stage_{required_stage}_gate.json` exists, has status == 'PASS' and score == 100.0,
+    that all hashed artifacts remain unmodified on disk, and that no upstream gate in its
+    `upstream_signature` chain was re-signed or modified after downstream stages were signed.
+    """
+    workspace = os.path.abspath(workspace)
+    top_data, _ = _verify_single_gate(workspace, required_stage, verify_hashes=verify_hashes)
+
+    cur_stage = required_stage
+    cur_data = top_data
+    while cur_stage > 0 and cur_data.get("upstream_signature"):
+        expected_up_sig = cur_data["upstream_signature"]
+        prev_data, prev_sig = _verify_single_gate(workspace, cur_stage - 1, verify_hashes=verify_hashes)
+        if prev_sig != expected_up_sig:
+            print(
+                f"[CI/CD GATE BLOCKED] Stage {cur_stage} gate is stale: upstream Stage {cur_stage - 1} was re-signed after Stage {cur_stage}!\n"
+                f"Re-run Stage {cur_stage} (and downstream stages) so outputs match the updated Stage {cur_stage - 1} artifacts.",
+                file=sys.stderr,
+                flush=True,
+            )
+            sys.exit(GATE_EXIT_CODE)
+        cur_stage -= 1
+        cur_data = prev_data
+
+    print(f"[CI/CD GATE OK] Verified Stage {required_stage} ({top_data.get('stage_name')}) token & artifact SHA-256 hashes.", flush=True)
+    return top_data
 
 
 def main():

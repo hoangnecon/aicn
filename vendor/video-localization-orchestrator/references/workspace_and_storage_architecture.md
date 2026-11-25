@@ -38,8 +38,8 @@ workspace/<series-slug>/
 ├── 00_series_manifest.md
 ├── config/
 │   ├── rights.json
-│   ├── series_bible.json        # MASTER Character Roster, Pronoun Matrix & Glossary
-│   └── series_config.json       # mode: "voice_dub", genre, source_lang
+│   ├── series_bible.json        # MASTER Character Roster, Pronoun Matrix, Glossary & source_language
+│   └── series_config.json       # localization_mode: "voice_dub", genre, title_vi, title_zh
 ├── posters/
 │   ├── cover.jpg
 │   ├── official_poster_<slug>_zh.jpg

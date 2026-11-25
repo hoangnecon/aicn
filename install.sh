@@ -34,6 +34,17 @@ copy_clean_tree() {
 
 sync_skill() {
   local src="$1" dst="$2"
+  local src_real dst_real=""
+  src_real="$(cd "$src" && pwd -P)"
+  if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+    dst_real="$(cd "$dst" && pwd -P)"
+  elif [ -d "$(dirname "$dst")" ]; then
+    dst_real="$(cd "$(dirname "$dst")" && pwd -P)/$(basename "$dst")"
+  fi
+  if [ "$src_real" = "$dst_real" ]; then
+    echo "self   $dst"
+    return
+  fi
   if [ "$MODE" = "sync" ]; then
     if [ -L "$dst" ]; then
       rm -f "$dst"

@@ -37,11 +37,11 @@ Created by `aicn.py init-series --series-slug <slug> --title-vi "<Tên Tiếng V
 workspace/<series-slug>/
 ├── CHANGELOG.md                          # Append-only hub event log (templates/CHANGELOG.md)
 ├── PROGRESS.md                           # Hub progress & full-release status (templates/PROGRESS.md)
-├── 00_series_manifest.md                 # Episode-to-batch registry (updated by init_workspace.py)
+├── 00_series_manifest.md                 # Episode-to-batch registry (created on init, synced by update-series)
 ├── config/
 │   ├── rights.json                       # License basis & proof (required != "unknown")
-│   ├── series_bible.json                 # Shared character roster, pronoun matrix (xưng hô), glossary, voices
-│   └── series_config.json                # mode: "voice_dub", genre, source_lang
+│   ├── series_bible.json                 # Shared character roster, pronoun matrix (xưng hô), glossary, voices, source_language
+│   └── series_config.json                # localization_mode: "voice_dub", genre, title_vi, title_zh
 ├── source_inbox/
 │   ├── raw/                              # Raw downloads (ep01.mp4..epNN.mp4), immutable
 │   └── batch_01_ep01_10/ ...             # 10-ep hardlinked input batches (ep01.mp4..ep10.mp4)

@@ -117,8 +117,9 @@ def main():
             f_abs = os.path.join(ws, item["rel_path"])
             if not os.path.exists(f_abs) or sha256_file(f_abs) != item.get("sha256"):
                 missing_jpgs.append(item["filename"])
-        cv_ok = len(frames_list) >= 10 and len(missing_jpgs) == 0
-        cv_detail = f"frames={len(frames_list)} (need >=10), missing_or_corrupt_jpgs={missing_jpgs}"
+        min_req_frames = 10 if vid_dur >= 4.0 else 1
+        cv_ok = len(frames_list) >= min_req_frames and len(missing_jpgs) == 0
+        cv_detail = f"frames={len(frames_list)} (need >={min_req_frames}), missing_or_corrupt_jpgs={missing_jpgs}"
 
     # Check 4: Agent Visual Inspection Report (04_qa_review_report.md)
     report_ok = False
@@ -204,7 +205,7 @@ def main():
 
     metrics = {
         "qa_frames_verified": len(frames_list),
-        "final_mp4_path": final_mp4 if promoted_ok else None,
+        "final_mp4_path": f"media/final_{slug}_vi.mp4" if promoted_ok else None,
         "final_mp4_size_bytes": os.path.getsize(final_mp4) if promoted_ok else 0,
     }
 

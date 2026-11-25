@@ -139,7 +139,7 @@ def cicd():
     cands = [os.environ.get("AICN_CICD_DIR", ""),
              os.path.join(SKILL_DIR, "vendor", "video-localization-orchestrator", "scripts"),
              os.path.expanduser("~/.gemini/config/skills/video-localization-orchestrator/scripts"),
-             os.path.join(os.getcwd(), ".agents/skills/video-localization-orchestrator/scripts")]
+             os.path.expanduser("~/.claude/skills/video-localization-orchestrator/scripts")]
     for c in cands:
         if c and os.path.exists(os.path.join(c, "cicd_gate.py")):
             if c not in sys.path:
@@ -176,15 +176,38 @@ def resolve_unit_hub(ws, cfg=None):
 
 def gate_status(ws):
     out = []
+    prev_sig = None
+    upstream_dirty = False
     for n in range(6):
         g = jload(os.path.join(ws, ".cicd", f"stage_{n}_gate.json"))
         if not g:
             out.append("-")
-        elif g.get("status") != "PASS":
+            prev_sig = None
+            continue
+        cur_sig = g.get("signature")
+        if g.get("status") != "PASS" or float(g.get("score", 0)) < 100.0:
             out.append("F")
-        else:   # 'x' = signed PASS but a hashed artifact is gone (e.g. media deleted): gate no longer holds
-            gone = any(not os.path.exists(k if os.path.isabs(k) else os.path.join(ws, k)) for k in g.get("artifacts", {}))
-            out.append("x" if gone else "P")
+            prev_sig = cur_sig
+            upstream_dirty = True
+            continue
+        up_sig = g.get("upstream_signature")
+        chain_broken = upstream_dirty or (n > 0 and bool(up_sig) and up_sig != prev_sig)
+        missing_art = False
+        modified_art = False
+        for k, meta in (g.get("artifacts") or {}).items():
+            p = k if os.path.isabs(k) else os.path.join(ws, k)
+            if not os.path.exists(p):
+                missing_art = True
+            elif isinstance(meta, dict) and meta.get("sha256") and ap.content_sha256(p) != meta.get("sha256"):
+                modified_art = True
+        if chain_broken or modified_art:
+            out.append("x")
+            upstream_dirty = True
+        elif missing_art:
+            out.append("x")
+        else:
+            out.append("P")
+        prev_sig = cur_sig
     return "".join(out)
 
 
@@ -630,7 +653,7 @@ def resolve_fps(ws, prof):
     return 30
 
 
-def build_cached_watermark_strip(wm, width, height):
+def build_cached_watermark_strip(wm, width, height, hint_path=None):
     """Pre-composite dual-corner branding ONCE into a tight top-band RGBA PNG cached globally by content hash."""
     from PIL import Image
 
@@ -639,7 +662,7 @@ def build_cached_watermark_strip(wm, width, height):
     pos = [int(wm["tl_x"]), int(wm["tl_y"]), int(wm["tr_mx"]), int(wm["tr_y"])]
     sc = float(wm.get("scale", 1.0))
     wm_key = ap.wm_overlay_key(width, height, tl_sha, tr_sha, sc, pos)
-    overlay_png = ap.global_cache_path("wm_overlay", wm_key, ".png")
+    overlay_png = ap.global_cache_path("wm_overlay", wm_key, ".png", hint_path=hint_path)
     if os.path.exists(overlay_png):
         return overlay_png, wm_key
 
@@ -711,12 +734,11 @@ def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
             vs = next((s for s in ffprobe_streams(src_mp4) if s.get("codec_type") == "video"), {})
             W = int(vs.get("width") or 1920)
             H = int(vs.get("height") or 1080)
-        overlay_png, _ = build_cached_watermark_strip(wm, W, H)
+        overlay_png, _ = build_cached_watermark_strip(wm, W, H, hint_path=ws)
         filters = ap.probe_ffmpeg_filters(ff_bin)
         use_cuda_overlay = (
             enc.get("backend") == "nvenc"
             and filters.get("overlay_cuda")
-            and filters.get("scale_cuda")
             and filters.get("hwupload_cuda")
             and os.environ.get("AICN_NO_CUDA_OVERLAY") != "1"
         )
@@ -749,18 +771,26 @@ def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
             c += ["-g", str(int(round(fps * 2))), "-fps_mode", "passthrough", "-sn", "-movflags", "+faststart", part_out]
             return c
 
-        if use_cuda_overlay:
-            try:
-                subprocess.run(_build_wm_cmd(True), check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError:
-                if os.path.exists(part_out):
-                    try:
-                        os.remove(part_out)
-                    except OSError:
-                        pass
+        try:
+            if use_cuda_overlay:
+                try:
+                    subprocess.run(_build_wm_cmd(True), check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError:
+                    if os.path.exists(part_out):
+                        try:
+                            os.remove(part_out)
+                        except OSError:
+                            pass
+                    subprocess.run(_build_wm_cmd(False), check=True)
+            else:
                 subprocess.run(_build_wm_cmd(False), check=True)
-        else:
-            subprocess.run(_build_wm_cmd(False), check=True)
+            os.replace(part_out, out)
+        finally:
+            if os.path.exists(part_out):
+                try:
+                    os.remove(part_out)
+                except OSError:
+                    pass
     else:
         cmd = [ff_bin, "-v", "error", "-y", "-i", src_mp4]
         if has_audio:
@@ -768,9 +798,15 @@ def render_ffmpeg(ws, prof, audio, out, enc=None, wm=None):
         else:
             cmd += ["-map", "0:v:0", "-an"]
         cmd += ["-c:v", "copy", "-sn", "-shortest", "-movflags", "+faststart", part_out]
-        subprocess.run(cmd, check=True)
-
-    os.replace(part_out, out)
+        try:
+            subprocess.run(cmd, check=True)
+            os.replace(part_out, out)
+        finally:
+            if os.path.exists(part_out):
+                try:
+                    os.remove(part_out)
+                except OSError:
+                    pass
 
 
 def cmd_render(a):
@@ -807,7 +843,7 @@ def cmd_render(a):
     print(f"[render] ffmpeg {time.time() - t0:.1f}s -> {out} ({sz_mb:.1f} MB)")
     state["render"] = {"engine": "ffmpeg", "key": key, "parts": {k: h_obj(v) for k, v in parts.items()},
                        "enc": enc if wm else {"vcodec": "copy"}, "wm": bool(wm), "renderer": FF_RENDERER_VERSION}
-    state["last_render"] = {"at": now(), "rendered": 1, "reused": 0, "output": out,
+    state["last_render"] = {"at": now(), "rendered": 1, "reused": 0, "output": "media/.staging_render.mp4",
                             "seconds": round(time.time() - t0, 1), "size_mb": round(sz_mb, 1)}
     jdump(os.path.join(ws, ".cache", "build_state.json"), state)
 
@@ -1177,23 +1213,32 @@ def cmd_run_series(a):
             check=False,
         )
 
+    def _render_is_dirty(u):
+        p_args = argparse.Namespace(unit=u, codec=a.codec, quality=a.quality, brand_dir=a.brand_dir)
+        return bool(cmd_plan(p_args, quiet=True))
+
     if a.dry_run:
         render_todo = list(todo)
     else:
         render_todo = [
             u for u in todo
             if gate_status(u)[3] == "P"
-            and (gate_status(u)[4] != "P" or not os.path.exists(os.path.join(u, "data", "04_qa_frames_manifest.json")))
+            and (
+                gate_status(u)[4] != "P"
+                or _render_is_dirty(u)
+                or not os.path.exists(os.path.join(u, "data", "04_qa_frames_manifest.json"))
+            )
         ]
 
     def _produce_render(u):
         bn = os.path.basename(u)
         gs = gate_status(u)
-        if a.dry_run or gs[4] != "P":
+        need_render = a.dry_run or gs[4] != "P" or _render_is_dirty(u)
+        if need_render:
             _run(f"{bn}:render[{vid_tag}]", [py, aicn_py, "render", "--unit", u, *render_flags])
             _run(f"{bn}:verify-render", [py, aicn_py, "verify-render", "--unit", u])
         qa_man = os.path.join(u, "data", "04_qa_frames_manifest.json")
-        if a.dry_run or not os.path.exists(qa_man):
+        if need_render or not os.path.exists(qa_man):
             src = os.path.join(u, "source", "master_source.mp4")
             stg = os.path.join(u, "media", ".staging_render.mp4")
             ts = _qa_timestamps_for(u)

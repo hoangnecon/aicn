@@ -343,7 +343,7 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
                         "name_zh": "女主",
                         "name_vi": "Nữ chính",
                         "role": "Lead Female",
-                        "voice_id": "Ngọc",
+                        "voice_id": "Trúc Ly",
                         "default_self_pronoun": "tôi",
                         "notes": "Xưng hô nhất quán theo ngữ cảnh quan hệ"
                     }

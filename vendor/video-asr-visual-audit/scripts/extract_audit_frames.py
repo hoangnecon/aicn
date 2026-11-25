@@ -115,9 +115,18 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ts_list = select_smart_timestamps(ws, args.timestamps)
 
-    def _extract_one(ts):
+    seen_names: set[str] = set()
+    tasks: list[tuple[float, str]] = []
+    for idx, ts in enumerate(ts_list):
         ts_int = int(round(ts))
         fname = f"frame_{ts_int:04d}s.jpg"
+        if fname in seen_names:
+            fname = f"frame_{idx:02d}_{ts_int:04d}s.jpg"
+        seen_names.add(fname)
+        tasks.append((ts, fname))
+
+    def _extract_one(item: tuple[float, str]):
+        ts, fname = item
         out_jpg = os.path.join(out_dir, fname)
         cmd = [
             ap.find_tool("ffmpeg") if ap else "ffmpeg", "-y",
@@ -138,8 +147,8 @@ def main():
             "sha256": sha256_file(out_jpg),
         }
 
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(ts_list)))) as ex:
-        manifest_items = list(ex.map(_extract_one, ts_list))
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(tasks)))) as ex:
+        manifest_items = list(ex.map(_extract_one, tasks))
 
     manifest_path = os.path.join(ws, "data", "01_extracted_audit_manifest.json")
     payload = {"num_frames": len(manifest_items), "frames": manifest_items}

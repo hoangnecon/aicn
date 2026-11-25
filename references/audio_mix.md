@@ -56,7 +56,7 @@ Splitting a synthesized multi-clause WAV back into individual clauses caused mid
 | Check (`03_mix_report.json`) | Pass Rule |
 |---|---|
 | `loudness` | Integrated `-14.0 ± 1.0 LUFS`, true peak `<= -0.8 dBFS` |
-| `stems_match_source` | Demucs stems sum matches current `master_source.mp4` energy |
+| `stems_match_source` | `media/stems/stems.json` key matches current `ap.stems_key(src_sha, demucs_model, STEMS_VERSION)` |
 | `dub_intelligible` | Active-speech frames `dub_snr_speech_db_median >= 10.0 dB` AND `dub_snr_speech_db_p10 >= 4.0 dB` |
 | `original_never_muted` | Deepest attenuation stays within `6.0 dB` of `floor_vocal_db` (`-24.0`) and `floor_bgm_db` (`-9.0`) |
 | `original_present` | Non-dubbed passages preserve original energy (`>= -6.0 dB` vs source) |

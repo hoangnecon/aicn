@@ -41,7 +41,7 @@ All scripts import their cache key builders from `scripts/aicn_platform.py` (no 
 
 | Edit Type | What Invalidates | Work Re-Run |
 |---|---|---|
-| **Fix `.srt` display text (`sub_text` only)** | Stage 2 gate, SRT export | `validate_bilingual_script.py` → `aicn_audio.py verify` (or re-export SRT) → `merge-series` (**0 TTS, 0 mix, 0 video render**) |
+| **Fix `.srt` display text (`sub_text` only)** | Stage 2 gate, SRT export | `validate_bilingual_script.py` → `aicn_audio.py dub` (100% cache hit) + `aicn_audio.py verify` → `merge-series` (**0 TTS, 0 mix, 0 video render**) |
 | **Edit 1 dubbed line (`tts_text`)** | 1 utterance (`tts_sent` + `rb_stretch`) + unit mix/master/render | 1 VieNeu inference (all unchanged utterances hit `tts_sent` + `rb_stretch` cache) → `<12s` single-STFT `mix` → `~4s` `master` → 1 fast hardware `render` → QA → `merge-series` |
 | **Tune `config/audio_mix.json` mix/EQ/master** | `mix` + `master` + `render` | **0 TTS / 0 rubberband** → `<12s` `mix` → `~4s` `master` → 1 fast hardware `render` → QA → `merge-series` |
 | **Change watermark (`--brand-dir`) or `--codec`** | `wm_overlay` (once globally) + `render` | **0 Stage 1–3 work** → 1 fast hardware `render` (or instant `-c:v copy` if watermark removed) → QA |

@@ -189,26 +189,39 @@ def load_whisper(size):
 
 
 def resolve_source_language(workspace: str, cli_lang: str | None = None) -> str:
-    """Resolve source audio language from CLI flag, project_config.json, or series_bible.json."""
+    """Resolve source audio language from CLI flag, project_config.json, unit series_bible.json, or hub series_bible.json."""
     if cli_lang:
         return cli_lang
+    cfg = {}
     cfg_p = os.path.join(workspace, "config", "project_config.json")
     if os.path.exists(cfg_p):
         with open(cfg_p, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+            cfg = json.load(f) or {}
         if cfg.get("source_language"):
             return str(cfg["source_language"])
-        hub = cfg.get("series_hub_dir") or ""
-        if not (hub and os.path.isdir(hub)):
-            cand_hub = os.path.dirname(os.path.dirname(os.path.abspath(workspace)))
-            if os.path.basename(os.path.dirname(os.path.abspath(workspace))) == "units":
-                hub = cand_hub
-        bible_p = os.path.join(hub, "config", "series_bible.json") if hub else ""
-        if bible_p and os.path.exists(bible_p):
-            with open(bible_p, "r", encoding="utf-8") as bf:
-                bible = json.load(bf)
-            if bible.get("source_language"):
-                return str(bible["source_language"])
+    unit_bible_p = os.path.join(workspace, "config", "series_bible.json")
+    if os.path.exists(unit_bible_p):
+        with open(unit_bible_p, "r", encoding="utf-8") as bf:
+            ub = json.load(bf) or {}
+        if ub.get("source_language"):
+            return str(ub["source_language"])
+    hub = ""
+    if cfg.get("series_hub_rel"):
+        cand_rel = os.path.abspath(os.path.join(workspace, str(cfg["series_hub_rel"])))
+        if os.path.isdir(cand_rel):
+            hub = cand_rel
+    if not hub and cfg.get("series_hub_dir") and os.path.isdir(str(cfg["series_hub_dir"])):
+        hub = str(cfg["series_hub_dir"])
+    if not hub:
+        cand_hub = os.path.dirname(os.path.dirname(os.path.abspath(workspace)))
+        if os.path.basename(os.path.dirname(os.path.abspath(workspace))) == "units" and os.path.isdir(cand_hub):
+            hub = cand_hub
+    bible_p = os.path.join(hub, "config", "series_bible.json") if hub else ""
+    if bible_p and os.path.exists(bible_p):
+        with open(bible_p, "r", encoding="utf-8") as bf:
+            bible = json.load(bf) or {}
+        if bible.get("source_language"):
+            return str(bible["source_language"])
     return "zh"
 
 

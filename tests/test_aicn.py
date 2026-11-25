@@ -729,6 +729,91 @@ class CLI(unittest.TestCase):
             with Image.open(res16["branded"]) as b16:
                 self.assertEqual(b16.size, (1920, 1080))
 
+    def test_chained_cicd_gates_invalidate_downstream_on_edit_and_preserve_deep_clean(self):
+        cg = aicn.cicd()
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"AICN_CACHE_DIR": os.path.join(td, "gcache")}):
+            ws = os.path.join(td, "unit_chain")
+            for sub in ("data", "media", ".cicd"):
+                os.makedirs(os.path.join(ws, sub), exist_ok=True)
+            arts = [
+                "data/a0.json",
+                "data/a1.json",
+                "data/02_bilingual_script.json",
+                "media/master_audio_48k.wav",
+                "media/.staging_render.mp4",
+                "media/final_unit_chain_vi.mp4",
+            ]
+            for idx, rel in enumerate(arts):
+                with open(os.path.join(ws, rel), "wb") as f:
+                    f.write(f"stage-{idx}-v1".encode("utf-8"))
+                cg.write_gate_token(
+                    ws, idx, f"Stage {idx}",
+                    [{"id": "ok", "weight": 100, "passed": True, "detail": "ok"}],
+                    {}, [rel],
+                )
+
+            self.assertEqual(aicn.gate_status(ws), "PPPPPP")
+            cg.require_gate(ws, 5)
+
+            # 1) Editing Stage 2 script in-place invalidates Stages 2..5 in gate_status AND blocks require_gate(4)
+            with open(os.path.join(ws, "data/02_bilingual_script.json"), "wb") as f:
+                f.write(b"stage-2-v2-edited")
+            self.assertEqual(aicn.gate_status(ws), "PPxxxx")
+            with self.assertRaises(SystemExit) as cm1:
+                cg.require_gate(ws, 4)
+            self.assertEqual(cm1.exception.code, 2)
+
+            # 2) Re-signing Stage 2 alone leaves Stages 3..5 stale via upstream_signature mismatch
+            cg.write_gate_token(
+                ws, 2, "Stage 2",
+                [{"id": "ok", "weight": 100, "passed": True, "detail": "ok"}],
+                {}, ["data/02_bilingual_script.json"],
+            )
+            self.assertEqual(aicn.gate_status(ws), "PPPxxx")
+            with self.assertRaises(SystemExit) as cm2:
+                cg.require_gate(ws, 4)
+            self.assertEqual(cm2.exception.code, 2)
+
+            # 3) Re-signing Stages 3, 4, 5 restores PPPPPP; deep-clean deleting Stage 3/4 media keeps Stage 5 P
+            for idx in (3, 4, 5):
+                cg.write_gate_token(
+                    ws, idx, f"Stage {idx}",
+                    [{"id": "ok", "weight": 100, "passed": True, "detail": "ok"}],
+                    {}, [arts[idx]],
+                )
+            self.assertEqual(aicn.gate_status(ws), "PPPPPP")
+            os.remove(os.path.join(ws, "media/master_audio_48k.wav"))
+            os.remove(os.path.join(ws, "media/.staging_render.mp4"))
+            self.assertEqual(aicn.gate_status(ws), "PPPxxP")
+
+    def test_install_sh_self_guard_and_extract_audit_frames_collision_safety(self):
+        sh_txt = open(os.path.join(ROOT, "install.sh"), encoding="utf-8").read()
+        self.assertIn('if [ "$src_real" = "$dst_real" ]; then', sh_txt)
+        self.assertLess(sh_txt.index('if [ "$src_real" = "$dst_real" ]; then'), sh_txt.index('copy_clean_tree "$src" "$dst"'))
+
+        cg = aicn.cicd()
+        ext_py = os.path.join(ROOT, "vendor", "video-asr-visual-audit", "scripts", "extract_audit_frames.py")
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"AICN_CACHE_DIR": os.path.join(td, "gcache")}):
+            ws = os.path.join(td, "u_frames")
+            for sub in ("source", "data", ".cicd"):
+                os.makedirs(os.path.join(ws, sub), exist_ok=True)
+            vid = os.path.join(ws, "source", "master_source.mp4")
+            subprocess.run([
+                aicn.ap.find_tool("ffmpeg"), "-v", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=s=160x120:d=3.0:r=25",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", vid,
+            ], check=True)
+            aicn.jdump(os.path.join(ws, "data", "00_video_profile.json"), {"duration": 3.0, "source_video": "source/master_source.mp4"})
+            cg.write_gate_token(ws, 0, "Stage 0", [{"id": "ok", "weight": 100, "passed": True, "detail": "ok"}], {}, ["data/00_video_profile.json"])
+            subprocess.run([sys.executable, ext_py, "--workspace", ws, "--timestamps", "0.6,1.1,1.4"], check=True)
+            man = aicn.jload(os.path.join(ws, "data", "01_extracted_audit_manifest.json"))
+            self.assertEqual(man["num_frames"], 3)
+            fnames = [it["filename"] for it in man["frames"]]
+            self.assertEqual(len(set(fnames)), 3, f"Colliding filenames generated: {fnames}")
+            for it in man["frames"]:
+                fp = os.path.join(ws, it["rel_path"])
+                self.assertEqual(aicn.ap.content_sha256(fp), it["sha256"])
+
 
 if __name__ == "__main__":
     unittest.main()

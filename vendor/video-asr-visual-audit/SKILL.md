@@ -37,7 +37,7 @@ Separates the source audio using `htdemucs` (`torch-cuda` under `ap.gpu_slot("de
 
 ### 3. Strictly Monotonic Acoustic Alignment (`analyze_voice_waveform.py --snap-and-split`, `wf-4.0`)
 - Pure acoustic alignment on `vocals.wav` + `300–3400 Hz` bandpass energy (zero visual bbox or spectral-toy clutter).
-- Splits compound segments containing `>= 0.40s` internal silent gaps and clamps `[start, end]` to active acoustic voice onset/offset (`premature_lead_segments == 0`, `bloated_segments == 0`).
+- Clamps `[start, end]` to active acoustic voice onset/offset (`premature_lead_segments == 0`, `bloated_segments == 0`) and deduplicates adjacent boundary echoes.
 - Cleanly absorbs `< 0.25s` micro-fragments/stutter echoes within `0.20s` and drops `< 0.15s` stubs.
 - **Strict Post-Alignment Monotonic Invariant:** Guarantees across ALL segments:
   `0.0 <= start[i] < end[i] <= start[i+1] - 0.02` AND `(end[i] - start[i]) >= 0.15`.

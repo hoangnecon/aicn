@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -801,6 +802,133 @@ class WarmBatchAndStage3Gates(unittest.TestCase, _TempEnvMixin):
             with ThreadPoolExecutor(max_workers=6) as ex:
                 list(ex.map(lambda _: self.m._write_wav16(target, wav, self.sr), range(12)))
             self.assertTrue(os.path.isfile(target))
+
+    def test_cmd_mix_headroom_no_clip_on_loud_source_and_quiet_vocal_floor(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            self._enter_cache_env(td)
+            try:
+                # 1) Very loud hot source (-8 LUFS vocal + high-crest dub) must never clip 0 dBFS in premaster_48k.wav
+                d_loud = os.path.join(td, "loud")
+                for sub in ("data", "config", "media/stems", "media/audio"):
+                    os.makedirs(os.path.join(d_loud, sub), exist_ok=True)
+                t = np.arange(self.sr * 2) / self.sr
+                voc_loud = (0.75 * np.sin(2 * np.pi * 900 * t)).astype(np.float32)
+                acc_loud = (0.35 * np.sin(2 * np.pi * 240 * t)).astype(np.float32)
+                dub = np.zeros(self.sr * 2, dtype=np.float32)
+                dub[int(0.3 * self.sr): int(1.5 * self.sr)] = 0.08 * np.sin(2 * np.pi * 1100 * t[: int(1.2 * self.sr)])
+                dub[self.sr] = 0.65  # sharp crest transient
+                soundfile.write(os.path.join(d_loud, "media/stems/vocals.wav"), np.stack([voc_loud, voc_loud], axis=1), self.sr)
+                soundfile.write(os.path.join(d_loud, "media/stems/accomp.wav"), np.stack([acc_loud, acc_loud], axis=1), self.sr)
+                soundfile.write(os.path.join(d_loud, "media/audio/dub_voice_48k.wav"), dub, self.sr)
+                self.ap.atomic_write_json(os.path.join(d_loud, "data/00_video_profile.json"), {"duration": 2.0, "localization_mode": "voice_dub"})
+                self.m.cmd_mix(d_loud, self.m.cfg(d_loud))
+                pm_loud, _ = soundfile.read(os.path.join(d_loud, "media/audio/premaster_48k.wav"), dtype="float32")
+                self.assertLessEqual(float(np.max(np.abs(pm_loud))), 0.96)
+
+                # 2) Near-silent vocal stem (-70 LUFS) must NOT mute dub by -48 dB
+                d_quiet = os.path.join(td, "quiet")
+                for sub in ("data", "config", "media/stems", "media/audio"):
+                    os.makedirs(os.path.join(d_quiet, sub), exist_ok=True)
+                voc_quiet = np.zeros((self.sr * 2, 2), dtype=np.float32)
+                acc_quiet = (0.04 * np.sin(2 * np.pi * 240 * t))[:, None].repeat(2, axis=1).astype(np.float32)
+                dub_q = np.zeros(self.sr * 2, dtype=np.float32)
+                dub_q[int(0.3 * self.sr): int(1.5 * self.sr)] = 0.22 * np.sin(2 * np.pi * 1100 * t[: int(1.2 * self.sr)])
+                soundfile.write(os.path.join(d_quiet, "media/stems/vocals.wav"), voc_quiet, self.sr)
+                soundfile.write(os.path.join(d_quiet, "media/stems/accomp.wav"), acc_quiet, self.sr)
+                soundfile.write(os.path.join(d_quiet, "media/audio/dub_voice_48k.wav"), dub_q, self.sr)
+                self.ap.atomic_write_json(os.path.join(d_quiet, "data/00_video_profile.json"), {"duration": 2.0, "localization_mode": "voice_dub"})
+                self.m.cmd_mix(d_quiet, self.m.cfg(d_quiet))
+                st_q = json.load(open(os.path.join(d_quiet, "data/03_mix_stats.json"), encoding="utf-8"))
+                self.assertGreaterEqual(st_q["dub_gain_db"], -12.0)
+                self.assertGreaterEqual(st_q["dub_snr_speech_db_median"], 10.0)
+            finally:
+                self._exit_cache_env()
+
+    def test_series_bible_speaker_voice_mapping_and_allow_overflow_no_cache_poison(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            self._enter_cache_env(td)
+            try:
+                ws = os.path.join(td, "u_spk")
+                for sub in ("data", "config", "media/audio", "media/tts_segments"):
+                    os.makedirs(os.path.join(ws, sub), exist_ok=True)
+                self.ap.atomic_write_json(os.path.join(ws, "data/00_video_profile.json"), {"duration": 3.0, "localization_mode": "voice_dub"})
+                self.ap.atomic_write_json(os.path.join(ws, "config/series_bible.json"), {
+                    "characters": [
+                        {"speaker_id": "M1", "voice_id": "Hải Đăng"},
+                        {"speaker_id": "F_OLD", "voice_id": "Ngọc"},  # invalid legacy name -> safely ignored
+                    ],
+                    "voices": {"F2": "Ngọc Huyền"},
+                })
+                segs = [
+                    {"id": 0, "start": 0.1, "end": 0.4, "speaker": "M1", "zh_text": "太长了。", "sub_text": "Câu này dài.", "tts_text": "Câu này quá dài luôn."},
+                    {"id": 1, "start": 0.5, "end": 1.2, "speaker": "F_OLD", "zh_text": "好。", "sub_text": "Ừ.", "tts_text": "Ừ."},
+                ]
+                self.ap.atomic_write_json(os.path.join(ws, "data/02_bilingual_script.json"), segs)
+                c = self.m.cfg(ws)
+                spk_map, dv = self.m.resolve_speaker_voices(ws, c)
+                self.assertEqual(spk_map.get("M1"), "Hải Đăng")
+                self.assertEqual(spk_map.get("F2"), "Ngọc Huyền")
+                if self.m._known_vieneu_voices():
+                    self.assertNotIn("F_OLD", spk_map)
+                pl = self.m._plan_unit_dub(ws, c)
+                self.assertEqual(pl["items"][0][3], "Hải Đăng")
+                self.assertEqual(pl["items"][1][3], dv if self.m._known_vieneu_voices() else "Ngọc")
+
+                # Pre-populate TTS cache with overflowing WAV on seg 0; verify --allow-overflow does NOT poison dub_key
+                for _gi, _g, _txt, _v, _tk, raw_p in pl["items"]:
+                    soundfile.write(raw_p, self.tone(1.6 if _gi == 0 else 0.3), self.sr)
+                ok_diag, overs = self.m._assemble_unit_dub(pl, allow_overflow=True)
+                self.assertTrue(ok_diag)
+                self.assertGreaterEqual(len(overs), 1)
+                # Subsequent normal cmd_dub MUST NOT see cached=True — it must still fail fast with code 2!
+                with self.assertRaises(SystemExit) as cm:
+                    self.m.cmd_dub(ws, self.m.cfg(ws))
+                self.assertEqual(cm.exception.code, 2)
+            finally:
+                self._exit_cache_env()
+
+    def test_stage2_elastic_short_burst_syl_rate_passes(self):
+        v2_py = os.path.join(ROOT, "vendor", "zh-vi-script-adapter", "scripts", "validate_bilingual_script.py")
+        cg_py = os.path.join(ROOT, "vendor", "video-localization-orchestrator", "scripts", "cicd_gate.py")
+        spec_cg = importlib.util.spec_from_file_location("cg_mod2", cg_py)
+        cg = importlib.util.module_from_spec(spec_cg)
+        spec_cg.loader.exec_module(cg)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            self._enter_cache_env(td)
+            try:
+                ws = os.path.join(td, "u_s2")
+                for sub in ("data", "config", "source", "media/stems", ".cicd"):
+                    os.makedirs(os.path.join(ws, sub), exist_ok=True)
+                vid = os.path.join(ws, "source", "master_source.mp4")
+                voc_w = np.zeros(self.sr * 3, dtype=np.float32)
+                t_sub = np.arange(int(0.35 * self.sr)) / self.sr
+                voc_w[int(0.20 * self.sr): int(0.55 * self.sr)] = 0.15 * np.sin(2 * np.pi * 600 * t_sub)
+                voc_w[int(1.80 * self.sr): int(2.15 * self.sr)] = 0.15 * np.sin(2 * np.pi * 600 * t_sub)
+                soundfile.write(os.path.join(ws, "media/stems/vocals.wav"), np.stack([voc_w, voc_w], axis=1), self.sr)
+                subprocess.run([
+                    self.ap.find_tool("ffmpeg"), "-v", "error", "-y",
+                    "-f", "lavfi", "-i", "color=c=black:s=160x120:d=3.0:r=25",
+                    "-i", os.path.join(ws, "media/stems/vocals.wav"),
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", vid,
+                ], check=True)
+                self.ap.atomic_write_json(os.path.join(ws, "data/00_video_profile.json"), {"duration": 3.0, "localization_mode": "voice_dub", "source_video": "source/master_source.mp4"})
+                raw_asr = [
+                    {"id": 1, "start": 0.20, "end": 0.45, "text": "快走！", "source": "pass1_asr"},
+                    {"id": 2, "start": 1.80, "end": 2.25, "text": "好！", "source": "pass1_asr"},
+                ]
+                script_segs = [
+                    {"id": 1, "start": 0.20, "end": 0.45, "speaker": "M1", "zh_text": "快走！", "sub_text": "Mau đi!", "tts_text": "Mau đi!"},
+                    {"id": 2, "start": 1.80, "end": 2.25, "speaker": "F1", "zh_text": "好！", "sub_text": "Được!", "tts_text": "Được!"},
+                ]
+                self.ap.atomic_write_json(os.path.join(ws, "data/01_asr_raw_segments.json"), raw_asr)
+                self.ap.atomic_write_json(os.path.join(ws, "data/02_bilingual_script.json"), script_segs)
+                with open(os.path.join(ws, "02_glossary_and_pronunciation.md"), "w", encoding="utf-8") as f:
+                    f.write("# Glossary\n")
+                cg.write_gate_token(ws, 1, "Stage 1", [{"id": "ok", "weight": 100, "passed": True, "detail": "ok"}], {}, ["data/01_asr_raw_segments.json"])
+                r = subprocess.run([sys.executable, v2_py, "--workspace", ws], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stdout + "\n" + r.stderr)
+            finally:
+                self._exit_cache_env()
 
 
 if __name__ == "__main__":

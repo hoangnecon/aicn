@@ -282,7 +282,7 @@ def _atomic_replace(tmp, dst):
         except PermissionError:
             if attempt == 9:
                 raise
-            time.sleep(0.02)
+            time.sleep(0.02 * (attempt + 1))
 
 
 def _write_wav16(path, arr, sr=SR, inplace=False):
@@ -463,17 +463,91 @@ def cmd_separate(ws, c, fh=None):
 
 
 # ---------------------------------------------------------------- dub (indivisible utterances)
-def group_lines(segs, max_gap=None, max_group_segs=None, max_group_dur=None):
+_KNOWN_VOICES_CACHE = None
+
+
+def _known_vieneu_voices():
+    """Return set of valid VieNeu v3 Turbo preset voice IDs when vieneu assets are installed, else None."""
+    global _KNOWN_VOICES_CACHE
+    if _KNOWN_VOICES_CACHE is not None:
+        return _KNOWN_VOICES_CACHE
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("vieneu")
+        if spec and spec.origin:
+            v_json = os.path.join(os.path.dirname(spec.origin), "assets", "voices_v3_turbo.json")
+            if os.path.isfile(v_json):
+                raw = _jload(v_json, {}) or {}
+                presets = raw.get("presets") if isinstance(raw.get("presets"), dict) else raw
+                names = set(presets.keys()) if isinstance(presets, dict) else set()
+                if isinstance(presets, dict):
+                    for v_info in presets.values():
+                        if isinstance(v_info, dict):
+                            names.update(str(al) for al in (v_info.get("aliases") or []) if al)
+                if names:
+                    _KNOWN_VOICES_CACHE = names
+                    return _KNOWN_VOICES_CACHE
+    except Exception:
+        pass
+    _KNOWN_VOICES_CACHE = set()
+    return _KNOWN_VOICES_CACHE
+
+
+def resolve_speaker_voices(ws, c):
+    """Build speaker -> VieNeu voice_id map from series_bible.json and config/audio_mix.json."""
+    default_v = c.get("voice") or DEFAULTS["voice"]
+    known = _known_vieneu_voices()
+    mapping = {}
+    hub = _resolve_hub(ws)
+    bible_paths = []
+    if hub:
+        bible_paths.append(os.path.join(hub, "config", "series_bible.json"))
+    bible_paths.append(os.path.join(ws, "config", "series_bible.json"))
+    for bp in bible_paths:
+        b = _jload(bp, {}) or {}
+        for ch in b.get("characters") or []:
+            if isinstance(ch, dict) and ch.get("speaker_id") and ch.get("voice_id"):
+                vid = str(ch["voice_id"]).strip()
+                if vid and (not known or vid in known):
+                    mapping[str(ch["speaker_id"]).strip()] = vid
+        if isinstance(b.get("voices"), dict):
+            for spk, vid in b["voices"].items():
+                vid_s = str(vid or "").strip()
+                if spk and vid_s and (not known or vid_s in known):
+                    mapping[str(spk).strip()] = vid_s
+    if isinstance(c.get("voices"), dict):
+        for spk, vid in c["voices"].items():
+            vid_s = str(vid or "").strip()
+            if spk and vid_s and (not known or vid_s in known):
+                mapping[str(spk).strip()] = vid_s
+    return mapping, default_v
+
+
+def effective_seg_voice(seg, spk_map=None, default_voice=None):
+    dv = default_voice or DEFAULTS["voice"]
+    v = (seg.get("voice") or "").strip()
+    if v:
+        return v
+    spk = str(seg.get("speaker") or "").strip()
+    if spk and spk_map and spk in spk_map:
+        return spk_map[spk]
+    return dv
+
+
+def group_lines(segs, max_gap=None, max_group_segs=None, max_group_dur=None, spk_map=None, default_voice=None):
     """Group adjacent clauses ONLY when continuous same-speaker/voice speech (gap <= 0.12s, <= 3 clauses, <= 4.5s)."""
     mg = DEFAULTS["group_max_gap_s"] if max_gap is None else float(max_gap)
     mc = DEFAULTS["max_group_clauses"] if max_group_segs is None else int(max_group_segs)
     md = DEFAULTS["max_group_span_s"] if max_group_dur is None else float(max_group_dur)
+    dv = default_voice or DEFAULTS["voice"]
     groups, cur = [], []
     for i, s in enumerate(segs):
         if cur:
             p = segs[cur[-1]]
             chained = not re.search(r"[.!?…]\s*$", p["tts_text"].strip())
-            same_spk = s.get("speaker") == p.get("speaker") and s.get("voice") == p.get("voice")
+            v_cur = effective_seg_voice(s, spk_map, dv)
+            v_prv = effective_seg_voice(p, spk_map, dv)
+            same_spk = s.get("speaker") == p.get("speaker") and v_cur == v_prv
             gap = float(s["start"]) - float(p["end"])
             span = float(s["end"]) - float(segs[cur[0]]["start"])
             if chained and len(cur) < mc and span <= md and same_spk and gap <= mg:
@@ -571,15 +645,27 @@ def presynth(jobs, workers, threads=0, batch_size=16):
         for text, voice, temp, top_k, path in jobs:
             by_cfg[(voice, temp, top_k)].append((text, path))
         with ap.gpu_slot("vieneu", vram_mb=1024, label="VIENEU-TTS"):
+            injected_tts = _TTS is not None
             if _TTS is None:
                 _tts_init(device="cuda", max_batch_size=bs)
-            for (voice, temp, top_k), items in by_cfg.items():
-                for start in range(0, len(items), bs):
-                    chunk = items[start: start + bs]
-                    texts = [t for t, _ in chunk]
-                    wavs = _TTS.infer_batch(texts=texts, voice=voice, temperature=temp, top_k=top_k, batch_size=bs)
-                    for (_, path), w in zip(chunk, wavs):
-                        _write_wav16(path, w, SR)
+            try:
+                for (voice, temp, top_k), items in by_cfg.items():
+                    for start in range(0, len(items), bs):
+                        chunk = items[start: start + bs]
+                        texts = [t for t, _ in chunk]
+                        wavs = _TTS.infer_batch(texts=texts, voice=voice, temperature=temp, top_k=top_k, batch_size=bs)
+                        for (_, path), w in zip(chunk, wavs):
+                            _write_wav16(path, w, SR)
+            finally:
+                if not injected_tts:
+                    globals()["_TTS"] = None
+                    try:
+                        import gc
+                        gc.collect()
+                        if torch is not None and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
         return
     if workers <= 1 or len(jobs) < 8:
         if _TTS is None:
@@ -639,11 +725,12 @@ def _resolve_tts_parallelism(c):
     return w, th
 
 
-def _dub_cache_key(ws, c, script_p, dur):
+def _dub_cache_key(ws, c, script_p, dur, spk_map=None):
     return ap.hash_obj({
         "v": AUDIO_VERSION,
         "script": ap.content_sha256(script_p),
         "dur": round(dur, 3),
+        "spk_voices": spk_map or {},
         "cfg": {
             k: c.get(k) for k in (
                 "voice", "temperature", "top_k", "group_max_gap_s", "max_group_clauses",
@@ -670,7 +757,9 @@ def _dub_outputs_valid(ws, n_segs):
         u_rel = it.get("utterance_wav") or f"media/tts_segments/utt_{int(it['utterance_id']):04d}.wav"
         if not os.path.exists(os.path.join(ws, u_rel)):
             return False
-        if it.get("overflow_s", 0.0) > 0.05 or it.get("tempo", 1.0) > it.get("cap_tempo", 1.28) + 0.005:
+        cap_t = float(it.get("cap_tempo", 1.28))
+        req_t = max(float(it.get("tempo", 1.0)), float(it.get("required_tempo", 1.0)))
+        if bool(it.get("runt", False)) or float(it.get("overflow_s", 0.0)) > 0.05 or req_t > cap_t + 0.005:
             return False
     return True
 
@@ -683,16 +772,20 @@ def _plan_unit_dub(ws, c):
     if not segs:
         sys.exit(f"[aicn-audio] missing or empty {script_p}")
     dur = float(profile(ws)["duration"])
-    dub_key = _dub_cache_key(ws, c, script_p, dur)
+    spk_map, default_v = resolve_speaker_voices(ws, c)
+    dub_key = _dub_cache_key(ws, c, script_p, dur, spk_map=spk_map)
     st_cache = _audio_state_load(ws)
     if not c.get("_force") and st_cache.get("dub_key") == dub_key and _dub_outputs_valid(ws, len(segs)):
         return {"cached": True, "ws": ws, "c": c, "segs": segs, "dur": dur, "dub_key": dub_key, "items": []}
 
-    groups = group_lines(segs, c["group_max_gap_s"], c["max_group_clauses"], c["max_group_span_s"])
+    groups = group_lines(
+        segs, c["group_max_gap_s"], c["max_group_clauses"], c["max_group_span_s"],
+        spk_map=spk_map, default_voice=default_v,
+    )
     items = []
     for gi, g in enumerate(groups):
         text = " ".join(segs[i]["tts_text"].strip() for i in g)
-        voice = segs[g[0]].get("voice") or c["voice"]
+        voice = effective_seg_voice(segs[g[0]], spk_map=spk_map, default_voice=default_v)
         t_key = ap.tts_sent_key(text, voice, TTS_ENGINE_TAG, c["temperature"], c["top_k"])
         raw_p = _resolve_tts_cached_path(ws, t_key)
         items.append((gi, g, text, voice, t_key, raw_p))
@@ -887,11 +980,11 @@ def _assemble_unit_dub(plan, allow_overflow=False):
         why = f"RUNT {l['stretched_s']:.3f}s < {min_utt_s}s" if l["runt"] else f"+{l['overflow_s']:.2f}s (req {l['required_tempo']:.2f}x > cap {l['cap_tempo']:.2f}x, trim ~{l['suggested_trim_syls']} syl)"
         print(f"   OVERFLOW utt {l['utterance_id']} ids {l['ids']} {why}: {l['text']}", file=sys.stderr)
 
-    if over_entries and not allow_overflow:
+    if over_entries:
         st_cache = _audio_state_load(ws)
         st_cache.pop("dub_key", None)
         _audio_state_save(ws, st_cache)
-        return False, over_entries
+        return bool(allow_overflow), over_entries
 
     st_cache = _audio_state_load(ws)
     st_cache["dub_key"] = dub_key
@@ -1572,7 +1665,12 @@ def cmd_mix(ws, c, fh=None):
         flv = ex.submit(lufs, V)
         flt = ex.submit(lufs, T[:, None])
         lv = flv.result()
-        gain = lv + float(c["dub_over_vocal_lu"]) - flt.result()
+        lt_mono = flt.result()
+        # T is added dual-mono to both stereo channels (mix += T[:, None]), which is +3.0103 LU louder than 1-ch mono;
+        # guard quiet/whisper vocals (lv <= -60 LUFS) and clamp gain to [-12, +12] dB so dub never mutes or overdrives.
+        lv_eff = -20.0 if lv <= -60.0 else max(lv, -30.0)
+        lt_stereo = (lt_mono + 3.0103) if lt_mono > -65.0 else -20.0
+        gain = float(np.clip(lv_eff + float(c["dub_over_vocal_lu"]) - lt_stereo, -12.0, 12.0))
     T = T * np.float32(10.0 ** (gain / 20.0))
 
     idx, band_of_bin = _band_indices()
@@ -1633,9 +1731,16 @@ def cmd_mix(ws, c, fh=None):
         mix = istft_combined([(ZV, gV), (ZB, gB)], band_of_bin, n)
         del ZV, ZB
     if torch is not None and len(mix) >= SR * 10:
-        torch.from_numpy(mix).add_(torch.from_numpy(np.ascontiguousarray(T, dtype=np.float32)).unsqueeze(1))
+        mt_mix = torch.from_numpy(mix)
+        mt_mix.add_(torch.from_numpy(np.ascontiguousarray(T, dtype=np.float32)).unsqueeze(1))
+        pk_mix = float(mt_mix.abs().max())
+        if pk_mix > 0.95:
+            mt_mix.mul_(0.95 / pk_mix)
     else:
         mix += T[:, None]
+        pk_mix = float(np.max(np.abs(mix))) if len(mix) else 0.0
+        if pk_mix > 0.95:
+            mix *= np.float32(0.95 / pk_mix)
     os.makedirs(os.path.join(ws, "media", "audio"), exist_ok=True)
     _write_wav16(pre_p, mix, SR, inplace=True)
 
@@ -1823,7 +1928,10 @@ def _run_audio_checks(ws, c, fh=None):
     log = _jload(os.path.join(ws, "data", "03_dub_sentences.json"), []) or []
     min_utt_s = float(c.get("min_utterance_s", 0.12))
     over = [l for l in log if float(l.get("overflow_s", 0.0)) > 0.05]
-    tempo_bad = [l for l in log if float(l.get("tempo", 1.0)) > float(l.get("cap_tempo", c["max_tempo"])) + 0.005]
+    tempo_bad = [
+        l for l in log
+        if max(float(l.get("tempo", 1.0)), float(l.get("required_tempo", 1.0))) > float(l.get("cap_tempo", c["max_tempo"])) + 0.005
+    ]
     runt_bad = []
     utt_overlap_bad = []
     for idx_u, l in enumerate(log):

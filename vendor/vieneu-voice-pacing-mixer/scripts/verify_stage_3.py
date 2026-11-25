@@ -76,9 +76,10 @@ def run_stage_3_verification(ws: str):
                 utt_bad.append(f"{rel}:sr={info_u.samplerate},dur={info_u.duration:.3f}s,pk={pk_u:.4f}")
         cap_t = float(u.get("cap_tempo", 1.28))
         t_val = float(u.get("tempo", 1.0))
+        req_t = max(t_val, float(u.get("required_tempo", t_val)))
         tempos.append(t_val)
-        if float(u.get("overflow_s", 0.0)) > 0.05 or t_val > cap_t + 0.005:
-            over_bad.append(f"utt#{idx_u}:ov={u.get('overflow_s')}s,t={t_val}>{cap_t}")
+        if bool(u.get("runt", False)) or float(u.get("overflow_s", 0.0)) > 0.05 or req_t > cap_t + 0.005:
+            over_bad.append(f"utt#{idx_u}:runt={u.get('runt', False)},ov={u.get('overflow_s')}s,req_t={req_t}>{cap_t}")
     chk2_ok = len(utts) > 0 and len(utt_bad) == 0 and len(over_bad) == 0
     mean_tempo = float(np.mean(tempos)) if tempos else 0.0
     max_tempo = float(np.max(tempos)) if tempos else 0.0

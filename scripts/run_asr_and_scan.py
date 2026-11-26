@@ -30,6 +30,7 @@ except ImportError:
     ap = None
 
 from analyze_voice_waveform import (
+    _bandpass_in_ram,
     _fast_file_sig,
     build_multiband_audio_streams,
     cjk_alnum_chars,
@@ -41,7 +42,7 @@ from analyze_voice_waveform import (
 )
 
 
-ASR_PIPELINE_VERSION = "asr-4.0"
+ASR_PIPELINE_VERSION = "asr-4.1"
 HALLUCINATION_SUBSTRINGS = (
     "索兰娅", "明镜", "点点栏目", "打赏支持", "不吝点赞", "请不吝", "点赞订阅", "订阅转发", "欢迎订阅",
     "谢谢观看", "感谢观看", "感谢收看", "字幕由", "字幕制作", "中文字幕", "优优独播", "Amara",
@@ -388,10 +389,11 @@ def _neighbor_clamped_pad(
     total_dur: float,
     prev_gap_end: float | None = None,
     next_gap_start: float | None = None,
+    pad_margin_s: float = 0.28,
 ) -> tuple[float, float]:
     """Clamp slice padding strictly outside neighboring Pass 1 spans and adjacent split gaps."""
-    pad_s = max(0.0, gst - 0.15)
-    pad_e = min(total_dur, get + 0.15)
+    pad_s = max(0.0, gst - pad_margin_s)
+    pad_e = min(total_dur, get + pad_margin_s)
     if covered_spans:
         prev_ends = [ce for _, ce in covered_spans if ce <= gst + 0.02]
         if prev_ends:
@@ -400,11 +402,21 @@ def _neighbor_clamped_pad(
         if next_starts:
             pad_e = min(pad_e, min(next_starts) - 0.02)
     # Prevent consecutive split windows (>10s gap split at valley) from overlapping each other's padding
-    if prev_gap_end is not None and (gst - prev_gap_end) < 0.30:
+    if prev_gap_end is not None and (gst - prev_gap_end) < (2.0 * pad_margin_s):
         pad_s = max(pad_s, 0.5 * (prev_gap_end + gst) - 0.01)
-    if next_gap_start is not None and (next_gap_start - get) < 0.30:
+    if next_gap_start is not None and (next_gap_start - get) < (2.0 * pad_margin_s):
         pad_e = min(pad_e, 0.5 * (get + next_gap_start) + 0.01)
     return pad_s, pad_e
+
+
+def _rms_controlled_gain(clip: np.ndarray, target_rms: float = 0.10, max_gain: float = 10.0) -> np.ndarray:
+    """Normalize speech slice gently by RMS (clamping peak <= 0.85) instead of boosting quiet hiss/SFX to 0.85."""
+    mx = float(np.max(np.abs(clip))) if len(clip) else 0.0
+    if mx <= 0.002:
+        return np.zeros(0, dtype=np.float32)
+    rms = float(np.sqrt(np.mean(clip ** 2) + 1e-12))
+    gain = min(max_gain, target_rms / max(1e-4, rms), 0.85 / mx)
+    return np.clip(clip * gain, -0.85, 0.85).astype(np.float32)
 
 
 def _probe_band_clip(
@@ -428,14 +440,13 @@ def _probe_band_clip(
     if len(clip) < int(0.30 * sr):
         return []
     clip = _mask_covered_spans_in_clip(clip, pad_s, covered_spans, sr=sr)
-    mx = float(np.max(np.abs(clip)))
-    if mx <= 0.002:
+    clip = _rms_controlled_gain(clip)
+    if len(clip) == 0:
         return []
-    clip = (clip / mx * 0.85).astype(np.float32)
 
     kwargs = dict(
         language=whisper_lang,
-        beam_size=3 if band_name in ("full_vocal", "raw_clean") else 2,
+        beam_size=3 if band_name in ("full_vocal", "raw_clean", "voc_verify") else 2,
         word_timestamps=True,
         vad_filter=False,
         condition_on_previous_text=False,
@@ -453,6 +464,7 @@ def _probe_band_clip(
         comp_r = float(getattr(sg, "compression_ratio", 1.0))
 
         words = list(getattr(sg, "words", None) or [])
+        mean_w_prob = 0.85
         if words:
             kept_words = []
             for w in words:
@@ -463,6 +475,10 @@ def _probe_band_clip(
                 continue
             rec_text = "".join(w.word for w in kept_words).strip()
             if not rec_text or _is_hallucination(rec_text):
+                continue
+            w_probs = [float(getattr(w, "probability", 0.85)) for w in kept_words]
+            mean_w_prob = (sum(w_probs) / len(w_probs)) if w_probs else 0.85
+            if mean_w_prob < 0.42:
                 continue
             seg_st = round(max(gst, pad_s + float(kept_words[0].start)), 3)
             seg_et = round(min(get, pad_s + float(kept_words[-1].end)), 3)
@@ -479,7 +495,12 @@ def _probe_band_clip(
             )
         else:
             has_words = len(rec_text.strip()) >= 3
-        if not (rec_prob > -0.78 and no_sp < 0.50 and comp_r <= 2.2 and has_words):
+        # Short clips padded into Whisper's fixed 30s mel window inflate window-level no_speech_prob;
+        # rescue genuine speech when Demucs vocal RMS and token/logprob confidence are both strong.
+        conf_ok = (rec_prob > -0.78 and no_sp < 0.52) or (
+            peak_voc_rms >= 0.025 and mean_w_prob >= 0.56 and rec_prob > -0.68 and no_sp < 0.90
+        )
+        if not (conf_ok and comp_r <= 2.2 and has_words):
             continue
 
         max_ok_dur = n_chars * 0.35 + 1.25
@@ -487,13 +508,15 @@ def _probe_band_clip(
             seg_et = round(seg_st + max_ok_dur, 3)
         if seg_et - seg_st < 0.18:
             continue
-        base_score = round(rec_prob - 0.80 * no_sp - max(0.0, comp_r - 1.8) * 0.40, 4)
+        eff_nsp = min(no_sp, 0.25) if (peak_voc_rms >= 0.030 and mean_w_prob >= 0.60) else no_sp
+        base_score = round(rec_prob - 0.80 * eff_nsp - max(0.0, comp_r - 1.8) * 0.40, 4)
         cands.append({
             "start": seg_st,
             "end": seg_et,
             "text": rec_text,
             "avg_logprob": rec_prob,
             "no_speech_prob": round(no_sp, 3),
+            "mean_word_prob": round(mean_w_prob, 3),
             "compression_ratio": round(comp_r, 3),
             "band": band_name,
             "base_score": base_score,
@@ -582,30 +605,6 @@ def fuse_and_refine_multiband_candidates(
         cl_st = min(x["start"] for x in cl)
         cl_et = max(x["end"] for x in cl)
 
-        if len(bands_present) == 1 and model is not None and raw_clean_wave is not None:
-            s0 = max(0, int(round(cl_st * sr)))
-            s1 = min(len(voc_raw), int(round(cl_et * sr))) if voc_raw is not None else 0
-            local_voc_rms = float(np.sqrt(np.mean(voc_raw[s0:s1] ** 2) + 1e-12)) if s1 > s0 else 0.0
-            if local_voc_rms < 0.022 and bands_present[0] != "raw_clean":
-                r_pad_s, r_pad_e = _neighbor_clamped_pad(cl_st, cl_et, covered_spans, total_dur)
-                rev_cands = _probe_band_clip(
-                    model=model,
-                    wave=raw_clean_wave,
-                    pad_s=r_pad_s,
-                    pad_e=r_pad_e,
-                    gst=cl_st,
-                    get=cl_et,
-                    band_name="raw_clean",
-                    whisper_lang=whisper_lang,
-                    source_lang=source_lang,
-                    peak_voc_rms=float(gap_meta.get("peak_voc_rms", 0.0)),
-                    sr=sr,
-                    covered_spans=covered_spans,
-                )
-                for rc in rev_cands:
-                    if max(0.0, min(cl_et, rc["end"]) - max(cl_st, rc["start"])) >= 0.15:
-                        cl.append(rc)
-
         best_item = None
         best_score = -999.0
         for cand in cl:
@@ -638,7 +637,12 @@ def fuse_and_refine_multiband_candidates(
             if not (len(agreed_bands) >= 2 and win["avg_logprob"] > -0.50 and win["no_speech_prob"] < 0.25):
                 continue
         if len(agreed_bands) == 1:
-            if not (win["avg_logprob"] > -0.72 and win["no_speech_prob"] < 0.45):
+            acoustic_backed = (
+                seg_voc_rms >= 0.025
+                and float(win.get("mean_word_prob", 0.85)) >= 0.56
+                and win["avg_logprob"] > -0.68
+            )
+            if not ((win["avg_logprob"] > -0.72 and win["no_speech_prob"] < 0.52) or acoustic_backed):
                 continue
             b_raw = streams.get(f"{win['band']}_raw")
             if b_raw is not None and len(b_raw) > 0:
@@ -679,27 +683,33 @@ def _probe_band_gaps_stitched(
     total_dur: float,
     sr: int = 16000,
     max_batch_s: float = 22.0,
-    sep_s: float = 0.65,
+    sep_s: float = 0.85,
     force_stitch: bool = False,
     covered_spans: list[tuple[float, float]] | None = None,
+    call_counter: list[int] | None = None,
+    slot_max_wprob_out: dict[int, float] | None = None,
 ) -> dict:
     """
-    Stitched Multi-Gap Batching with Neighbor-Clamped Padding & Word-Midpoint Exclusion:
-      - Clamps slice padding strictly outside neighboring Pass 1 segments and adjacent split gaps.
-      - Masks any sample inside Pass 1 spans via _mask_covered_spans_in_clip().
-      - Drops any decoded word whose midpoint falls outside [gst - 0.02, get + 0.02] or inside Pass 1 spans.
+    Stitched Multi-Gap Batching with Bucket Isolation, RMS Gain & Per-Slot Confidence:
+      - Separates clean harmonic vocal gaps from noisy/SFX/low-vocal gaps so animal barks or SFX
+        never sit at t=0 of a clean-speech Whisper encoder window.
+      - Uses RMS-controlled gain (+0.30s leading silence & 0.85s inter-slot silence) instead of 0.85 peak boost.
+      - Evaluates confidence per slot (word probability + local vocal RMS) rather than dropping an entire
+        multi-slot batch on Whisper's 30s-window-wide no_speech_prob.
     """
     by_gap = {idx: [] for idx, _ in gap_entries}
     if not gap_entries:
         return by_gap
 
-    can_stitch = force_stitch or (hasattr(model, "feature_extractor") and len(gap_entries) >= 2)
+    can_stitch = force_stitch or hasattr(model, "feature_extractor")
     if not can_stitch:
         for pos, (g_idx, g) in enumerate(gap_entries):
             gst, get = float(g["start"]), float(g["end"])
             prev_ge = float(gap_entries[pos - 1][1]["end"]) if pos > 0 else None
             next_gs = float(gap_entries[pos + 1][1]["start"]) if pos + 1 < len(gap_entries) else None
             pad_s, pad_e = _neighbor_clamped_pad(gst, get, covered_spans, total_dur, prev_ge, next_gs)
+            if call_counter is not None:
+                call_counter[0] += 1
             by_gap[g_idx] = _probe_band_clip(
                 model=model,
                 wave=wave,
@@ -716,17 +726,41 @@ def _probe_band_gaps_stitched(
             )
         return by_gap
 
+    # Compute neighbor bounds in chronological order BEFORE partitioning into clean vs noisy buckets
+    neighbor_bounds = {}
+    for pos, (g_idx, g) in enumerate(gap_entries):
+        prev_ge = float(gap_entries[pos - 1][1]["end"]) if pos > 0 else None
+        next_gs = float(gap_entries[pos + 1][1]["start"]) if pos + 1 < len(gap_entries) else None
+        neighbor_bounds[g_idx] = (prev_ge, next_gs)
+
+    if force_stitch:
+        ordered_entries = list(gap_entries)
+    else:
+        # Place clean harmonic speech slots FIRST (t=0.25s of Whisper's 30s encoder window so <|nospeech|>
+        # sees real speech first) and noisy/SFX/bark slots AFTER them inside the SAME <=22s batch (1 call/band!).
+        clean_bucket, noisy_bucket = [], []
+        for entry in gap_entries:
+            _, g = entry
+            p_v = float(g.get("peak_voc_rms", 0.0))
+            dur_g = float(g.get("end", 0.0)) - float(g.get("start", 0.0))
+            zcr_g = float(g.get("mean_voc_zcr", 0.12))
+            if p_v >= 0.030 and g.get("kind", "normal") == "normal" and zcr_g <= 0.22 and dur_g <= 6.0:
+                clean_bucket.append(entry)
+            else:
+                noisy_bucket.append(entry)
+        ordered_entries = clean_bucket + noisy_bucket
+
+    lead_samples = np.zeros(int(round(0.25 * sr)), dtype=np.float32) if not force_stitch else np.zeros(0, dtype=np.float32)
     sep_samples = np.zeros(int(round(sep_s * sr)), dtype=np.float32)
+    max_samples = int(round(max_batch_s * sr))
     batches = []
+
     cur_pieces = []
     cur_slots = []
     cur_samples = 0
-    max_samples = int(round(max_batch_s * sr))
-
-    for pos, (g_idx, g) in enumerate(gap_entries):
+    for g_idx, g in ordered_entries:
         gst, get = float(g["start"]), float(g["end"])
-        prev_ge = float(gap_entries[pos - 1][1]["end"]) if pos > 0 else None
-        next_gs = float(gap_entries[pos + 1][1]["start"]) if pos + 1 < len(gap_entries) else None
+        prev_ge, next_gs = neighbor_bounds[g_idx]
         pad_s, pad_e = _neighbor_clamped_pad(gst, get, covered_spans, total_dur, prev_ge, next_gs)
         s_i = max(0, int(round(pad_s * sr)))
         e_i = min(len(wave), int(round(pad_e * sr)))
@@ -734,15 +768,17 @@ def _probe_band_gaps_stitched(
         if len(clip) < int(0.30 * sr):
             continue
         clip = _mask_covered_spans_in_clip(clip, pad_s, covered_spans, sr=sr)
-        mx = float(np.max(np.abs(clip)))
-        if mx <= 0.002:
+        clip_norm = _rms_controlled_gain(clip)
+        if len(clip_norm) == 0:
             continue
-        clip_norm = (clip / mx * 0.85).astype(np.float32)
-        needed = len(clip_norm) + (len(sep_samples) if cur_pieces else 0)
+        needed = len(clip_norm) + (len(sep_samples) if cur_pieces else len(lead_samples))
         if cur_pieces and (cur_samples + needed) > max_samples:
             batches.append((np.concatenate(cur_pieces), cur_slots))
             cur_pieces, cur_slots, cur_samples = [], [], 0
-        if cur_pieces:
+        if not cur_pieces and len(lead_samples) > 0:
+            cur_pieces.append(lead_samples)
+            cur_samples += len(lead_samples)
+        elif cur_pieces:
             cur_pieces.append(sep_samples)
             cur_samples += len(sep_samples)
         buf_st = cur_samples / sr
@@ -750,14 +786,15 @@ def _probe_band_gaps_stitched(
         cur_samples += len(clip_norm)
         buf_et = cur_samples / sr
         cur_slots.append((buf_st, buf_et, g_idx, pad_s, gst, get, float(g.get("peak_voc_rms", 0.0))))
-
     if cur_pieces:
         batches.append((np.concatenate(cur_pieces), cur_slots))
 
     for buf, slots in batches:
+        if call_counter is not None:
+            call_counter[0] += 1
         kwargs = dict(
             language=whisper_lang,
-            beam_size=2,
+            beam_size=3 if band_name in ("full_vocal", "voc_verify") else 2,
             word_timestamps=True,
             vad_filter=False,
             condition_on_previous_text=False,
@@ -773,7 +810,8 @@ def _probe_band_gaps_stitched(
             rec_prob = round(float(getattr(sg, "avg_logprob", -0.6)), 3)
             no_sp = float(getattr(sg, "no_speech_prob", 0.0))
             comp_r = float(getattr(sg, "compression_ratio", 1.0))
-            if rec_prob <= -0.78 or no_sp >= 0.48 or comp_r > 2.2:
+            # NEVER reject the whole multi-slot batch on window-wide no_sp here; evaluate per slot below!
+            if rec_prob <= -0.95 or comp_r > 2.3:
                 continue
             words = list(getattr(sg, "words", None) or [])
 
@@ -784,8 +822,7 @@ def _probe_band_gaps_stitched(
                     for si, (bst, bet, g_idx, pad_s, gst, get, _pv) in enumerate(slots):
                         if (bst - 0.18) <= wm <= (bet + 0.18):
                             abs_wm = pad_s + (wm - bst)
-                            # Drop collar-bleed words outside [gst - 0.02, get + 0.02] or inside Pass 1 spans
-                            if (gst - 0.02) <= abs_wm <= (get + 0.02) and not _in_covered_spans(abs_wm, covered_spans):
+                            if (gst - 0.12) <= abs_wm <= (get + 0.12) and not _in_covered_spans(abs_wm, covered_spans):
                                 slot_buckets[si].append(w)
                             break
 
@@ -804,15 +841,23 @@ def _probe_band_gaps_stitched(
                         if not txt or _is_hallucination(txt):
                             continue
                         w_probs = [float(getattr(x, "probability", 0.85)) for x in ch]
-                        if w_probs and (sum(w_probs) / len(w_probs)) < 0.42:
+                        mean_w_prob = (sum(w_probs) / len(w_probs)) if w_probs else 0.85
+                        if slot_max_wprob_out is not None:
+                            slot_max_wprob_out[g_idx] = max(slot_max_wprob_out.get(g_idx, 0.0), mean_w_prob)
+                        if mean_w_prob < 0.42:
                             continue
                         n_cjk = len(cjk_chars(txt))
                         n_chars = max(1, len(cjk_alnum_chars(txt)))
                         has_words = (
-                            (n_cjk >= 2) or (n_cjk == 1 and rec_prob > -0.35 and no_sp < 0.20 and p_voc >= 0.045)
+                            (n_cjk >= 2) or (n_cjk == 1 and rec_prob > -0.35 and (no_sp < 0.25 or mean_w_prob >= 0.75) and p_voc >= 0.045)
                             if source_lang == "zh" else (len(txt) >= 3)
                         )
                         if not has_words:
+                            continue
+                        conf_ok = (rec_prob > -0.78 and no_sp < 0.52 and comp_r <= 2.2) or (
+                            p_voc >= 0.025 and mean_w_prob >= 0.56 and rec_prob > -0.68 and comp_r <= 2.2
+                        )
+                        if not conf_ok:
                             continue
                         loc_s = max(0.0, float(ch[0].start) - bst)
                         loc_e = min(bet - bst, max(loc_s + 0.18, float(ch[-1].end) - bst))
@@ -823,10 +868,12 @@ def _probe_band_gaps_stitched(
                             seg_et = round(seg_st + max_ok_dur, 3)
                         if seg_et - seg_st < 0.18:
                             continue
-                        base_score = round(rec_prob - 0.80 * no_sp - max(0.0, comp_r - 1.8) * 0.40, 4)
+                        eff_nsp = min(no_sp, 0.25) if (p_voc >= 0.030 and mean_w_prob >= 0.60) else no_sp
+                        base_score = round(rec_prob - 0.80 * eff_nsp - max(0.0, comp_r - 1.8) * 0.40, 4)
                         by_gap[g_idx].append({
                             "start": seg_st, "end": seg_et, "text": txt,
                             "avg_logprob": rec_prob, "no_speech_prob": round(no_sp, 3),
+                            "mean_word_prob": round(mean_w_prob, 3),
                             "compression_ratio": round(comp_r, 3), "band": band_name, "base_score": base_score,
                         })
             else:
@@ -840,6 +887,8 @@ def _probe_band_gaps_stitched(
                 if best_si is None or best_ov < 0.15:
                     continue
                 bst, bet, g_idx, pad_s, gst, get, p_voc = slots[best_si]
+                if not ((rec_prob > -0.78 and no_sp < 0.52 and comp_r <= 2.2) or (p_voc >= 0.035 and rec_prob > -0.60 and comp_r <= 2.2)):
+                    continue
                 n_cjk = len(cjk_chars(txt))
                 n_chars = max(1, len(cjk_alnum_chars(txt)))
                 has_words = (
@@ -861,6 +910,7 @@ def _probe_band_gaps_stitched(
                 by_gap[g_idx].append({
                     "start": seg_st, "end": seg_et, "text": txt,
                     "avg_logprob": rec_prob, "no_speech_prob": round(no_sp, 3),
+                    "mean_word_prob": 0.85,
                     "compression_ratio": round(comp_r, 3), "band": band_name, "base_score": base_score,
                 })
     return by_gap
@@ -962,6 +1012,9 @@ def run_multiband_pass2b_recovery(
 
     recovered_by_band = {"full_vocal": 0, "high": 0, "mid": 0, "low": 0, "raw_clean": 0}
     verified_non_speech_gaps = []
+    unrecovered_vocal_gaps = []
+    encoder_calls = [0]
+    slot_max_wprob: dict[int, float] = {}
     rec_cnt = 0
     dedup_rejected = 0
     total_dur = len(streams["raw_raw"]) / sr
@@ -970,7 +1023,7 @@ def run_multiband_pass2b_recovery(
         p2b_t0 = time.time()
         print(
             f"[PASS 2B MULTI-BAND RECOVERY] Probing {len(uncovered_gaps)} uncovered acoustic gaps "
-            f"via stitched <=22s batching (protective collar + boundary dedup)...",
+            f"via bounded stitched <=22s batching (bucket-isolated + honest non-speech gate)...",
             flush=True,
         )
         indexed_gaps = list(enumerate(uncovered_gaps))
@@ -987,6 +1040,8 @@ def run_multiband_pass2b_recovery(
             total_dur=total_dur,
             sr=sr,
             covered_spans=covered_spans,
+            call_counter=encoder_calls,
+            slot_max_wprob_out=slot_max_wprob,
         )
         unresolved = []
         for gi, g in indexed_gaps:
@@ -995,7 +1050,7 @@ def run_multiband_pass2b_recovery(
             hi_conf_cov = sum(
                 max(0.0, c["end"] - c["start"])
                 for c in cands_by_gap[gi]
-                if c["avg_logprob"] > -0.42 and c["no_speech_prob"] < 0.30
+                if c["avg_logprob"] > -0.42 and (c["no_speech_prob"] < 0.35 or c.get("mean_word_prob", 0.0) >= 0.70)
             )
             if (hi_conf_cov / gdur) < 0.65:
                 unresolved.append((gi, g))
@@ -1006,10 +1061,13 @@ def run_multiband_pass2b_recovery(
                 continue
             band_todo = []
             for gi, g in unresolved:
-                if bname not in g.get("probe_bands", ["high", "mid", "low"]):
+                if bname not in g.get("probe_bands", []):
                     continue
                 gdur = max(0.2, float(g["end"]) - float(g["start"]))
-                strong_bands = {c["band"] for c in cands_by_gap[gi] if c["avg_logprob"] > -0.45 and c["no_speech_prob"] < 0.25}
+                strong_bands = {
+                    c["band"] for c in cands_by_gap[gi]
+                    if c["avg_logprob"] > -0.45 and (c["no_speech_prob"] < 0.30 or c.get("mean_word_prob", 0.0) >= 0.70)
+                }
                 if len(strong_bands) >= 2:
                     best_b_cov = max(
                         sum(max(0.0, c["end"] - c["start"]) for c in cands_by_gap[gi] if c["band"] == sb and c["avg_logprob"] > -0.45)
@@ -1031,9 +1089,62 @@ def run_multiband_pass2b_recovery(
                 total_dur=total_dur,
                 sr=sr,
                 covered_spans=covered_spans,
+                call_counter=encoder_calls,
+                slot_max_wprob_out=slot_max_wprob,
             )
             for gi, _ in band_todo:
                 cands_by_gap[gi].extend(b_map.get(gi, []))
+
+        # Batched raw_clean cross-check (ONE single batched pass instead of an O(N) per-cluster loop)
+        raw_clean_wave = streams.get("raw_clean")
+        if raw_clean_wave is not None:
+            raw_todo = [
+                (gi, g) for gi, g in indexed_gaps
+                if len({c["band"] for c in cands_by_gap[gi]}) == 1
+                and float(g.get("peak_voc_rms", 0.0)) < 0.022
+            ]
+            if raw_todo:
+                rc_map = _probe_band_gaps_stitched(
+                    model=model,
+                    wave=raw_clean_wave,
+                    gap_entries=raw_todo,
+                    band_name="raw_clean",
+                    whisper_lang=whisper_lang,
+                    source_lang=source_lang,
+                    total_dur=total_dur,
+                    sr=sr,
+                    covered_spans=covered_spans,
+                    call_counter=encoder_calls,
+                    slot_max_wprob_out=slot_max_wprob,
+                )
+                for gi, _ in raw_todo:
+                    cands_by_gap[gi].extend(rc_map.get(gi, []))
+                    probed_bands_by_gap[gi].append("raw_clean")
+
+        # Clean Demucs voc_raw verification batch (AT MOST 1 stitched call) for any loud vocal gap
+        # (peak_voc_rms >= 0.035) that still yielded 0 candidates in mixed bands
+        voc_verify_todo = [
+            (gi, g) for gi, g in indexed_gaps
+            if not cands_by_gap[gi] and float(g.get("peak_voc_rms", 0.0)) >= 0.035
+        ]
+        if voc_verify_todo and streams.get("voc_raw") is not None and hasattr(model, "feature_extractor"):
+            vv_map = _probe_band_gaps_stitched(
+                model=model,
+                wave=streams["voc_raw"],
+                gap_entries=voc_verify_todo,
+                band_name="full_vocal",
+                whisper_lang=whisper_lang,
+                source_lang=source_lang,
+                total_dur=total_dur,
+                sr=sr,
+                sep_s=1.10,
+                covered_spans=covered_spans,
+                call_counter=encoder_calls,
+                slot_max_wprob_out=slot_max_wprob,
+            )
+            for gi, _ in voc_verify_todo:
+                cands_by_gap[gi].extend(vv_map.get(gi, []))
+                probed_bands_by_gap[gi].append("voc_verify")
 
         for gi, g in indexed_gaps:
             gst, get = float(g["start"]), float(g["end"])
@@ -1061,19 +1172,33 @@ def run_multiband_pass2b_recovery(
                 wb = item.get("winning_band", "full_vocal")
                 recovered_by_band[wb] = recovered_by_band.get(wb, 0) + 1
 
-            verified_non_speech_gaps.append({
-                "start": gst,
-                "end": get,
-                "duration": round(gdur, 2),
-                "recovered_in_gap": gap_added,
-                "kind": g.get("kind", "normal"),
-                "probed_bands": probed_bands_by_gap[gi],
-            })
+            p_voc_g = float(g.get("peak_voc_rms", 0.0))
+            max_wp = float(slot_max_wprob.get(gi, 0.0))
+            # Honest non-speech certification: NEVER rubber-stamp an unrecovered loud vocal burst
+            # as "verified_non_speech" if Whisper saw borderline speech tokens (0.30 <= max_wp < 0.56).
+            if gap_added == 0:
+                ambiguous_vocal = (p_voc_g >= 0.040) and (max_wp >= 0.30)
+                entry_meta = {
+                    "start": gst,
+                    "end": get,
+                    "duration": round(gdur, 2),
+                    "recovered_in_gap": 0,
+                    "peak_voc_rms": round(p_voc_g, 4),
+                    "max_word_prob_seen": round(max_wp, 3),
+                    "ambiguous_vocal": ambiguous_vocal,
+                    "kind": g.get("kind", "normal"),
+                    "probed_bands": probed_bands_by_gap[gi],
+                }
+                if ambiguous_vocal:
+                    unrecovered_vocal_gaps.append(entry_meta)
+                else:
+                    verified_non_speech_gaps.append(entry_meta)
 
         print(
-            f"[PASS 2B DONE] Recovered {rec_cnt} segments (dedup_rejected={dedup_rejected}) across "
+            f"[PASS 2B DONE] Recovered {rec_cnt} segments (dedup_rejected={dedup_rejected}, calls={encoder_calls[0]}) across "
             f"{len(uncovered_gaps)} gaps in {time.time()-p2b_t0:.1f}s "
-            f"(by_band={recovered_by_band}, verified_non_speech={len(verified_non_speech_gaps)}).",
+            f"(by_band={recovered_by_band}, verified_non_speech={len(verified_non_speech_gaps)}, "
+            f"unrecovered_vocal={len(unrecovered_vocal_gaps)}).",
             flush=True,
         )
 
@@ -1083,10 +1208,12 @@ def run_multiband_pass2b_recovery(
     report = {
         "pipeline_version": ASR_PIPELINE_VERSION,
         "gaps_probed": len(uncovered_gaps),
+        "encoder_calls": encoder_calls[0],
         "recovered_total": rec_cnt,
         "dedup_rejected": dedup_rejected,
         "recovered_by_band": recovered_by_band,
         "verified_non_speech_gaps": verified_non_speech_gaps,
+        "unrecovered_vocal_gaps": unrecovered_vocal_gaps,
     }
     if report_path:
         _atomic_write_json(report_path, report)
@@ -1099,7 +1226,10 @@ def _decode_unit_audio(video_path: str, vocals_path: str) -> tuple[np.ndarray, n
         voc_audio = decode_audio_16k(vocals_path)
         min_len = min(len(raw_audio), len(voc_audio))
         pass1_audio = np.zeros_like(raw_audio)
-        pass1_audio[:min_len] = 0.70 * voc_audio[:min_len] + 0.30 * raw_audio[:min_len]
+        # Keep Pass 1 predominantly clean Demucs vocals (88%) plus 12% 300-3400Hz mid-formants
+        # (preserves phone-call speech without injecting broadband animal barks / bass BGM / SFX).
+        raw_mid = _bandpass_in_ram(raw_audio[:min_len], 300.0, 3400.0, sr=16000) if min_len > 64 else raw_audio[:min_len]
+        pass1_audio[:min_len] = 0.88 * voc_audio[:min_len] + 0.12 * raw_mid
     else:
         voc_audio = raw_audio
         pass1_audio = raw_audio
@@ -1117,7 +1247,15 @@ def _run_multipass_with_loaded_model(
     whisper_lang: str | None,
 ):
     prompt = _initial_prompt_for(source_lang)
-    vad_params = dict(threshold=0.20, min_speech_duration_ms=80, min_silence_duration_ms=250, speech_pad_ms=80)
+    # Tighter VAD threshold (0.35) + max_speech_duration_s=12.0 prevents opening SFX/barks from merging
+    # with 30 seconds of dialogue and collapsing an entire encoder window into a YouTube hallucination.
+    vad_params = dict(
+        threshold=0.35,
+        min_speech_duration_ms=100,
+        min_silence_duration_ms=280,
+        speech_pad_ms=120,
+        max_speech_duration_s=12.0,
+    )
     transcribe_kwargs = dict(
         language=whisper_lang,
         word_timestamps=True,
@@ -1130,10 +1268,14 @@ def _run_multipass_with_loaded_model(
     segments_gen, _ = model.transcribe(pass1_audio, **transcribe_kwargs)
 
     results = []
+    hallucinated_spans = []
     last_log = time.time()
     for seg in segments_gen:
-        txt = seg.text.strip()
+        txt = (seg.text or "").strip()
+        st_raw, et_raw = float(getattr(seg, "start", 0.0)), float(getattr(seg, "end", 0.0))
         if not txt or _is_hallucination(txt):
+            if txt and (et_raw - st_raw) >= 1.0 and _span_rms(voc_audio, st_raw, et_raw, sr=16000) >= 0.015:
+                hallucinated_spans.append((max(0.0, st_raw), et_raw))
             continue
         avg_prob = round(float(getattr(seg, "avg_logprob", -0.2)), 3)
         no_sp = float(getattr(seg, "no_speech_prob", 0.0))
@@ -1144,6 +1286,62 @@ def _run_multipass_with_loaded_model(
         if time.time() - last_log >= 15.0:
             print(f"[PROGRESS] Pass 1 transcribed {len(results)} segments (up to {seg.end:.1f}s) in {time.time()-t0:.1f}s", flush=True)
             last_log = time.time()
+
+    # Rescue any hallucinated Pass 1 span in ONE single stitched call on pure vocals.wav (initial_prompt=None)
+    if hallucinated_spans and voc_audio is not None and len(voc_audio) > 0:
+        sr = 16000
+        sep = np.zeros(int(0.80 * sr), dtype=np.float32)
+        pieces, offsets, cur_s = [], [], 0.0
+        for h_st, h_et in hallucinated_spans:
+            i0, i1 = max(0, int(round(h_st * sr))), min(len(voc_audio), int(round(h_et * sr)))
+            if i1 - i0 < int(0.30 * sr):
+                continue
+            if pieces:
+                pieces.append(sep)
+                cur_s += 0.80
+            dur_h = (i1 - i0) / sr
+            pieces.append(voc_audio[i0:i1].astype(np.float32))
+            offsets.append((cur_s, cur_s + dur_h, h_st, h_et))
+            cur_s += dur_h
+        if pieces:
+            rescue_buf = np.concatenate(pieces)
+            r_gen, _ = model.transcribe(
+                rescue_buf,
+                language=whisper_lang,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters=dict(threshold=0.40, min_speech_duration_ms=100, min_silence_duration_ms=250, speech_pad_ms=100, max_speech_duration_s=6.0),
+                condition_on_previous_text=False,
+            )
+            for rseg in r_gen:
+                rtxt = (rseg.text or "").strip()
+                if not rtxt or _is_hallucination(rtxt):
+                    continue
+                r_lp = round(float(getattr(rseg, "avg_logprob", -0.3)), 3)
+                if r_lp <= -0.90:
+                    continue
+                mid_t = 0.5 * (float(rseg.start) + float(rseg.end))
+                for bst, bet, h_st, h_et in offsets:
+                    if (bst - 0.15) <= mid_t <= (bet + 0.15):
+                        shift = h_st - bst
+                        r_words = getattr(rseg, "words", None) or []
+                        shifted_words = [
+                            type("_RW", (), {
+                                "word": w.word,
+                                "start": max(h_st, min(h_et, float(w.start) + shift)),
+                                "end": max(h_st, min(h_et, float(w.end) + shift)),
+                                "probability": getattr(w, "probability", 0.85),
+                            })()
+                            for w in r_words
+                        ]
+                        shifted_seg = type("_RS", (), {
+                            "text": rtxt,
+                            "start": max(h_st, min(h_et, float(rseg.start) + shift)),
+                            "end": max(h_st, min(h_et, float(rseg.end) + shift)),
+                            "words": shifted_words,
+                        })()
+                        results.extend(split_pass1_words_with_orphan_guard(shifted_seg, voc_audio, r_lp, sr=16000))
+                        break
 
     if results:
         results = enforce_monotonic_segments(results, min_dur_s=0.15, min_gap_s=0.02)

@@ -852,7 +852,7 @@ class CLI(unittest.TestCase):
                 ]
                 aicn.jdump(os.path.join(u, "data/02_bilingual_script.json"), cues)
                 aicn.jdump(os.path.join(u, "data/03_dub_sentences.json"), [
-                    {"utt_id": "utt_0000", "seg_indices": [0], "slot_start": 10.0, "slot_end": 12.0, "voice": "Hải Đăng", "tempo": 1.08, "required_tempo": 1.08, "overflow_s": 0.0},
+                    {"utt_id": "utt_0000", "seg_indices": [0], "slot_start": 10.0, "slot_end": 12.0, "voice": "Trúc Ly", "tempo": 1.0, "required_tempo": 1.0, "overflow_s": 0.0},
                     {"utt_id": "utt_0001", "seg_indices": [1], "slot_start": 264.2, "slot_end": 266.5, "voice": "Trúc Ly", "tempo": 1.24, "required_tempo": 1.24, "overflow_s": 0.0},
                 ])
                 aicn.jdump(os.path.join(u, "data/03_mix_report.json"), {"passed": True, "checks": [{"id": "lufs", "passed": True}]})
@@ -884,6 +884,15 @@ class CLI(unittest.TestCase):
             aud_ok = self.run_cli("audit", "--hub", hub, "--strict", "--json")
             self.assertEqual(aud_ok.returncode, 0, aud_ok.stdout + aud_ok.stderr)
             self.assertTrue(json.loads(aud_ok.stdout)["ok"])
+
+            # 2b) Single-voice Trúc Ly contract: non-Trúc Ly voice in series_bible.json MUST fail audit unless allow_multi_voice=True
+            bible_p = os.path.join(hub, "config", "series_bible.json")
+            orig_bible = aicn.jload(bible_p, {})
+            aicn.jdump(bible_p, {**orig_bible, "voices": {"M1": "Hải Đăng", "default": "Trúc Ly"}})
+            aud_mv = self.run_cli("audit", "--hub", hub, "--json")
+            self.assertEqual(aud_mv.returncode, 2)
+            self.assertTrue(any("non-Trúc Ly" in c for c in json.loads(aud_mv.stdout)["critical"]))
+            aicn.jdump(bible_p, orig_bible)
 
             # Make unit_02 MP4 newer than full_mp4 -> audit MUST catch stale_merge with exit code 2
             u2_mp4 = os.path.join(hub, "units", "unit_02", "media", "final_unit_02_vi.mp4")

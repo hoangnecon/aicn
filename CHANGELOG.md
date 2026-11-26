@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.1.1 (2026-11-26)
+- **Stage 1 Multi-Band ASR Overhaul (`asr-4.1` / `wf-4.1`), Honest Non-Speech Gate, On-Demand `rubberband` (`base_tempo=1.0`), Single House Voice `"Trúc Ly"` & Modal Resolution Normalization:**
+  - **Pass 1 & Bounded `O(1)` Multi-Band Pass 2B (`scripts/run_asr_and_scan.py`, `scripts/analyze_voice_waveform.py`):**
+    - Switched Pass 1 mix to `88% vocals.wav + 12% 300–3400 Hz mid-formants` with tighter Silero VAD (`threshold=0.35`, `max_speech_duration_s=12.0`) plus single-batch pure-`vocals.wav` hallucination rescue so opening animal barks/SFX never swallow 30-second dialogue chunks into YouTube hallucinations.
+    - Raised intra-utterance pause bridging in `detect_uncovered_multiband_gaps()` from `< 0.25s` (`5` hops) to `0.35s` (`8` hops) with consonant-onset backtracking (keeping `>= 0.10s` separation from neighbor SFX/barks) so 2-clause short lines (e.g. `“说吧，哪疼”`) stay intact without gluing onto adjacent barks.
+    - Eliminated the hidden `O(N)` per-cluster `raw_clean` loop in `fuse_and_refine_multiband_candidates()` (now 1 batched pass), ordered clean harmonic vocal slots ahead of noisy/SFX slots inside the same `<= 22s` stitched buffer (`0.85s` separator + RMS-controlled gain), and rescued short high-`voc_rms` / high-word-probability clauses from Whisper's 30s-window `no_speech_prob` inflation.
+    - Removed unconditional `verified_non_speech_gaps` rubber-stamping: unrecovered loud vocal bursts with borderline speech tokens are tracked in `unrecovered_vocal_gaps` (alongside `encoder_calls`) so Stage 1 waveform audit never masks missed speech.
+  - **On-Demand `rubberband` Bypass (`scripts/aicn_audio.py`):**
+    - Changed `DEFAULTS["base_tempo"]` from `1.08` to `1.0`: utterances that naturally fit their slot (`raw_dur <= avail`) bypass `rubberband` completely (`0` subprocess spawns, `100%` untouched `VieNeu v3 Turbo` waveform); `rubberband -3 -F` runs strictly when `req_tempo > 1.005`. Recorded synthesized `"voice"` and `"speaker"` per utterance in `03_dub_sentences.json`.
+  - **Mandatory Single House Voice `"Trúc Ly"` (`rules/AGENTS.md`, `skills/*`, `scripts/init_workspace.py`, `scripts/aicn.py`):**
+    - Locked `"Trúc Ly"` as the mandatory single house voice across 100% of characters and cues by default; `aicn.py audit` raises a `critical` failure on any non-`"Trúc Ly"` voice unless `"allow_multi_voice": true` is explicitly configured.
+  - **Series-Wide `target_resolution` & Modal Mixed-Episode Normalization (`scripts/init_workspace.py`, `scripts/aicn.py`):**
+    - Added modal `(width, height)` selection when normalizing mixed-aspect raw episode batches and `target_resolution` enforcement across unit renders and `merge-series`.
+
 ## 3.1.0 (2026-11-26)
 - **Multi-Provider Plugin Packaging & Intent-Driven `/aicn-*` Command Suite:**
   - Converted `aicn` from 6 loose scattered skill folders (`vendor/*`) into a single unified multi-provider plugin (`~/.gemini/config/plugins/aicn`) shipping standard manifests for **Google Antigravity** (`plugin.json` + `assets/logo.svg` + `rules/AGENTS.md`), **Claude Code** (`.claude-plugin/plugin.json`), **Cursor** (`.cursor-plugin/plugin.json`), **OpenAI Codex** (`.codex-plugin/plugin.json`), and **Gemini CLI** (`gemini-extension.json` + `GEMINI.md`).

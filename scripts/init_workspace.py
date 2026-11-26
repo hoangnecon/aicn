@@ -330,9 +330,9 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
                         "name_zh": "男主",
                         "name_vi": "Nam chính",
                         "role": "Protagonist",
-                        "voice_id": "Hải Đăng",
+                        "voice_id": "Trúc Ly",
                         "default_self_pronoun": "tôi",
-                        "notes": "Giữ nguyên cách xưng hô xuyên suốt các tập"
+                        "notes": "Giữ nguyên cách xưng hô xuyên suốt các tập (100% giọng Trúc Ly)"
                     },
                     {
                         "speaker_id": "F1",
@@ -341,7 +341,7 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
                         "role": "Lead Female",
                         "voice_id": "Trúc Ly",
                         "default_self_pronoun": "tôi",
-                        "notes": "Xưng hô nhất quán theo ngữ cảnh quan hệ"
+                        "notes": "Xưng hô nhất quán theo ngữ cảnh quan hệ (100% giọng Trúc Ly)"
                     }
                 ],
                 "pronoun_matrix": [
@@ -373,7 +373,12 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
                         "tts_text": "Cục Điều Tra Dị Thường",
                         "category": "Organization"
                     }
-                ]
+                ],
+                "voices": {
+                    "M1": "Trúc Ly",
+                    "F1": "Trúc Ly",
+                    "default": "Trúc Ly"
+                }
             }
         else:
             bible_data = {
@@ -387,9 +392,9 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
                         "name_zh": "旁白 / 博主",
                         "name_vi": "Người dẫn chuyện",
                         "role": "Host / Narrator",
-                        "voice_id": "Hải Đăng",
+                        "voice_id": "Trúc Ly",
                         "default_self_pronoun": "chúng ta / mình",
-                        "notes": "Giọng phân tích rõ ràng, nhịp độ chuẩn"
+                        "notes": "Giọng thuyết minh Trúc Ly rõ ràng, nhịp độ chuẩn"
                     }
                 ],
                 "pronoun_matrix": [],
@@ -397,7 +402,11 @@ def write_schema_templates(base: str, genre: str, localization_mode: str, slug: 
                     {"zh": "思维链", "vi": "Chuỗi suy luận", "tts_text": "Chuỗi suy luận", "category": "AI/Tech"},
                     {"zh": "蒸馏", "vi": "Chưng cất mô hình", "tts_text": "Chưng cất mô hình", "category": "AI/Tech"},
                     {"zh": "强化学习", "vi": "Học tăng cường", "tts_text": "Học tăng cường", "category": "AI/Tech"}
-                ]
+                ],
+                "voices": {
+                    "NARRATOR": "Trúc Ly",
+                    "default": "Trúc Ly"
+                }
             }
         with open(bible_path, "w", encoding="utf-8") as f:
             json.dump(bible_data, f, ensure_ascii=False, indent=2)

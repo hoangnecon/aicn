@@ -33,7 +33,7 @@ except ImportError:
     ap = None
 
 
-WAVEFORM_CACHE_VERSION = "wf-4.0"
+WAVEFORM_CACHE_VERSION = "wf-4.1"
 
 
 def decode_audio_16k(input_path: str, af_filter: str = "") -> np.ndarray:
@@ -104,7 +104,7 @@ def is_boundary_duplicate_pair(
     src_l = str(left_seg.get("source", "") or "")
     src_r = str(right_seg.get("source", "") or "")
     if strict is None:
-        involves_p2b = ("pass2b" in src_l) or ("pass2b" in src_r) or (not src_l and not src_r)
+        involves_p2b = ("pass2b" in src_l) or ("pass2b" in src_r)
     else:
         involves_p2b = bool(strict)
 
@@ -388,7 +388,17 @@ def detect_uncovered_multiband_gaps(
     )
 
     uncovered_active = (~covered) & (is_full | is_high | is_mid | is_low)
+    onset_tail_floor = (~covered) & (
+        (voc_rms > max(0.0035, voc_fl * 1.35))
+        | (full_rms > max(0.0045, voc_fl * 1.45))
+        | (mid_rms > max(0.0045, mid_fl * 1.45))
+        | (hi_rms > max(0.0035, hi_fl * 1.45))
+        | (lo_rms > max(0.0050, lo_fl * 1.45))
+    )
 
+    # Bridge intra-sentence clause pauses up to 0.35s (7 hops at 50ms) so 2-clause short lines
+    # (e.g. "说吧，哪疼" with a 0.30s comma pause) stay intact without gluing >=0.45s separate turns/SFX.
+    max_bridge_hops = 8
     raw_spans = []
     i = 0
     while i < n_hops:
@@ -399,16 +409,42 @@ def detect_uncovered_multiband_gaps(
                     j += 1
                     continue
                 bridge = 0
-                while (j + bridge) < n_hops and bridge < 5 and (not uncovered_active[j + bridge]) and (not covered[j + bridge]):
+                while (
+                    (j + bridge) < n_hops
+                    and bridge < max_bridge_hops
+                    and (not uncovered_active[j + bridge])
+                    and (not covered[j + bridge])
+                ):
                     bridge += 1
-                if bridge < 5 and (j + bridge) < n_hops and uncovered_active[j + bridge]:
+                if bridge < max_bridge_hops and (j + bridge) < n_hops and uncovered_active[j + bridge]:
                     j = j + bridge + 1
                 else:
                     break
-            raw_spans.append((i, j))
+            raw_spans.append([i, j])
             i = j
         else:
             i += 1
+
+    # Backtrack initial consonant onset (up to 0.45s = 9 hops, bridging 1 quiet stop-closure hop) &
+    # trailing vowel release (up to 0.20s = 4 hops), keeping >= 2 hops (0.10s) clear of neighbor spans.
+    for idx_sp, sp in enumerate(raw_spans):
+        lo_bound = (raw_spans[idx_sp - 1][1] + 2) if idx_sp > 0 else 0
+        hi_bound = (raw_spans[idx_sp + 1][0] - 2) if idx_sp + 1 < len(raw_spans) else n_hops
+        s0, s1 = sp[0], sp[1]
+        for _ in range(9):
+            if s0 - 1 >= lo_bound and onset_tail_floor[s0 - 1]:
+                s0 -= 1
+            elif s0 - 2 >= lo_bound and (not covered[s0 - 1]) and onset_tail_floor[s0 - 2]:
+                s0 -= 2
+            else:
+                break
+        for _ in range(4):
+            if s1 < hi_bound and onset_tail_floor[s1]:
+                s1 += 1
+            else:
+                break
+        sp[0], sp[1] = s0, s1
+    raw_spans = [(sp[0], sp[1]) for sp in raw_spans]
 
     min_hops = max(2, int(round(min_gap_s / 0.05)))
     max_hops = max(min_hops + 4, int(round(max_window_s / 0.05)))
@@ -470,11 +506,6 @@ def detect_uncovered_multiband_gaps(
             "mid": int(is_mid[i0:i1].sum()),
             "low": int(is_low[i0:i1].sum()),
         }
-        active_bands = [b for b in ("high", "mid", "low") if band_hits[b] >= 2 or band_snr[b] >= 1.8]
-        active_bands.sort(key=lambda b: (band_hits[b], band_snr[b]), reverse=True)
-        if not active_bands:
-            active_bands = sorted(("high", "mid", "low"), key=lambda b: band_snr[b], reverse=True)[:2]
-
         dominant = max(("full_vocal", "high", "mid", "low"), key=lambda b: (band_hits[b], band_snr[b]))
         if band_hits["mid"] > band_hits["full_vocal"] and band_hits["mid"] >= 3 and p_voc < p_mid * 0.75:
             kind = "phone_call"
@@ -486,6 +517,21 @@ def detect_uncovered_multiband_gaps(
             kind = "low_voice"
         else:
             kind = "normal"
+
+        # Select specialist sub-bands ONLY when acoustically warranted (prevents wasting 3 extra sub-band
+        # passes on loud broadband SFX/barks that full_vocal already covers cleanly).
+        mean_raw_hi = float(np.mean(raw_hi_rms[i0:i1])) if i1 > i0 else 0.0
+        mean_lo = float(np.mean(lo_rms[i0:i1])) if i1 > i0 else 0.0
+        active_bands = []
+        if kind == "phone_call" or band_hits["mid"] > band_hits["full_vocal"] or (band_hits["mid"] >= 2 and (p_voc < 0.040 or p_mid >= p_voc * 0.85)):
+            active_bands.append("mid")
+        if kind in ("high_voice", "whisper") or (band_hits["high"] >= 2 and (p_voc < 0.040 or p_hi >= p_voc * 0.65)):
+            active_bands.append("high")
+        if kind == "low_voice" or (band_hits["low"] >= 2 and (p_voc < 0.060 or mean_raw_hi > mean_lo * 0.45)):
+            active_bands.append("low")
+        active_bands.sort(key=lambda b: (band_hits[b], band_snr[b]), reverse=True)
+        if not active_bands and p_voc < 0.035:
+            active_bands = sorted(("high", "mid", "low"), key=lambda b: band_snr[b], reverse=True)[:1]
 
         gaps.append({
             "start": round(i0 * 0.05, 2),
@@ -500,6 +546,7 @@ def detect_uncovered_multiband_gaps(
             "peak_high_rms": round(p_hi, 4),
             "peak_mid_rms": round(p_mid, 4),
             "peak_low_rms": round(p_lo, 4),
+            "mean_voc_zcr": round(float(np.mean(voc_zcr[i0:i1])) if i1 > i0 else 0.0, 4),
             "mod_cv": round(best_mod, 3),
         })
 
@@ -1108,6 +1155,8 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         if i1 > i0:
             covered_or_verified[i0:i1] = True
     for ns in verified_non_speech:
+        if ns.get("ambiguous_vocal"):
+            continue
         i0 = max(0, int(round(float(ns["start"]) / 0.05)))
         i1 = min(n_hops, int(round(float(ns["end"]) / 0.05)))
         if i1 > i0:
@@ -1131,6 +1180,7 @@ def analyze_waveform_and_clauses(workspace: str, target_segments_path: str = Non
         non_speech_ov = sum(
             max(0.0, min(bet, float(ns["end"])) - max(bst, float(ns["start"])))
             for ns in verified_non_speech
+            if not ns.get("ambiguous_vocal")
         )
         non_speech_ratio = non_speech_ov / max(0.2, bdur)
 

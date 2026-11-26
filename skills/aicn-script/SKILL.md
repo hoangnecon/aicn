@@ -1,6 +1,6 @@
 ---
 name: aicn-script
-description: Use when separating audio stems, running Whisper ASR transcription, auditing source keyframes for homophones/names, locking character pronouns and speaker voices in series_bible.json, or translating and editing Vietnamese dubbing scripts ("tách thoại", "chạy ASR", "viết kịch bản", "dịch lời thoại", "chốt xưng hô").
+description: Use when separating audio stems, running Whisper ASR transcription, auditing source keyframes for homophones/names, locking character pronouns and single house voice Trúc Ly in series_bible.json, or translating and editing Vietnamese dubbing scripts ("tách thoại", "chạy ASR", "viết kịch bản", "dịch lời thoại", "chốt xưng hô").
 ---
 
 # Transcribing & Adapting Dual-Layer Vietnamese Dub Scripts (`/aicn-script`)
@@ -28,8 +28,8 @@ Drive **Stage 1** (Demucs stems + multi-pass Whisper `large-v3` ASR + `wf-4.0` a
    ```
 
 ### Part B — Stage 2: Living `series_bible.json` & Dual-Layer `02_bilingual_script.json`
-1. **Lock character pronouns, register & valid `VieNeu v3 Turbo` voices in `<hub>/config/series_bible.json`** (and sync `<unit>/config/series_bible.json`):
-   Assign real `voices_v3_turbo.json` presets per character (`"Trúc Ly"`, `"Ngọc Huyền"`, `"Hải Đăng"`, `"Thanh Bình"`, `"Phạm Tuyên"`, etc.) plus exact directional pronouns (`anh/em`, `trẫm/ái khanh`, `sư phụ/đồ nhi`, `mày/tao` when furious).
+1. **Lock character pronouns, register & mandatory single house voice `"Trúc Ly"` in `<hub>/config/series_bible.json`** (and sync `<unit>/config/series_bible.json`):
+   Set `"voice_id": "Trúc Ly"` on **100% of characters** and map **every** key in `"voices"` (`"default": "Trúc Ly"`, `"M1": "Trúc Ly"`, `"F1": "Trúc Ly"`, `"SYSTEM": "Trúc Ly"`, etc.) to `"Trúc Ly"`. Keep distinct `speaker` IDs per character (`M1`, `F1`, `F2`, `SYSTEM`, etc.) for turn boundaries and exact directional pronouns (`anh/em`, `trẫm/ái khanh`, `sư phụ/đồ nhi`, `mày/tao` when furious) — NEVER assign multiple TTS voices unless the user explicitly asks for multi-voice (`"allow_multi_voice": true` in `series_config.json`).
 
 2. **Author `<unit>/data/02_bilingual_script.json` from `01_asr_clean.json`:**
    Preserve exact monotonic `start`/`end` slots (`0 <= start[i] < end[i] <= start[i+1] - 0.02`, `dur >= 0.15s`) and populate for every cue:
@@ -44,6 +44,7 @@ Drive **Stage 1** (Demucs stems + multi-pass Whisper `large-v3` ASR + `wf-4.0` a
    ```
 
 ## Common Mistakes
+- **Assigning multiple TTS voices (`Hải Đăng`, `Ngọc Huyền`, `Thanh Bình`, etc.) instead of `"Trúc Ly"`:** Strictly forbidden by channel house rules. Use ONLY `"Trúc Ly"` across 100% of characters and cues unless the user explicitly requests multi-voice.
 - **Editing `sub_text` while leaving `tts_text` bloated:** Stage 3 synthesizes `tts_text`. Trim filler particles in `tts_text` whenever `validate_bilingual_script.py` flags duration budget overflow.
 - **Leaving raw English/acronyms unwrapped in `tts_text`:** Causes Vietnamese letter-by-letter mispronunciation; always wrap in `<en>...</en>`.
 

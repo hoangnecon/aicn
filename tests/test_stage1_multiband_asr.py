@@ -185,8 +185,8 @@ class TestStage1MultiBandASR(unittest.TestCase):
             self.assertEqual(rep2["longest_uncovered_vocal_gap_s"], 0.0)
 
     def test_v3_versions_and_dead_v1_code_purged(self):
-        self.assertEqual(ras.ASR_PIPELINE_VERSION, "asr-4.0")
-        self.assertEqual(avw.WAVEFORM_CACHE_VERSION, "wf-4.0")
+        self.assertEqual(ras.ASR_PIPELINE_VERSION, "asr-4.1")
+        self.assertEqual(avw.WAVEFORM_CACHE_VERSION, "wf-4.1")
         self.assertEqual(ras._initial_prompt_for("zh"), "以下是普通话的句子，使用简体中文。")
         self.assertIsNone(ras._initial_prompt_for("en"))
         self.assertFalse(hasattr(ras, "scan_hardsub_and_scenes"), "Dead v1.x scan_hardsub_and_scenes must be purged")
@@ -649,6 +649,65 @@ class TestStage1MultiBandASR(unittest.TestCase):
                     os.environ.pop("AICN_CACHE_DIR", None)
                 else:
                     os.environ["AICN_CACHE_DIR"] = old_cache
+
+    def test_two_clause_pause_bridged_and_bark_batch_never_poisons_short_speech_or_ci_gate(self):
+        """Regression test for Ep1 0-6s: 0.30s pause inside '说吧，哪疼' stays 1 intact gap, window no_sp=0.658 is rescued, and ambiguous loud vocals are NOT rubber-stamped as verified_non_speech."""
+        sr = self.sr
+        voc = np.zeros(sr * 10, dtype=np.float32)
+        # [0.2..3.3s] impulsive high-ZCR dog bark; [3.80..4.46s] '说吧' + 0.30s pause + [4.76..5.30s] '哪疼'
+        rng = np.random.default_rng(42)
+        bark_t = np.arange(int(3.1 * sr)) / sr
+        bark_env = (np.sin(2 * np.pi * 3.2 * bark_t) > 0.2).astype(np.float32)
+        voc[int(0.2 * sr):int(3.3 * sr)] = (0.16 * bark_env * rng.standard_normal(len(bark_t))).astype(np.float32)
+        t_c1 = np.arange(int(0.66 * sr)) / sr
+        t_c2 = np.arange(int(0.54 * sr)) / sr
+        voc[int(3.80 * sr):int(4.46 * sr)] = (0.14 * np.sin(2 * np.pi * 520 * t_c1) * (0.6 + 0.4 * np.sin(2 * np.pi * 5 * t_c1))).astype(np.float32)
+        voc[int(4.76 * sr):int(5.30 * sr)] = (0.14 * np.sin(2 * np.pi * 560 * t_c2) * (0.6 + 0.4 * np.sin(2 * np.pi * 5 * t_c2))).astype(np.float32)
+        # [7.5..8.5s] ambiguous mumbled vocal burst (high voc_rms, borderline word prob 0.38 -> must NOT enter verified_non_speech_gaps!)
+        t_m = np.arange(int(1.0 * sr)) / sr
+        voc[int(7.5 * sr):int(8.5 * sr)] = (0.10 * np.sin(2 * np.pi * 480 * t_m) * (0.6 + 0.4 * np.sin(2 * np.pi * 4 * t_m))).astype(np.float32)
+
+        gaps = avw.detect_uncovered_multiband_gaps([], voc, voc, sr=sr)
+        speech_gaps = [g for g in gaps if 3.5 <= g["start"] <= 4.3 and 5.2 <= g["end"] <= 5.8]
+        self.assertEqual(len(speech_gaps), 1, f"'说吧，哪疼' (0.30s pause) was chopped or onset-clipped: {gaps}")
+        self.assertLessEqual(speech_gaps[0]["start"], 3.85)
+
+        class _WindowInflatedNoSpeechModel:
+            feature_extractor = True
+
+            def __init__(self):
+                self.n_calls = 0
+
+            def transcribe(self, buf, **kwargs):
+                self.n_calls += 1
+                # Simulate Whisper's 30s-window inflated no_speech_prob=0.658 on full_vocal batch (call #1):
+                # Slot 0 ([3.80..5.30s]) has word probs 0.99 / 0.82 -> rescued!
+                # Slot 1 ([7.50..8.50s]) has borderline word prob 0.36 -> rejected AND flagged as unrecovered_vocal!
+                if self.n_calls == 1:
+                    return [
+                        _FakeSeg(
+                            0.35, 1.95, "说吧哪疼", avg_logprob=-0.223, no_speech_prob=0.658,
+                            words=[_FakeWord(0.45, 1.10, "说吧", 0.99), _FakeWord(1.35, 1.90, "哪疼", 0.82)],
+                        ),
+                        _FakeSeg(
+                            3.40, 4.00, "唔唔", avg_logprob=-0.85, no_speech_prob=0.72,
+                            words=[_FakeWord(3.45, 3.95, "唔唔", 0.36)],
+                        ),
+                    ], {}
+                return [], {}
+
+        out, rep = ras.run_multiband_pass2b_recovery(
+            model=_WindowInflatedNoSpeechModel(),
+            results=[],
+            voc_audio=voc,
+            raw_audio=voc,
+            whisper_lang="zh",
+            source_lang="zh",
+            sr=sr,
+        )
+        self.assertTrue(any("说吧哪疼" in s["text"] for s in out), f"'说吧哪疼' dropped despite high word prob & voc_rms: {out}")
+        self.assertLessEqual(rep["encoder_calls"], 6, f"Multiband turned into an excessive call loop: {rep['encoder_calls']}")
+        self.assertGreaterEqual(len(rep["unrecovered_vocal_gaps"]), 1, f"Ambiguous vocal burst was rubber-stamped as non-speech: {rep}")
 
 
 if __name__ == "__main__":

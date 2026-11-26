@@ -13,14 +13,9 @@ This manual specifies the acoustic signal-processing rules, indivisible utteranc
 - **Warm Multi-Unit Batching:** `aicn_audio.py batch-dub` and `batch-all` keep one `Vieneu` model resident in VRAM across all missing utterances of multiple units.
 - **Native Sample Rate & Cache Format:** `48000 Hz` mono `PCM_16` cached globally at `<global_cache>/tts_sent/<tts_sent_key>.wav` (`TTS_ENGINE_TAG = "vieneu-v3-turbo-48k"`).
 
-### Preset Voice Selection
-| Voice Name | Gender / Timbre | Best Used For |
-| :--- | :--- | :--- |
-| `Trúc Ly` | Female, balanced natural warmth (`DEFAULTS["voice"]`) | Female drama leads, general narration & default fallback |
-| `Hải Đăng` | Male, crisp, analytical, modern Northern cadence | Male leads, tech reviews, AI essays, tutorials |
-| `Thanh Bình` | Male, warm, steady narrative gravitas | Documentaries, male authority / narrator roles |
-| `Ngọc Huyền` | Female, clear, expressive natural cadence | Female supporting leads, conversational explainers |
-| `Phạm Tuyên` | Male, authoritative commentary projection | News briefings, formal announcements |
+### House Voice Policy (`"Trúc Ly"` Single-Voice Standard)
+- **Mandatory Default Across 100% of Every Series:** **`Trúc Ly`** (`DEFAULTS["voice"] = "Trúc Ly"` — female, balanced natural warmth). Every character (`characters[*].voice_id`), `"voices"` entry, and cue in a series MUST use `"Trúc Ly"` (single-narrator thuyết minh style).
+- **Multi-Voice Override (Opt-In Only):** Other `voices_v3_turbo.json` presets in the engine (`Hải Đăng`, `Thanh Bình`, `Ngọc Huyền`, `Phạm Tuyên`, etc.) are NEVER used unless the user explicitly requests multi-voice casting and sets `"allow_multi_voice": true` in `config/series_config.json`; otherwise `aicn.py audit` flags non-`"Trúc Ly"` voices as a critical violation.
 
 ---
 
@@ -42,8 +37,8 @@ In `v3.0.0`, synthesized multi-clause WAVs are **never sliced back into clause p
 - **Elastic Silent-Slack Borrowing:**
   $$\text{avail} = \min\left(\text{next\_utterance\_start} - 0.05,\; \text{segs}[g[-1]].\text{end} + 1.20\right) - \text{start}_u$$
   (`lead_gap_s = 0.05`, `max_overhang_s = 1.20`).
-- **Formant-Preserved Time-Stretch (`rubberband -3 -F -q`):**
-  - `base_tempo = 1.08`; if `raw_dur / base_tempo > avail`, compute `tempo = raw_dur / max(0.15, avail)`.
+- **Formant-Preserved Time-Stretch (`rubberband -3 -F -q`, On-Demand Only):**
+  - `base_tempo = 1.00`: whenever `raw_dur <= avail`, `rubberband` is completely bypassed (`0` subprocess spawns, `100%` untouched native `VieNeu v3 Turbo` waveform). `rubberband -3 -F` runs ONLY when `raw_dur > avail` (`tempo = raw_dur / max(0.15, avail) > 1.005`) to fit fast dialogue slots without raising vocal pitch.
   - Caps: `max_tempo = 1.28` (`max_tempo_short = 1.32` for `<= 2`-syllable interjections).
   - Stretched intact WAVs are cached globally at `<global_cache>/rb_stretch/<rb_stretch_key>.wav` (`RB_STRETCH_VERSION = "rb3-f-3.0"`) via parallel `ThreadPoolExecutor`, placed **once intact** onto `dub_voice_48k.wav`, and written intact to `media/tts_segments/utt_{gi:04d}.wav`.
 - **Fail-Fast Exit `2` Before `cmd_mix`:** If ANY utterance has `tempo > cap + 0.005`, `overflow_s > 0.05`, or `end_u > next_start - 0.03`, `cmd_dub` writes `data/03_dub_sentences.json` with exact offending IDs and trim advice and exits with code `2` immediately (unless `--allow-overflow` is explicitly passed).

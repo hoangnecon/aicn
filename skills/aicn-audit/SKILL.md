@@ -6,7 +6,7 @@ description: Use when the user asks to review, inspect, check quality, verify ga
 # Forensic Read-Only Quality Audit (`/aicn-audit`)
 
 ## Overview
-Perform a **100% read-only** multi-layer audit across chained CI/CD gate signatures (`0..5`), bilingual script integrity, Stage 3 utterance tempo/overflow telemetry, `-16 LUFS` mix compliance, visual QA frames, and full-series merge freshness. **Never edit scripts, re-render media, or write temp files into `workspace/` during an audit.**
+Perform a **100% read-only** multi-layer audit across chained CI/CD gate signatures (`0..5`), bilingual script integrity, Stage 3 utterance tempo/overflow telemetry, `-14 LUFS` mix compliance, visual QA frames, and full-series merge freshness. **Never edit scripts, re-render media, or write temp files into `workspace/` during an audit.**
 
 - `<aicn>`: `$AICN_HOME` if set, else `~/.gemini/config/plugins/aicn` (`../..` from this skill).
 - `$AICN_PY`: `C:\Work\Tools\VieNeu-TTS\.venv\Scripts\python.exe` (Windows) or `/Users/Shared/Tools/VieNeu-TTS/.venv/bin/python` (macOS).
@@ -22,9 +22,9 @@ Perform a **100% read-only** multi-layer audit across chained CI/CD gate signatu
 
 2. **Verify all 5 technical layers from the JSON report:**
    - **Chained Gates (`gates`):** Confirm every finished batch is `PPPPPP` (or `PPPxxP` after `clean --deep`). Any `F` or `x` before Stage 5 means an upstream file was edited after signing without rebuilding downstream stages.
-   - **Script Integrity:** `0` CJK/Hangul residue, `0` empty `sub_text`/`tts_text`, `0` monotonic timestamp overlaps.
+   - **Script Integrity & Single Voice `"Trúc Ly"`:** `0` CJK/Hangul residue, `0` empty `sub_text`/`tts_text`, `0` monotonic timestamp overlaps, and **100% single house voice `"Trúc Ly"`** across `series_bible.json` and `03_dub_sentences.json` (unless `"allow_multi_voice": true` is explicitly set in `series_config.json`).
    - **Voice Pacing (`pacing`):** `overflows == 0`, `tempo_violations == 0`, `runts == 0`. Flag any utterance near the ceiling (`tempo > 1.24`) if the user reported rushed speech.
-   - **Mix & Master (`mix`):** `passed == true` (`-16 ± 1 LUFS` / Gate 3 checks).
+   - **Mix & Master (`mix`):** `passed == true` (`-14 ± 1 LUFS` / Gate 3 checks).
    - **Full-Series Release (`release`):** `stale_merge == false` (ensuring `final_<slug>_full_vi.mp4` is newer than every unit MP4), `av_sync_drift_s <= 0.50`, and branded posters present.
 
 3. **Mandatory Visual Frame Proof (`read_file`):**

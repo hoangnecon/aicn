@@ -61,7 +61,7 @@ DEFAULTS = {
     "group_max_gap_s": 0.12,
     "max_group_clauses": 3,
     "max_group_span_s": 4.5,
-    "base_tempo": 1.08,
+    "base_tempo": 1.0,
     "max_tempo": 1.28,
     "max_tempo_short": 1.32,
     "lead_gap_s": 0.05,
@@ -836,17 +836,18 @@ def _assemble_unit_dub(plan, allow_overflow=False):
         raw_wav_sha = hashlib.sha256(np.ascontiguousarray(w_raw, dtype=np.float32).tobytes()).hexdigest()
         rb_key = ap.rb_stretch_key(raw_wav_sha, stretch_tempo, RB_STRETCH_VERSION)
         rb_p = ap.global_cache_path("rb_stretch", rb_key, ".wav", hint_path=ws)
-        prep.append((gi, g, text, w_raw, raw_dur, s0, g_end, next_start, eff_ceil, avail_raw, syl_cnt, cap, req_tempo, stretch_tempo, rb_p))
+        prep.append((gi, g, text, voice, w_raw, raw_dur, s0, g_end, next_start, eff_ceil, avail_raw, syl_cnt, cap, req_tempo, stretch_tempo, rb_p))
 
     unique_jobs = {}
     for it in prep:
-        cp = it[14]
-        if cp not in unique_jobs:
-            unique_jobs[cp] = (it[3], it[13], cp)
+        cp = it[15]
+        st_tempo = it[14]
+        if abs(st_tempo - 1.0) >= 0.005 and cp not in unique_jobs:
+            unique_jobs[cp] = (it[4], st_tempo, cp)
 
     def _stretch_cached(job):
         w_raw, st_tempo, cp = job
-        if len(w_raw) == 0:
+        if len(w_raw) == 0 or abs(st_tempo - 1.0) < 0.005:
             return w_raw, True
         if not c.get("_force") and os.path.exists(cp):
             return sf.read(cp, dtype="float32")[0], True
@@ -855,11 +856,17 @@ def _assemble_unit_dub(plan, allow_overflow=False):
         return out, False
 
     job_list = list(unique_jobs.values())
-    rb_workers = min(8, os.cpu_count() or 4, max(1, len(job_list)))
-    with ThreadPoolExecutor(max_workers=rb_workers) as ex:
-        unique_res = dict(zip((j[2] for j in job_list), ex.map(_stretch_cached, job_list)))
-    stretched_res = [unique_res[it[14]] for it in prep]
-    rb_hits = sum(1 for it in prep if unique_res[it[14]][1])
+    if job_list:
+        rb_workers = min(8, os.cpu_count() or 4, max(1, len(job_list)))
+        with ThreadPoolExecutor(max_workers=rb_workers) as ex:
+            unique_res = dict(zip((j[2] for j in job_list), ex.map(_stretch_cached, job_list)))
+    else:
+        unique_res = {}
+    stretched_res = [
+        (it[4], True) if abs(it[14] - 1.0) < 0.005 else unique_res[it[15]]
+        for it in prep
+    ]
+    rb_hits = sum(1 for _, hit in stretched_res if hit)
 
     track = np.zeros(n, dtype=np.float32)
     aligned = [None] * len(segs)
@@ -868,7 +875,7 @@ def _assemble_unit_dub(plan, allow_overflow=False):
     over_entries = []
 
     for idx_pos, (it, (piece_raw, _)) in enumerate(zip(prep, stretched_res)):
-        gi, g, text, _w_raw, raw_dur, s0, g_end, next_start, eff_ceil, avail_raw, syl_cnt, cap, req_tempo, stretch_tempo, _cp = it
+        gi, g, text, voice, _w_raw, raw_dur, s0, g_end, next_start, eff_ceil, avail_raw, syl_cnt, cap, req_tempo, stretch_tempo, _cp = it
         piece = _cosine_edge_fade(piece_raw, fade_s=0.010)
         piece_dur = len(piece) / SR
         sp_s = s0 if prev_sp_e < 0.0 else max(s0, prev_sp_e + 0.03)
@@ -926,6 +933,8 @@ def _assemble_unit_dub(plan, allow_overflow=False):
             "utterance_id": gi,
             "group": gi,
             "ids": g,
+            "speaker": segs[g[0]].get("speaker", ""),
+            "voice": voice,
             "utterance_wav": utt_rel,
             "start": round(s0, 3),
             "script_start": round(s0, 3),

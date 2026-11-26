@@ -1,4 +1,4 @@
-# AICN Drama Localization Plugin (`aicn` · v3.1.0) — Workspace Routing & Non-Bypass Rules
+# AICN Drama Localization Plugin (`aicn` · v3.1.1) — Workspace Routing & Non-Bypass Rules
 
 Applies whenever working on Chinese (`红果`/`抖音`/`B站`) or English (`DramaDunyam`) short-drama Vietnamese dubbing, or inside any workspace containing `series_bible.json`, `source_inbox/`, `units/`, `02_bilingual_script.json`, or `deliverables/final_*_full_vi.mp4`.
 
@@ -20,3 +20,4 @@ Match the user's explicit `/aicn-*` command or natural-language goal and read it
 2. **Full `voice_dub` Mandatory:** Vietnamese dubbing + dual-corner channel watermark + external `.srt` (zero burned-in subtitle overlay, zero `sub_only` downgrade).
 3. **Pure Content-SHA-256 Cache & Chained Gates:** Never wipe `<project_root>/.cache/content_hash.db` or re-run unaffected units during a fix. Use `aicn.py locate` for surgical fixes and `aicn.py audit` + `read_file` on JPEG frames for visual QA.
 4. **Original Sources Only:** Never source Chinese dramas from YouTube; run `node <aicn>/scripts/hg_tool.cjs check-upstream --json` before any Hongguo query.
+5. **Single House Voice `"Trúc Ly"` Mandatory:** Use ONLY voice `"Trúc Ly"` across 100% of characters, speakers, and cues in every series (`series_bible.json` `characters[*].voice_id` and `voices[*]` all `"Trúc Ly"`, `audio_mix.json` `"voice": "Trúc Ly"`). Keep distinct `speaker` IDs (`M1`, `F1`, `F2`, `SYSTEM`, etc.) solely for pronoun consistency and turn separation — NEVER assign multiple TTS voices unless the user explicitly asks for multi-voice (`"allow_multi_voice": true` in `series_config.json`).

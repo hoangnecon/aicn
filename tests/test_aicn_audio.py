@@ -394,6 +394,7 @@ class IndivisibleDubAndDSP(unittest.TestCase, _TempEnvMixin):
                 self.ap.atomic_write_json(os.path.join(ws, "data", "02_bilingual_script.json"), segs)
                 c = dict(self.m.DEFAULTS)
                 k_tts = self.ap.tts_sent_key("Được rồi.", c["voice"], self.m.TTS_ENGINE_TAG, c["temperature"], c["top_k"])
+                # 1) When raw_dur (1.0s) <= avail (1.95s), base_tempo=1.0 MUST bypass rubberband completely (0 calls!)
                 soundfile.write(self.ap.global_cache_path("tts_sent", k_tts, ".wav"), self.tone(1.0), self.sr)
 
                 def _counting_stretch(w, tempo):
@@ -403,6 +404,12 @@ class IndivisibleDubAndDSP(unittest.TestCase, _TempEnvMixin):
 
                 self.m.stretch = _counting_stretch
                 self.m.cmd_dub(ws, c)
+                self.assertEqual(len(stretch_calls), 0, f"Natural-fitting utterances must bypass rubberband, got {stretch_calls}")
+
+                # 2) When raw_dur (2.2s) > avail (1.95s), 4 identical tight utterances MUST deduplicate rb_stretch to 1 call
+                soundfile.write(self.ap.global_cache_path("tts_sent", k_tts, ".wav"), self.tone(2.2), self.sr)
+                c_force = dict(c, _force=True)
+                self.m.cmd_dub(ws, c_force)
                 self.assertEqual(len(stretch_calls), 1, f"Expected rb_stretch dedup to run once, got {stretch_calls}")
                 for k in range(4):
                     self.assertTrue(os.path.exists(os.path.join(ws, "media", "tts_segments", f"utt_{k:04d}.wav")))

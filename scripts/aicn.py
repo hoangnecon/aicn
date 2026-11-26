@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-aicn.py - incremental build & localization engine for the AICN v3.1.0 multi-provider plugin.
+aicn.py - incremental build & localization engine for the AICN v3.1.1 multi-provider plugin.
 
 Provides unified CLI subcommands across all pipeline stages and user intents:
 
@@ -358,11 +358,11 @@ def cmd_init_series(a):
     write_if_absent(os.path.join(hub, "config", "series_bible.json"), json.dumps(
         {"schema_version": "3.0", "series_slug": a.series_slug, "source_language": getattr(a, "source_lang", "zh"),
          "title_zh": title_zh, "title_vi": title_vi, "characters": [],
-         "pronoun_matrix": [], "glossary": [], "voices": {}},
+         "pronoun_matrix": [], "glossary": [], "voices": {"default": "Trúc Ly"}},
         ensure_ascii=False, indent=2))
     scfg_p = os.path.join(hub, "config", "series_config.json")
     scfg = {"schema_version": "3.0", "series_slug": a.series_slug, "title_vi": title_vi, "title_zh": title_zh,
-            "genre": "short-drama", "localization_mode": "voice_dub", "updated_at": now()}
+            "genre": "short-drama", "localization_mode": "voice_dub", "voice": "Trúc Ly", "updated_at": now()}
     write_if_absent(scfg_p, json.dumps(scfg, ensure_ascii=False, indent=2))
     if not os.path.exists(os.path.join(hub, "00_series_manifest.md")):
         _sync_series_manifest(hub, a.series_slug, title_vi=title_vi, title_zh=title_zh, scfg=scfg)
@@ -1848,6 +1848,33 @@ def cmd_audit(a):
     unit_reports = []
     newest_unit_mp4_mtime = 0.0
 
+    scfg = jload(os.path.join(hub, "config", "series_config.json"), {}) if hub else {}
+    scfg = scfg if isinstance(scfg, dict) else {}
+    house_voice = str(scfg.get("voice") or "Trúc Ly").strip() or "Trúc Ly"
+    allow_multi_voice = bool(scfg.get("allow_multi_voice", False))
+
+    def _collect_non_house_voices(bible_obj):
+        bad = []
+        if not isinstance(bible_obj, dict):
+            return bad
+        for ch in (bible_obj.get("characters") or []):
+            if isinstance(ch, dict) and ch.get("voice_id"):
+                v = str(ch["voice_id"]).strip()
+                if v and v != house_voice:
+                    bad.append(f"{ch.get('speaker_id', '?')}={v}")
+        vmap = bible_obj.get("voices")
+        if isinstance(vmap, dict):
+            for k, v in vmap.items():
+                vs = str(v or "").strip()
+                if vs and vs != house_voice:
+                    bad.append(f"voices.{k}={vs}")
+        return bad
+
+    if hub and not allow_multi_voice:
+        hub_bad_voices = _collect_non_house_voices(jload(os.path.join(hub, "config", "series_bible.json"), {}))
+        if hub_bad_voices:
+            critical.append(f"hub: non-{house_voice} voice(s) in series_bible.json ({', '.join(hub_bad_voices[:5])}); single voice '{house_voice}' is mandatory unless allow_multi_voice=true")
+
     for u in units:
         bn = os.path.basename(u)
         gs = gate_status(u)
@@ -1855,6 +1882,16 @@ def cmd_audit(a):
             critical.append(f"{bn}: failed gate(s) in '{gs}'")
         elif "x" in gs and gs[5] != "P":
             important.append(f"{bn}: stale/broken gate chain '{gs}' (upstream modified or intermediate missing before Stage 5 PASS)")
+
+        pcfg_u = jload(os.path.join(u, "config", "project_config.json"), {}) or {}
+        unit_multi_ok = allow_multi_voice or bool(pcfg_u.get("allow_multi_voice", False))
+        if not unit_multi_ok:
+            u_bad_bible = _collect_non_house_voices(jload(os.path.join(u, "config", "series_bible.json"), {}))
+            if u_bad_bible and not hub:
+                critical.append(f"{bn}: non-{house_voice} voice(s) in series_bible.json ({', '.join(u_bad_bible[:5])})")
+            acfg_v = str((jload(os.path.join(u, "config", "audio_mix.json"), {}) or {}).get("voice") or house_voice).strip()
+            if acfg_v and acfg_v != house_voice:
+                critical.append(f"{bn}: audio_mix.json voice='{acfg_v}' != '{house_voice}'")
 
         script_issues = []
         cues = jload(os.path.join(u, "data", "02_bilingual_script.json"))
@@ -1869,6 +1906,9 @@ def cmd_audit(a):
                     script_issues.append(f"cue #{idx} CJK/Hangul leak")
                 if prev_end >= 0 and st < prev_end + 0.019:
                     script_issues.append(f"cue #{idx} monotonic/gap violation ({st:.3f}s vs prev_end {prev_end:.3f}s)")
+                cue_v = str(c.get("voice") or "").strip()
+                if not unit_multi_ok and cue_v and cue_v != house_voice:
+                    script_issues.append(f"cue #{idx} non-{house_voice} voice override '{cue_v}'")
                 prev_end = et
             if script_issues:
                 critical.append(f"{bn}: {len(script_issues)} script defect(s) ({script_issues[0]})")
@@ -1881,6 +1921,7 @@ def cmd_audit(a):
             max_ts = float(acfg.get("max_tempo_short", max(max_t, 1.32)))
             overs = [s for s in dub_sents if float(s.get("overflow_s", 0.0) or 0.0) > 0.005]
             bad_tempo = []
+            bad_voices = []
             runts = [s for s in dub_sents if s.get("runt")]
             worst_tempo = 0.0
             for s in dub_sents:
@@ -1890,15 +1931,21 @@ def cmd_audit(a):
                 worst_tempo = max(worst_tempo, eff_t)
                 if eff_t > cap + 0.005:
                     bad_tempo.append(s.get("utt_id"))
+                sv = str(s.get("voice") or "").strip()
+                if not unit_multi_ok and sv and sv != house_voice:
+                    bad_voices.append(f"{s.get('utt_id')}={sv}")
             pacing_summary = {
                 "utterances": len(dub_sents),
                 "overflows": len(overs),
                 "tempo_violations": len(bad_tempo),
+                "non_house_voices": len(bad_voices),
                 "runts": len(runts),
                 "worst_tempo": round(worst_tempo, 3),
             }
             if overs or bad_tempo or runts:
                 critical.append(f"{bn}: Stage 3 pacing defects (overflows={len(overs)}, tempo_violations={len(bad_tempo)}, runts={len(runts)})")
+            if bad_voices:
+                critical.append(f"{bn}: Stage 3 non-{house_voice} utterance voice(s) ({', '.join(bad_voices[:4])})")
 
         mix_summary = None
         mix_rep = jload(os.path.join(u, "data", "03_mix_report.json"))

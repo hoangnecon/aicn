@@ -1,4 +1,4 @@
-# Stage Commands (`v3.1.0`, Copy-Paste Reference)
+# Stage Commands (`v3.1.1`, Copy-Paste Reference)
 
 Set once per shell:
 

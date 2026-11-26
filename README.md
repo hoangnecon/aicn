@@ -1,4 +1,4 @@
-# AICN Drama Localization Plugin (`aicn` · `v3.1.0`)
+# AICN Drama Localization Plugin (`aicn` · `v3.1.1`)
 
 Standard multi-provider plugin (**Google Antigravity**, **Anthropic Claude Code**, **Google Gemini CLI**, **Cursor**, and **OpenAI Codex**) for full-series Vietnamese dubbing + Vietsub localization of Chinese (`红果`/`抖音`/`B站`) and English (`DramaDunyam`) short dramas.
 
@@ -14,8 +14,8 @@ Type `/aicn` in the chat input to open the intent-driven command menu:
 | :--- | :--- | :--- |
 | **`/aicn-scout`** | Finding or pitching new dramas | Checks upstream `hongguo-drama`, queries original Chinese/English feeds (zero YouTube), fetches `.jpg` covers, and writes a Candidate Shortlist artifact. |
 | **`/aicn-create`** | Starting a new series project | Validates unaccented Vietnamese `--series-slug` & `--rights`, downloads raw episodes into `source_inbox/`, scaffolds ~10-ep `units/*`, and signs Stage 0. |
-| **`/aicn-script`** | Transcribing & writing VI dub scripts | Runs warm Demucs + Whisper `large-v3` (`asr-4.0`/`wf-4.0`), inspects audit frames, locks `series_bible.json` voices/pronouns, and validates `02_bilingual_script.json` (`100/100`). |
-| **`/aicn-produce`** | Dubbing, rendering & releasing | Streams Stage 3→6: warm CUDA `VieNeu v3 Turbo` `infer_batch(16)`, intact `rubberband` R3, `-16 LUFS` mix, NVENC watermark render, visual QA, `merge-series`, and `brand-poster`. |
+| **`/aicn-script`** | Transcribing & writing VI dub scripts | Runs warm Demucs + Whisper `large-v3` (`asr-4.1`/`wf-4.1`), inspects audit frames, locks single house voice `Trúc Ly` + pronouns in `series_bible.json`, and validates `02_bilingual_script.json` (`100/100`). |
+| **`/aicn-produce`** | Dubbing, rendering & releasing | Streams Stage 3→6: warm CUDA `VieNeu v3 Turbo` `infer_batch(16)`, on-demand `rubberband` R3 (`base_tempo=1.0`), `-14 LUFS` mix, NVENC watermark render, visual QA, `merge-series`, and `brand-poster`. |
 | **`/aicn-audit`** | Read-only quality inspection | Runs `aicn.py audit --strict` across chained gate signatures, script, TTS tempo/overflows, LUFS, `stale_merge`, and visual QA frames without mutating files. |
 | **`/aicn-fix`** | Repairing a reported defect | Runs `aicn.py locate` (maps full-series `HH:MM:SS`, episode time, or phrase to exact unit/cue/utterance), patches only the broken layer, and rebuilds with `100%` cache reuse on unchanged lines. |
 | **`/aicn-clean`** | Progress, time estimate & cleanup | Runs `discover`, `doctor`, turnaround estimation, `clean [--deep]` after release, or raw-preserving unit reset. |

@@ -30,7 +30,7 @@ Inspect the returned `unit`, `target_cue_index`, `sub_text`, `tts_text`, `speake
 - **Layer B — Missing or clipped source speech cue:**
   Inspect surrounding audio/frames (`frames/audit/` or narrow clip check), insert/adjust the monotonic non-overlapping cue in `01_asr_clean.json` + `02_bilingual_script.json` (`start[i] >= prev_end + 0.02`, `dur >= 0.15s`), and re-verify Stage 1 (`verify_stage_1.py`) before Stage 2.
 - **Layer C — Wrong speaker voice or BGM/vocal balance:**
-  Update `speaker` / `series_bible.json` voice preset (real `voices_v3_turbo.json` preset) or tune `<unit>/config/audio_mix.json` (`dub_over_vocal_lu`, `floor_vocal_db`, `floor_bgm_db` — see `<aicn>/references/audio_mix.md`).
+  House rule locks **100% single voice `"Trúc Ly"`** across every character and cue (never switch to other voices unless the user explicitly requested `"allow_multi_voice": true`). Update `<hub>/config/series_bible.json` + `<unit>/config/series_bible.json` or tune `<unit>/config/audio_mix.json` (`dub_over_vocal_lu`, `floor_vocal_db`, `floor_bgm_db` — see `<aicn>/references/audio_mix.md`). If rebuilding multiple units via `run-series --phase produce`, remove stale `.cicd/stage_{3,4,5}_gate.json` on affected units first so `run-series` does not skip them.
 - **Layer D — Watermark / aspect / poster defect:**
   Fix `--brand-dir` / `project_config.json["watermark"]` (only Stage 4–6 needed; Stage 3 audio stays untouched!) or re-run `aicn.py brand-poster`.
 
